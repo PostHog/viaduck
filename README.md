@@ -305,6 +305,35 @@ just up                # start docker-compose stack
 just down              # stop docker-compose stack
 ```
 
+## Formal Verification (TLA+)
+
+The 3-phase CDC algorithm is formally specified in TLA+ and verified by the TLC model checker. The spec models source operations (insert, delete, update), poll cycles, and crash-after-write scenarios, then exhaustively checks all reachable states.
+
+```bash
+flox activate          # enter flox env (provides tlaplus + JDK)
+just tlc               # run TLC model checker (~730K states, ~9s)
+just tlc-parse         # syntax/semantic check only (no model checking)
+just tlc-verbose       # model check + dump state graph as DOT
+```
+
+**Spec**: [`tla/Viaduck.tla`](tla/Viaduck.tla), **Config**: [`tla/Viaduck.cfg`](tla/Viaduck.cfg)
+
+Model parameters: `Keys={1,2}`, `Dests={d1,d2}`, `MaxOps=4`. TLC explores 2.8M transitions across 730K distinct states at depth 10.
+
+### Verified invariants
+
+| Invariant | What it means |
+|-----------|---------------|
+| `EventualConsistency` | When caught up and crash-free, each destination contains exactly the source rows matching its routing value |
+| `NoPhantomWhenCurrent` | No destination has rows that don't exist on the source |
+| `NoDataLossWhenCurrent` | Every source row appears in the correct destination |
+| `CursorMonotonicity` | Cursors never regress |
+| `PartitionCorrectness` | Rows only appear in the destination matching their routing value |
+
+### Known limitation found by TLC
+
+Crash-after-write followed by source delete before recovery causes **phantom data**: the insert+delete for the same rowid cancel in conflict resolution, but the destination already has the row from the crashed write. This is inherent to at-least-once delivery without cross-catalog transactions. Invariants are conditioned on crash-free execution (`~everCrashed`).
+
 ## Deployment
 
 ```bash

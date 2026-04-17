@@ -134,10 +134,23 @@ docs-check:
 
 # === TLA+ ===
 
-# Run TLA+ model checker on the viaduck spec
+# Run TLA+ model checker on the viaduck CDC algorithm spec (requires flox activate)
 [group('verify')]
 tlc:
     cd tla && tlc Viaduck.tla -config Viaduck.cfg -workers auto
+
+# Run TLA+ model checker with verbose output (shows state count per depth)
+[group('verify')]
+tlc-verbose:
+    cd tla && tlc Viaduck.tla -config Viaduck.cfg -workers auto -dump dot,colorize,actionlabels states.dot
+
+# Parse the TLA+ spec without model checking (syntax/semantic check only)
+[group('verify')]
+tlc-parse:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TLA_JAR=$(sed -n 's/.*-cp \([^ ]*\).*/\1/p' "$(which tlc)")
+    cd tla && java -cp "$TLA_JAR" tla2sany.SANY Viaduck.tla
 
 # === Build ===
 

@@ -80,6 +80,14 @@ CDC batches are processed as unordered sets. This is sound because each batch
 covers a closed snapshot range, batches are applied in ascending snapshot order,
 and within-batch conflicts are resolved by rowid grouping.
 
+## TLA+ Formal Verification
+
+The CDC algorithm is formally specified in `tla/Viaduck.tla` and verified by
+TLC. Run via `flox activate` then `just tlc`. The spec models source operations,
+poll cycles, and crash-after-write scenarios, checking 5 invariants across 730K
+states. Modify the spec when changing the CDC algorithm or adding new failure
+modes. Always run `just tlc` after spec changes.
+
 ## Key Design Decisions
 
 - **Config via YAML** with `_env` suffix convention for credential indirection
