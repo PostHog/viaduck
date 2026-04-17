@@ -1,0 +1,66 @@
+direction: right
+
+source: Source DuckLake {
+  style.fill: "#e8f4f8"
+  catalog: Catalog (Postgres + S3) {
+    shape: cylinder
+  }
+  state: _viaduck_state {
+    shape: sql_table
+    destination_id: VARCHAR
+    instance_id: VARCHAR
+    last_snapshot_id: BIGINT
+    rows_replicated: BIGINT
+    last_error: VARCHAR
+  }
+  events: events table {
+    shape: sql_table
+    company: VARCHAR
+    event_id: BIGINT
+    payload: VARCHAR
+  }
+  # Force vertical order: state above events
+  state -> events: {style.opacity: 0}
+}
+
+viaduck: Viaduck {
+  style.fill: "#fff3e0"
+  poll: "Poll Loop" {
+    shape: step
+  }
+  cdc: "CDC Read\n(table_insertions)" {
+    shape: step
+  }
+  route: "Router\n(Arrow split)" {
+    shape: step
+  }
+  # Force vertical order: poll above cdc
+  poll -> cdc: "current_snapshot()"
+  cdc -> route: "filter_expr pushdown"
+}
+
+dest: Destination DuckLakes {
+  style.fill: "#e8f5e9"
+  quacksworth: Quacksworth Catalog {
+    shape: cylinder
+    events: events
+  }
+  mallardine: Mallardine Catalog {
+    shape: cylinder
+    events: events
+  }
+  tealford: Tealford Catalog {
+    shape: cylinder
+    events: events
+  }
+  "...": "N catalogs" {
+    shape: text
+    style.font-size: 14
+  }
+}
+
+viaduck.poll -> source.state: "load/advance cursors"
+source.events -> viaduck.cdc: "CDC insertions\n(snapshot range)"
+viaduck.route -> dest.quacksworth: "company='quacksworth'"
+viaduck.route -> dest.mallardine: "company='mallardine'"
+viaduck.route -> dest.tealford: "company='tealford'"

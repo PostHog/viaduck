@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "viaduck/_version.py"
+
+[project]
+name = "viaduck"
+dynamic = ["version"]
+description = "DuckLake to DuckLake CDC replication"
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
+dependencies = [
+    "pyducklake>=1.0",
+    "duckdb>=1.4,<1.5",
+    "pyarrow>=18.0",
+    "prometheus-client>=0.21",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+viaduck = "viaduck.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "e2e: marks tests as E2E tests requiring docker-compose stack",
+    "perf: marks tests as performance benchmarks",
+]

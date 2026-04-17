@@ -1,0 +1,47 @@
+direction: down
+
+title: "Failure Modes & Recovery" { shape: text; style.font-size: 20 }
+
+source_down: "Source Catalog Unavailable" {
+  style.fill: "#ffcdd2"
+  impact: "CDC read fails" { shape: text }
+  recovery: "Fatal → crash → K8s restart\nResumes from last cursor" { shape: text; style.fill: "#c8e6c9" }
+}
+
+dest_down: "Destination Catalog Unavailable" {
+  style.fill: "#ffcdd2"
+  impact: "append() fails for\nthis destination only" { shape: text }
+  recovery: "3 retries with backoff\nOther destinations unaffected\nCursor not advanced → retry next poll" { shape: text; style.fill: "#c8e6c9" }
+}
+
+crash_after_write: "Crash After Write, Before State Update" {
+  style.fill: "#fff9c4"
+  impact: "Destination has data\nbut cursor not advanced" { shape: text }
+  recovery: "At-least-once: next poll\nre-reads and re-writes\nDuplicates possible" { shape: text; style.fill: "#c8e6c9" }
+}
+
+state_txn_fail: "State Transaction Failure" {
+  style.fill: "#fff9c4"
+  impact: "Delete+insert rolled back\nCursor preserved at old value" { shape: text }
+  recovery: "Automatic: same data\nretried next poll cycle" { shape: text; style.fill: "#c8e6c9" }
+}
+
+schema_mismatch: "Routing Field Missing/Changed" {
+  style.fill: "#ffcdd2"
+  impact: "RoutingError raised\nGroup processing halted" { shape: text }
+  recovery: "Error metricked + logged\nRequires manual intervention\n(fix source schema or config)" { shape: text; style.fill: "#c8e6c9" }
+}
+
+pool_exhaust: "Connection Pool Eviction Storm" {
+  style.fill: "#fff9c4"
+  impact: "Frequent close/reopen\nof destination catalogs" { shape: text }
+  recovery: "Automatic: LRU keeps hot\ndestinations cached\nIncrease max_open if needed" { shape: text; style.fill: "#c8e6c9" }
+}
+
+# Force vertical stacking
+title -> source_down: {style.opacity: 0}
+source_down -> dest_down: {style.opacity: 0}
+dest_down -> crash_after_write: {style.opacity: 0}
+crash_after_write -> state_txn_fail: {style.opacity: 0}
+state_txn_fail -> schema_mismatch: {style.opacity: 0}
+schema_mismatch -> pool_exhaust: {style.opacity: 0}

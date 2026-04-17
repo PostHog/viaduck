@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+.venv/
+*.egg
+.ruff_cache/
+.pytest_cache/
+viaduck/_version.py

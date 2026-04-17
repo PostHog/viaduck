@@ -1,0 +1,38 @@
+direction: down
+
+start: "Poll Cycle Start" { shape: oval }
+snapshot: "current_snapshot()" { shape: step }
+no_snap: "No snapshot?\nSleep & retry" { shape: diamond }
+load: "Load cursors from\n_viaduck_state" { shape: step }
+group: "Group destinations\nby last_snapshot_id" { shape: step }
+cdc: "table_insertions(\nstart, end,\nfilter_expr)" { shape: step }
+empty: "Empty\nchangeset?" { shape: diamond }
+route: "split_and_count()\nArrow routing" { shape: step }
+write: "append() to each\ndestination" { shape: step }
+advance: "advance_cursor()\n(in transaction)" { shape: step }
+fail: "Write failed?" { shape: diamond }
+retry: "Retry with\nbackoff (3x)" { shape: step }
+error: "record_error()\nevict connection" { shape: step }
+advance_empty: "advance_cursors()\n(no-data advance)" { shape: step }
+metrics: "Update lag metrics" { shape: step }
+done: "Sleep\npoll.interval_seconds" { shape: oval }
+
+start -> snapshot
+snapshot -> no_snap
+no_snap -> done: "yes"
+no_snap -> load: "no"
+load -> group
+group -> cdc: "for each snapshot group"
+cdc -> empty
+empty -> advance_empty: "yes (0 rows)"
+empty -> route: "no"
+route -> write: "for each destination batch"
+write -> fail
+fail -> advance: "no"
+fail -> retry: "yes"
+retry -> error: "exhausted"
+retry -> advance: "succeeded"
+advance -> metrics
+advance_empty -> metrics
+error -> metrics
+metrics -> done
