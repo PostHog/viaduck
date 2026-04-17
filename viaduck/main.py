@@ -1,4 +1,44 @@
-"""Entry point and main poll loop for viaduck."""
+"""Entry point and main poll loop for viaduck.
+
+CDC Replication Algorithm
+=========================
+
+Viaduck replicates changes from a source DuckLake table to N destination
+DuckLake tables using a 3-phase CDC algorithm. The algorithm is eventually
+consistent under three assumptions:
+
+1. **Routing column immutability**: The routing field (e.g. ``company``) must
+   not be updated on the source. The CDC read uses ``filter_expr`` pushdown
+   with the routing values of assigned destinations. If a row's routing value
+   changes, the preimage (with the old value) may be filtered out at the source
+   level, making the delete on the old destination unrecoverable. Violations
+   are detected and logged at ERROR, but data integrity is not guaranteed.
+
+2. **Rowid monotonicity**: DuckLake's internal ``rowid`` is assumed to be
+   monotonically increasing and never reused. Conflict resolution (Phase 2)
+   uses rowid to identify the same logical row across change types within a
+   single CDC batch. If rowids were recycled (as in SQLite VACUUM), unrelated
+   rows could be incorrectly cancelled.
+
+3. **Single-master destinations**: Each destination table must only be written
+   to by viaduck from the configured source. Concurrent writes from other
+   sources would break at-least-once idempotency — a retried delete could
+   remove a row inserted by another writer.
+
+The algorithm processes CDC batches as unordered sets (not sequences). This is
+sound because: (a) each batch covers a closed snapshot range, (b) batches are
+always applied in ascending snapshot order via cursor tracking, and (c)
+within-batch conflicts are resolved by rowid grouping before application.
+
+Phases:
+  1. Preimage Resolution (before routing) — pair update pre/postimages by
+     rowid, convert cross-tenant preimages to deletes, drop same-tenant
+     preimages.
+  2. Conflict Resolution (per-destination, after routing) — cancel
+     insert+delete pairs by rowid, drop postimages shadowed by deletes.
+  3. Apply (per-destination, atomic) — delete then upsert within a
+     destination catalog transaction.
+"""
 
 import argparse
 import logging
@@ -155,12 +195,19 @@ def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[st
     if all(keep_mask):
         # Only need to update change_type column
         idx = batch.column_names.index("change_type")
-        return batch.set_column(idx, "change_type", pa.array(new_change_types, type=pa.string()))
+        result = batch.set_column(idx, "change_type", pa.array(new_change_types, type=pa.string()))
+    else:
+        # Filter out dropped preimages and update change_types
+        idx = batch.column_names.index("change_type")
+        batch = batch.set_column(idx, "change_type", pa.array(new_change_types, type=pa.string()))
+        result = batch.filter(pa.array(keep_mask))
 
-    # Filter out dropped preimages and update change_types
-    idx = batch.column_names.index("change_type")
-    batch = batch.set_column(idx, "change_type", pa.array(new_change_types, type=pa.string()))
-    return batch.filter(pa.array(keep_mask))
+    # Post-condition: no preimages should remain after resolution
+    remaining_types = result.column("change_type").to_pylist()
+    assert "update_preimage" not in remaining_types, (
+        f"Bug: {remaining_types.count('update_preimage')} update_preimage rows remain after Phase 1 resolution"
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +219,9 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
     """Resolve conflicting changes for the same rowid within a batch.
 
     Uses rowid (not just key_columns) to identify the same logical row.
+    This depends on DuckLake rowids being monotonically increasing and never
+    reused. If rowids were recycled, unrelated rows could be incorrectly
+    cancelled.
 
     Rules:
     - insert + delete for same rowid → cancel both (net no-op)
@@ -211,10 +261,21 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
             rows_to_remove.update(postimage_rowids[rowid])
 
     if not rows_to_remove:
-        return batch
+        result = batch
+    else:
+        keep_mask = [i not in rows_to_remove for i in range(batch.num_rows)]
+        result = batch.filter(pa.array(keep_mask))
 
-    keep_mask = [i not in rows_to_remove for i in range(batch.num_rows)]
-    return batch.filter(pa.array(keep_mask))
+    # Post-condition: no rowid should appear in both insert and delete sets
+    if result.num_rows > 0:
+        remaining_ct = result.column("change_type").to_pylist()
+        remaining_rid = result.column("rowid").to_pylist()
+        insert_rids = {remaining_rid[i] for i in range(len(remaining_ct)) if remaining_ct[i] == "insert"}
+        delete_rids = {remaining_rid[i] for i in range(len(remaining_ct)) if remaining_ct[i] == "delete"}
+        overlap = insert_rids & delete_rids
+        assert not overlap, f"Bug: rowids {overlap} appear in both insert and delete after Phase 2 conflict resolution"
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +336,15 @@ def _build_delete_filter(delete_rows: pa.Table, key_columns: list[str]) -> str:
 
 def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str]) -> dict[str, int]:
     """Apply CDC changes to a destination table atomically.
+
+    Deletes are applied first, then upserts, within a single catalog transaction.
+    If the transaction fails, both are rolled back — no partial state on the
+    destination.
+
+    Delete and upsert are idempotent under single-master assumptions: deleting an
+    already-deleted row is a no-op, and upserting the same row twice produces the
+    same result. This enables safe at-least-once retry on crash recovery.
+    Destinations must not be written to by other sources.
 
     Returns dict of counts: {"deleted": N, "upserted": N, "upsert_matched": N}.
 

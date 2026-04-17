@@ -132,6 +132,13 @@ docs-check:
     fi
     echo "All docs links valid"
 
+# === TLA+ ===
+
+# Run TLA+ model checker on the viaduck spec
+[group('verify')]
+tlc:
+    cd tla && tlc Viaduck.tla -config Viaduck.cfg -workers auto
+
 # === Build ===
 
 # Build Docker image

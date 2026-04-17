@@ -1,0 +1,374 @@
+{
+  "lockfile-version": 1,
+  "manifest": {
+    "schema-version": "1.12.0",
+    "install": {
+      "d2": {
+        "pkg-path": "d2"
+      },
+      "jdk21": {
+        "pkg-path": "jdk21"
+      },
+      "tlaplus": {
+        "pkg-path": "tlaplus"
+      }
+    },
+    "hook": {},
+    "profile": {},
+    "options": {}
+  },
+  "packages": [
+    {
+      "attr_path": "d2",
+      "broken": false,
+      "derivation": "/nix/store/g0by1n0qip2fi9r7g1qjc9xbagpg62aw-d2-0.7.1.drv",
+      "description": "Modern diagram scripting language that turns text to diagrams",
+      "install_id": "d2",
+      "license": "MPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "d2-0.7.1",
+      "pname": "d2",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T06:05:18.393193Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.7.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/97kgl4xypf3svnmpwbmc40rkryiw7amg-d2-0.7.1"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "d2",
+      "broken": false,
+      "derivation": "/nix/store/ska70x701l9m9m95516sc6dx014g0xyn-d2-0.7.1.drv",
+      "description": "Modern diagram scripting language that turns text to diagrams",
+      "install_id": "d2",
+      "license": "MPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "d2-0.7.1",
+      "pname": "d2",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T06:37:13.363314Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.7.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/c5xafs44aj5lwz759796fc61bsc27g2j-d2-0.7.1"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "d2",
+      "broken": false,
+      "derivation": "/nix/store/kn6kq984q3m5q884aq27hv2yzp57qn36-d2-0.7.1.drv",
+      "description": "Modern diagram scripting language that turns text to diagrams",
+      "install_id": "d2",
+      "license": "MPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "d2-0.7.1",
+      "pname": "d2",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T07:08:02.361505Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.7.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/rag5k902jmdhrpvadp2w40vwd7dmn118-d2-0.7.1"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "d2",
+      "broken": false,
+      "derivation": "/nix/store/rdl31w8i4j91lck67y5p5cv2bhllwzj9-d2-0.7.1.drv",
+      "description": "Modern diagram scripting language that turns text to diagrams",
+      "install_id": "d2",
+      "license": "MPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "d2-0.7.1",
+      "pname": "d2",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T07:42:41.633241Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.7.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/d8w1acp6pbxw6w7c32z2xywn0h7wx100-d2-0.7.1"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "jdk21",
+      "broken": false,
+      "derivation": "/nix/store/hm5ja70cy6a07vddifl8yyasdsrqmv2h-zulu-ca-jdk-21.0.8.drv",
+      "description": "Certified builds of OpenJDK",
+      "install_id": "jdk21",
+      "license": "GPL-2.0-only",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "zulu-ca-jdk-21.0.8",
+      "pname": "jdk21",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T06:05:34.376886Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "21.0.8",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/z6sy07psaxfanyd700hxsmig3zn0wxpx-zulu-ca-jdk-21.0.8"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "jdk21",
+      "broken": false,
+      "derivation": "/nix/store/im7lrvn459pfji03pmfhn34q1y0s4xgb-openjdk-21.0.10+7.drv",
+      "description": "Open-source Java Development Kit",
+      "install_id": "jdk21",
+      "license": "GPL-2.0-only",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "openjdk-21.0.10+7",
+      "pname": "jdk21",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T06:37:34.142169Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "21.0.10+7",
+      "outputs_to_install": [
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "debug": "/nix/store/8byahby6s6rkx28ng1vnyh6dfxinnr5w-openjdk-21.0.10+7-debug",
+        "out": "/nix/store/nsjy736drsfnp0g5i1z413pwsz1n88gs-openjdk-21.0.10+7"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "jdk21",
+      "broken": false,
+      "derivation": "/nix/store/wjgnyjyyj37263jxr5y29p48qw8ag3b0-zulu-ca-jdk-21.0.8.drv",
+      "description": "Certified builds of OpenJDK",
+      "install_id": "jdk21",
+      "license": "GPL-2.0-only",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "zulu-ca-jdk-21.0.8",
+      "pname": "jdk21",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T07:08:18.319335Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "21.0.8",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/rd9lrhvl2qfp7z9c85xj2k0ak2f5q7d0-zulu-ca-jdk-21.0.8"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "jdk21",
+      "broken": false,
+      "derivation": "/nix/store/19mq6424wpzx7cx4mnzlb4c5qrrh2ja3-openjdk-21.0.10+7.drv",
+      "description": "Open-source Java Development Kit",
+      "install_id": "jdk21",
+      "license": "GPL-2.0-only",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "openjdk-21.0.10+7",
+      "pname": "jdk21",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T07:43:03.303078Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "21.0.10+7",
+      "outputs_to_install": [
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "debug": "/nix/store/dxzpjpy67jc4630dfmpn6nixgrf5mab5-openjdk-21.0.10+7-debug",
+        "out": "/nix/store/kiaiabxhnl2a15zpiamqvg13wfx1ikal-openjdk-21.0.10+7"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "tlaplus",
+      "broken": false,
+      "derivation": "/nix/store/jv41dczddjr8gb5wmnyqqcyxn6shsy8j-tlaplus-1.7.4.drv",
+      "description": "Algorithm specification language with model checking tools",
+      "install_id": "tlaplus",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "tlaplus-1.7.4",
+      "pname": "tlaplus",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T06:07:29.646687Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.7.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/k03d2jv06dykig7ymy4619gn6flw2zlq-tlaplus-1.7.4"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "tlaplus",
+      "broken": false,
+      "derivation": "/nix/store/iv6pdiqp9m0haibpwbjdy7a5b3rgafz7-tlaplus-1.7.4.drv",
+      "description": "Algorithm specification language with model checking tools",
+      "install_id": "tlaplus",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "tlaplus-1.7.4",
+      "pname": "tlaplus",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T06:40:13.116036Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.7.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/ibb4iz5wrys8vx7833smjfb54z7qkpjh-tlaplus-1.7.4"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "tlaplus",
+      "broken": false,
+      "derivation": "/nix/store/rmh3wrjvl1406bfczrf2h7lzbd49s83y-tlaplus-1.7.4.drv",
+      "description": "Algorithm specification language with model checking tools",
+      "install_id": "tlaplus",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "tlaplus-1.7.4",
+      "pname": "tlaplus",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T07:10:12.302610Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.7.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/qrbdzwd4i64iwsi01y8ysmmxgb7yj1ln-tlaplus-1.7.4"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "tlaplus",
+      "broken": false,
+      "derivation": "/nix/store/xhakwnj8nngf2palcjmnmz356z8v5mmx-tlaplus-1.7.4.drv",
+      "description": "Algorithm specification language with model checking tools",
+      "install_id": "tlaplus",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "name": "tlaplus-1.7.4",
+      "pname": "tlaplus",
+      "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+      "rev_count": 980183,
+      "rev_date": "2026-04-14T12:31:25Z",
+      "scrape_date": "2026-04-16T07:45:46.053617Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.7.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/3idpyx0g15y555f6kx7h7a3kjyra9rf1-tlaplus-1.7.4"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    }
+  ]
+}
