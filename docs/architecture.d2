@@ -28,15 +28,23 @@ viaduck: Viaduck {
   poll: "Poll Loop" {
     shape: step
   }
-  cdc: "CDC Read\n(table_insertions)" {
+  cdc: "CDC Read\n(table_changes)" {
+    shape: step
+  }
+  resolve: "Preimage Resolution\n+ Conflict Resolution" {
     shape: step
   }
   route: "Router\n(Arrow split)" {
     shape: step
   }
-  # Force vertical order: poll above cdc
+  apply: "Apply\ndelete → upsert\n(in transaction)" {
+    shape: step
+  }
+  # Force vertical order
   poll -> cdc: "current_snapshot()"
-  cdc -> route: "filter_expr pushdown"
+  cdc -> resolve: "inserts + deletes\n+ updates"
+  resolve -> route: "filter_expr pushdown"
+  route -> apply
 }
 
 dest: Destination DuckLakes {
@@ -60,7 +68,7 @@ dest: Destination DuckLakes {
 }
 
 viaduck.poll -> source.state: "load/advance cursors"
-source.events -> viaduck.cdc: "CDC insertions\n(snapshot range)"
-viaduck.route -> dest.quacksworth: "company='quacksworth'"
-viaduck.route -> dest.mallardine: "company='mallardine'"
-viaduck.route -> dest.tealford: "company='tealford'"
+source.events -> viaduck.cdc: "CDC changes\n(snapshot range)"
+viaduck.apply -> dest.quacksworth: "delete + upsert"
+viaduck.apply -> dest.mallardine: "delete + upsert"
+viaduck.apply -> dest.tealford: "delete + upsert"

@@ -9,6 +9,7 @@ import pytest
 from viaduck.config import (
     ConfigError,
     PartitionConfig,
+    RoutingConfig,
     _merge_defaults,
     _require_non_empty,
     _resolve_env_properties,
@@ -405,3 +406,37 @@ def test_load_non_mapping_yaml(tmp_path: Path):
     p.write_text("- a list\n- not a mapping\n")
     with pytest.raises(ConfigError, match="YAML mapping"):
         load(p)
+
+
+# --- key_columns config ---
+
+
+def test_load_with_key_columns(tmp_path: Path):
+    """YAML with key_columns: [event_id, company] parses correctly."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  key_columns: [event_id, company]"))
+    cfg = load(p)
+    assert cfg.routing.key_columns == ["event_id", "company"]
+
+
+def test_load_without_key_columns_defaults_empty(config_file: Path):
+    """YAML without key_columns defaults to []."""
+    cfg = load(config_file)
+    assert cfg.routing.key_columns == []
+
+
+def test_load_key_columns_empty_list(tmp_path: Path):
+    """Explicit key_columns: [] is valid."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  key_columns: []"))
+    cfg = load(p)
+    assert cfg.routing.key_columns == []
+
+
+def test_routing_config_has_key_columns():
+    """RoutingConfig dataclass has key_columns field."""
+    rc = RoutingConfig(field="company", key_columns=["event_id", "company"])
+    assert rc.key_columns == ["event_id", "company"]
+
+    rc_default = RoutingConfig(field="company")
+    assert rc_default.key_columns == []

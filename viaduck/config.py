@@ -63,6 +63,7 @@ class SourceConfig:
 @dataclass(frozen=True)
 class RoutingConfig:
     field: str
+    key_columns: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,7 @@ def load(path: str | Path) -> ViaduckConfig:
         raise ConfigError("'routing' section is required")
     routing = RoutingConfig(
         field=_require_non_empty(rt.get("field", ""), "routing.field"),
+        key_columns=rt.get("key_columns", []),
     )
 
     # Defaults

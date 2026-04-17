@@ -1,6 +1,6 @@
 # Viaduck — DuckLake to DuckLake CDC Replication
 
-A standalone Python app that replicates data from a source DuckLake table to N destination DuckLake tables using CDC (Change Data Capture). Single thread, single poll loop, no framework.
+A standalone Python app that replicates data from a source DuckLake table to N destination DuckLake tables using CDC (Change Data Capture). Supports inserts, deletes, and updates. Single thread, single poll loop, no framework.
 
 ## Naming
 
@@ -10,17 +10,19 @@ Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* an
 
 ## Why
 
-Multi-tenant DuckLake architectures need per-tenant table isolation — separate catalogs, separate S3 paths, separate Postgres metadata stores. Viaduck reads CDC insertions from a shared source table, routes rows by a configurable field (e.g. `company`), and writes each partition to the correct tenant's DuckLake. Think of it as a data viaduct with N exits.
+Multi-tenant DuckLake architectures need per-tenant table isolation — separate catalogs, separate S3 paths, separate Postgres metadata stores. Viaduck reads CDC changes from a shared source table, routes rows by a configurable field (e.g. `company`), and writes each partition to the correct tenant's DuckLake. Think of it as a data viaduct with N exits.
 
 ```
 loop:
   current_snapshot() on source
   group destinations by cursor position
   for each group:
-    table_insertions(start, end, filter_expr)  → CDC read
-    split by routing field                      → Arrow routing
-    append() to each destination                → write
-    advance_cursor() in transaction             → state update
+    table_changes(start, end, filter_expr)  → CDC read (inserts + deletes + updates)
+    resolve preimages                        → handle cross-tenant migration
+    split by routing field                   → Arrow routing
+    resolve conflicts                        → cancel insert+delete pairs
+    delete + upsert (in transaction)         → atomic apply
+    advance_cursor() in transaction          → state update
 ```
 
 Single thread, single loop. DuckLake snapshots are the cursor. State is tracked on the source catalog. Designed for high fanout (100s-1000s of destinations).
@@ -37,14 +39,23 @@ Core modules:
 
 | Module | Responsibility | Source |
 |--------|---------------|--------|
-| [`main.py`](viaduck/main.py) | Poll loop, signal handling, retry logic | Entry point |
+| [`main.py`](viaduck/main.py) | Poll loop, 3-phase CDC apply, signal handling, retry logic | Entry point |
 | [`config.py`](viaduck/config.py) | YAML parsing, env var resolution, validation | Configuration |
-| [`source.py`](viaduck/source.py) | Source catalog connection, CDC reading | CDC |
+| [`source.py`](viaduck/source.py) | Source catalog connection, CDC reading (`table_changes` / `table_insertions`) | CDC |
 | [`router.py`](viaduck/router.py) | Arrow splitting by routing field | Routing |
 | [`destination.py`](viaduck/destination.py) | LRU connection pool for destination catalogs | Connections |
 | [`state.py`](viaduck/state.py) | `_viaduck_state` table CRUD on source | State tracking |
 | [`metrics.py`](viaduck/metrics.py) | Prometheus metric definitions | Observability |
 | [`server.py`](viaduck/server.py) | HTTP `/metrics`, `/healthz`, `/readyz` | Health checks |
+
+## Two Modes
+
+Viaduck operates in one of two modes based on the `key_columns` configuration:
+
+| Mode | Config | CDC API | Destination writes | Use case |
+|------|--------|---------|-------------------|----------|
+| **Append-only** | `key_columns` omitted or `[]` | `table_insertions()` | `append()` | Append-only tables, no primary key |
+| **Full CDC** | `key_columns: [event_id]` | `table_changes()` | `delete()` + `upsert()` | Tables with primary keys, full replication |
 
 ## Poll Cycle
 
@@ -57,25 +68,25 @@ Each poll cycle ([`main.py:_poll_cycle`](viaduck/main.py)):
 1. **Snapshot check** — `current_snapshot()` on the source table. If no snapshots exist, sleep and retry.
 2. **Load cursors** — read `_viaduck_state` to get each destination's `last_snapshot_id`. Uses filter pushdown with `In` + `EqualTo` expressions ([`state.py:load_cursors`](viaduck/state.py)).
 3. **Group by cursor** — destinations at the same snapshot share a single CDC read ([`main.py:_group_by_cursor`](viaduck/main.py)). This avoids re-reading data for caught-up destinations.
-4. **CDC read** — `table_insertions(start, end, filter_expr)` with a SQL `IN` clause pushed down to DuckLake for server-side filtering ([`source.py:read_cdc`](viaduck/source.py)).
-5. **Route** — `split_and_count()` uses PyArrow compute to partition the Arrow table by routing field value in a single pass. Also counts unrouted rows ([`router.py:split_and_count`](viaduck/router.py)).
-6. **Write** — `append()` each filtered batch to the corresponding destination. Retries 3x with exponential backoff ([`main.py:_write_with_retry`](viaduck/main.py)).
-7. **Advance cursor** — `delete` + `insert` within a pyducklake `begin_transaction()` on the source catalog. Atomic — a crash during this operation triggers a rollback, preserving the previous cursor ([`state.py:advance_cursor`](viaduck/state.py)).
-8. **Lag metrics** — update per-destination snapshot lag gauges.
+4. **CDC read** — In full CDC mode: `table_changes(start, end, filter_expr)` reads inserts, deletes, and update pre/post images. In append-only mode: `table_insertions(start, end, filter_expr)` reads inserts only. Both use SQL `IN` pushdown ([`source.py`](viaduck/source.py)).
+5. **Phase 1: Preimage Resolution** *(full CDC only)* — pair `update_preimage` with `update_postimage` rows by `rowid`. If routing values differ (cross-tenant migration), convert preimage to a delete on the old destination. Drop same-tenant preimages (upsert handles them). Convert orphaned preimages to deletes ([`main.py:_resolve_preimages`](viaduck/main.py)).
+6. **Route** — `split_and_count()` uses PyArrow compute to partition the Arrow table by routing field value in a single pass. Counts unrouted rows ([`router.py:split_and_count`](viaduck/router.py)).
+7. **Phase 2: Conflict Resolution** *(full CDC only)* — within each per-destination batch, cancel `insert + delete` pairs for the same `rowid` (net no-op). Drop `update_postimage` rows shadowed by a delete for the same `rowid` ([`main.py:_resolve_conflicts`](viaduck/main.py)).
+8. **Phase 3: Apply** *(full CDC only)* — within a destination `catalog.begin_transaction()`: delete matching rows first, then upsert inserts + postimages. Atomic — crash during apply triggers rollback ([`main.py:_apply_changes`](viaduck/main.py)). In append-only mode: `append()` only.
+9. **Advance cursor** — `delete` + `insert` within a pyducklake `begin_transaction()` on the source catalog ([`state.py:advance_cursor`](viaduck/state.py)).
+10. **Lag metrics** — update per-destination snapshot lag gauges.
 
 ## CDC Operations and Semantics
 
 ### What CDC events are supported
 
-Viaduck uses pyducklake's `table_insertions()` API, which captures **append-only** CDC. This covers:
-
-| Operation | Supported | Notes |
-|-----------|-----------|-------|
-| INSERT / append | Yes | Core use case. Rows inserted between snapshots are read and routed. |
-| DELETE | **No** | `table_deletions()` exists in pyducklake but viaduck does not consume it. Deletes on the source are not propagated. |
-| UPDATE | **No** | DuckLake models updates as delete + insert. Viaduck would need to consume both `table_deletions()` and `table_insertions()` to replicate updates, which it does not yet do. |
-| UPSERT / MERGE | **No** | Same limitation as UPDATE. |
-| Schema evolution | **Partial** | New columns on the source are included in CDC reads. However, destination table schemas are created once from the source schema at connection time and **not** automatically evolved. A viaduck restart picks up the new schema for newly created destination tables. |
+| Operation | Append-only mode | Full CDC mode | Notes |
+|-----------|-----------------|---------------|-------|
+| INSERT | Yes | Yes | Core use case. Rows inserted between snapshots are read and routed. |
+| DELETE | No | Yes | Deleted rows are replicated via `table.delete(filter)` on destinations. Requires `key_columns`. |
+| UPDATE | No | Yes | DuckLake models updates as preimage + postimage. Viaduck upserts postimages via `table.upsert(df, key_columns)`. |
+| Cross-tenant UPDATE | No | Yes | When an update changes the routing value (e.g. `company`), the row is deleted from the old destination and inserted to the new one. Metricked via `viaduck_cdc_routing_mutations_total`. |
+| Schema evolution | Partial | Partial | New source columns included in CDC reads. Destination schemas not auto-evolved. Restart viaduck for new destinations to get updated schema. |
 
 ### CDC permutations handled
 
@@ -83,13 +94,19 @@ Viaduck uses pyducklake's `table_insertions()` API, which captures **append-only
 |----------|----------|--------|
 | No snapshots on source | Poll returns early, sleeps | [`test_poll_cycle_no_snapshots`](tests/unit/test_main.py) |
 | All destinations caught up | No CDC reads, no writes | [`test_poll_cycle_all_caught_up`](tests/unit/test_main.py) |
-| Empty changeset (snapshot advanced, no matching rows) | Cursors advanced without writing | [`test_poll_cycle_empty_changeset_advances_cursors`](tests/unit/test_main.py) |
+| Empty changeset | Cursors advanced without writing | [`test_poll_cycle_empty_changeset_advances_cursors`](tests/unit/test_main.py) |
 | Destinations at different snapshots | Grouped CDC reads — one per distinct cursor position | [`test_group_by_cursor_mixed`](tests/unit/test_main.py) |
-| New destination (no prior state) | Initialized at snapshot 0, replays full history | [`test_initialize_destinations_creates_new`](tests/unit/test_state.py), [`test_poll_cycle_snapshot_at_zero`](tests/unit/test_main.py) |
-| Rows with no matching destination | Counted as unrouted, metricked via `viaduck_unrouted_rows_total`, silently dropped | [`test_split_string_no_match`](tests/unit/test_router.py) |
-| NULL values in routing column | Not routed to any destination, counted as unrouted | [`test_split_null_values_not_routed`](tests/unit/test_router.py), [`test_split_all_null_routing_column`](tests/unit/test_router.py) |
-| Routing field missing from source schema | `RoutingError` raised, group processing halted, error metricked | [`test_split_missing_field_raises_routing_error`](tests/unit/test_router.py), [`test_poll_cycle_routing_error_breaks_gracefully`](tests/unit/test_main.py) |
-| Routing value type mismatch (e.g. non-numeric value for integer column) | `RoutingError` raised with descriptive message | [`test_split_invalid_integer_routing_value`](tests/unit/test_router.py), [`test_split_invalid_float_routing_value`](tests/unit/test_router.py) |
+| New destination (no prior state) | Initialized at snapshot 0, replays full history | [`test_initialize_destinations_creates_new`](tests/unit/test_state.py) |
+| Rows with no matching destination | Counted as unrouted, metricked, silently dropped | [`test_split_string_no_match`](tests/unit/test_router.py) |
+| NULL values in routing column | Not routed, counted as unrouted | [`test_split_null_values_not_routed`](tests/unit/test_router.py) |
+| Routing field missing from schema | `RoutingError` raised, group processing halted | [`test_poll_cycle_routing_error_breaks_gracefully`](tests/unit/test_main.py) |
+| Insert then delete same row in range | Conflict resolution cancels both — net no-op | [`test_resolve_conflicts_insert_delete_cancel`](tests/unit/test_main.py), [`test_torture_insert_update_delete_same_key`](tests/unit/test_main.py) |
+| Update then delete same row | Postimage dropped, delete kept — row removed | [`test_resolve_conflicts_update_delete_keeps_delete`](tests/unit/test_main.py) |
+| Same key, different logical rows | NOT cancelled — uses `rowid` to distinguish | [`test_resolve_conflicts_same_key_different_rowid_no_cancel`](tests/unit/test_main.py) |
+| Cross-tenant row migration | Preimage → delete on old dest, postimage → upsert on new dest | [`test_resolve_preimages_cross_tenant_converts_to_delete`](tests/unit/test_main.py), [`test_torture_routing_value_mutation_cross_tenant`](tests/unit/test_main.py) |
+| Orphaned preimage (no postimage) | Converted to delete (defensive) | [`test_resolve_preimages_orphaned_converts_to_delete`](tests/unit/test_main.py) |
+| NULL in key column | Delete filter uses `IS NULL` | [`test_build_delete_filter_null_in_key`](tests/unit/test_main.py), [`test_torture_delete_filter_null_composite_key`](tests/unit/test_main.py) |
+| Delete-only changeset | Only deletes applied, cursor advanced | [`test_apply_changes_deletes_only`](tests/unit/test_main.py) |
 
 ### Delivery guarantees
 
@@ -97,7 +114,8 @@ Viaduck uses pyducklake's `table_insertions()` API, which captures **append-only
 
 - If the process crashes **after writing** to a destination but **before advancing the cursor**, the next poll will re-read the same CDC range and re-write the same rows. Destinations must tolerate duplicates.
 - If the process crashes **during the cursor transaction**, the transaction is rolled back and the cursor stays at its previous value. The same data is re-read and re-written. No data loss.
-- If a destination write fails, the cursor is not advanced for that destination. Other destinations are unaffected. The failed destination retries automatically on the next poll.
+- In full CDC mode, deletes + upserts on each destination are applied within a **single transaction**. A crash mid-apply rolls back both — no partial state.
+- If a destination write fails, the cursor is not advanced for that destination. Other destinations are unaffected.
 
 There is **no data loss path**. The source DuckLake's snapshot history is the durable log.
 
@@ -110,15 +128,15 @@ Source: [`docs/failure-modes.d2`](docs/failure-modes.d2)
 | Failure | Impact | Recovery | Isolation |
 |---------|--------|----------|-----------|
 | Source catalog unavailable | CDC read fails | Fatal — crash, K8s restart, resume from last cursor | All destinations blocked |
-| Destination catalog unavailable | `append()` fails | 3 retries with backoff ([`main.py:_write_with_retry`](viaduck/main.py)), then error recorded, connection evicted. Cursor not advanced — automatic retry next poll. | **Per-destination** — other destinations unaffected ([`test_poll_cycle_handles_write_failure`](tests/unit/test_main.py)) |
+| Destination catalog unavailable | Write fails | 3 retries with backoff ([`main.py:_write_with_retry`](viaduck/main.py)), then error recorded, connection evicted. Cursor not advanced — automatic retry next poll. | **Per-destination** — other destinations unaffected ([`test_poll_cycle_handles_write_failure`](tests/unit/test_main.py)) |
 | Crash after write, before state update | Destination has data but cursor not advanced | At-least-once: re-reads and re-writes on restart. Duplicates possible. | Per-destination |
-| State transaction failure | `delete` + `insert` rolled back by pyducklake ([`transaction.py`](https://github.com/posthog/pyducklake)) | Cursor preserved at old value. Same data retried next poll. | Per-destination |
-| Routing field missing from source | `RoutingError` halts group processing | Error metricked (`viaduck_errors_total{type="routing"}`), logged. Requires config or schema fix. | All destinations in group |
-| Connection pool eviction storm | Frequent close/reopen of catalogs | Automatic via LRU. Increase `max_open` if thrashing. Metricked via `viaduck_pool_evictions_total`. | Performance, not correctness |
+| State transaction failure | `delete` + `insert` rolled back | Cursor preserved at old value. Same data retried next poll. | Per-destination |
+| Destination apply failure (full CDC) | Delete + upsert transaction rolled back | No partial state on destination. Retried next poll. | Per-destination |
+| Routing field missing from source | `RoutingError` halts group processing | Error metricked, logged. Requires config or schema fix. | All destinations in group |
+| Connection pool eviction storm | Frequent close/reopen | Automatic via LRU. Increase `max_open` if thrashing. | Performance, not correctness |
 
 ## Not Yet Supported
 
-- **DELETE / UPDATE replication** — source deletes and updates are not propagated to destinations. Only inserts.
 - **Dynamic destination discovery** — destinations are defined statically in YAML. No runtime discovery from a DuckLake table.
 - **Schema evolution propagation** — source schema changes are not automatically applied to existing destination tables. Requires viaduck restart.
 - **Exactly-once delivery** — at-least-once only. No deduplication layer.
@@ -146,6 +164,8 @@ source:
 
 routing:
   field: "company"                           # column in source table to route on
+  key_columns: ["event_id"]                  # primary key for delete/update replication
+                                             # omit or [] for append-only mode
 
 destinations:
   - id: "quacksworth-lake"                   # internal identifier (state tracking, logs)
@@ -185,6 +205,16 @@ Config parsing and validation: [`config.py`](viaduck/config.py), tests: [`test_c
 
 Routing values can be strings or integers (YAML unquoted integers are coerced to strings). The router detects the source column's Arrow type at runtime and casts accordingly ([`router.py:_make_scalar`](viaduck/router.py)).
 
+### Routing column immutability
+
+**The routing column must not be updated.** Viaduck assumes the routing field value is immutable for the lifetime of a row. This is a design constraint that enables efficient CDC filter pushdown — the `filter_expr` in `table_changes()` only includes the current destination routing values, which would miss preimages whose routing value was changed to a value outside the current set.
+
+If a routing column mutation is detected (e.g. via an UPDATE that changes `company`), viaduck handles it defensively (delete from old destination, upsert to new) and logs an ERROR with the `viaduck_cdc_routing_mutations_total` metric. However, **data integrity is not guaranteed** in this case — other preimages may have been dropped by the filter pushdown.
+
+### Reserved column names
+
+When using full CDC mode (`key_columns` configured), the source table must not use the column names `change_type`, `snapshot_id`, or `rowid`. These are metadata columns injected by DuckLake's `ducklake_table_changes()` function and are stripped before writing to destinations.
+
 ## State Tracking
 
 Viaduck stores per-destination replication cursors in a `_viaduck_state` table on the **source** DuckLake catalog ([`state.py`](viaduck/state.py)):
@@ -194,7 +224,7 @@ Viaduck stores per-destination replication cursors in a `_viaduck_state` table o
 | `destination_id` | VARCHAR | Which destination (e.g. "quacksworth-lake") |
 | `instance_id` | VARCHAR | Which viaduck instance owns this cursor |
 | `last_snapshot_id` | BIGINT | Last successfully replicated source snapshot |
-| `rows_replicated` | BIGINT | Cumulative rows written to this destination |
+| `rows_replicated` | BIGINT | Cumulative operations applied to this destination |
 | `last_error` | VARCHAR | Last error message (NULL if healthy) |
 | `updated_at` | TIMESTAMPTZ | When this row was last modified |
 
@@ -229,22 +259,29 @@ Each instance only processes its assigned destinations. State rows are keyed by 
 
 ## Metrics
 
-12 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
+19 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
 
-| Metric | Type | Labels |
-|--------|------|--------|
-| `viaduck_polls_total` | Counter | — |
-| `viaduck_cdc_read_seconds` | Histogram | — |
-| `viaduck_cdc_rows_read_total` | Counter | — |
-| `viaduck_source_snapshot_id` | Gauge | — |
-| `viaduck_dest_write_seconds` | Histogram | destination |
-| `viaduck_dest_rows_written_total` | Counter | destination |
-| `viaduck_dest_last_snapshot_id` | Gauge | destination |
-| `viaduck_dest_lag_snapshots` | Gauge | destination |
-| `viaduck_unrouted_rows_total` | Counter | — |
-| `viaduck_pool_open_connections` | Gauge | — |
-| `viaduck_pool_evictions_total` | Counter | — |
-| `viaduck_errors_total` | Counter | type, destination |
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `viaduck_polls_total` | Counter | — | Poll cycles executed |
+| `viaduck_cdc_read_seconds` | Histogram | — | Time to read CDC from source |
+| `viaduck_cdc_rows_read_total` | Counter | — | Total rows read from source |
+| `viaduck_cdc_batch_rows` | Histogram | — | Rows per CDC read (monitors batch sizes; large values indicate poll interval too slow) |
+| `viaduck_source_snapshot_id` | Gauge | — | Current source snapshot ID |
+| `viaduck_dest_write_seconds` | Histogram | destination | Time per destination write |
+| `viaduck_dest_rows_written_total` | Counter | destination | Rows appended (append-only mode) |
+| `viaduck_dest_rows_deleted_total` | Counter | destination | Rows deleted via CDC |
+| `viaduck_dest_rows_upserted_total` | Counter | destination | Rows sent to upsert (input count) |
+| `viaduck_dest_upsert_matched_total` | Counter | destination | Rows that matched existing rows during upsert (updates vs inserts) |
+| `viaduck_dest_last_snapshot_id` | Gauge | destination | Last replicated snapshot |
+| `viaduck_dest_lag_snapshots` | Gauge | destination | Snapshot lag per destination |
+| `viaduck_unrouted_rows_total` | Counter | — | Rows with no matching destination |
+| `viaduck_pool_open_connections` | Gauge | — | Open destination connections |
+| `viaduck_pool_evictions_total` | Counter | — | LRU evictions |
+| `viaduck_cdc_routing_mutations_total` | Counter | — | Cross-tenant routing value changes |
+| `viaduck_cdc_conflicts_resolved_total` | Counter | — | Insert+delete pairs cancelled |
+| `viaduck_cdc_orphaned_preimages_total` | Counter | — | Preimages with no matching postimage |
+| `viaduck_errors_total` | Counter | type, destination | Errors by type |
 
 ## Setup
 
@@ -261,7 +298,9 @@ just lint              # lint code
 just test              # run unit tests
 just test-integration  # run integration tests (local DuckDB)
 just test-e2e          # run E2E tests (docker-compose)
-just ci                # format check + lint + unit tests
+just ci                # format check + lint + unit tests + docs check
+just docs              # render d2 diagrams to SVG
+just docs-check        # verify all README links are valid
 just up                # start docker-compose stack
 just down              # stop docker-compose stack
 ```

@@ -5,10 +5,20 @@ snapshot: "current_snapshot()" { shape: step }
 no_snap: "No snapshot?\nSleep & retry" { shape: diamond }
 load: "Load cursors from\n_viaduck_state" { shape: step }
 group: "Group destinations\nby last_snapshot_id" { shape: step }
-cdc: "table_insertions(\nstart, end,\nfilter_expr)" { shape: step }
+
+mode: "key_columns\nconfigured?" { shape: diamond }
+cdc_changes: "table_changes(\nstart, end,\nfilter_expr)" { shape: step }
+cdc_insert: "table_insertions(\nstart, end,\nfilter_expr)" { shape: step }
+
 empty: "Empty\nchangeset?" { shape: diamond }
-route: "split_and_count()\nArrow routing" { shape: step }
-write: "append() to each\ndestination" { shape: step }
+
+phase1: "Phase 1: Resolve Preimages\n• pair by rowid\n• cross-tenant → delete\n• orphaned → delete" { shape: step }
+route: "Route: split_and_count()\nArrow split by routing field" { shape: step }
+phase2: "Phase 2: Resolve Conflicts\n• insert+delete same rowid → cancel\n• postimage+delete → drop postimage" { shape: step }
+phase3: "Phase 3: Apply (in txn)\n• delete matching rows\n• upsert inserts + postimages" { shape: step }
+
+append: "append() to each\ndestination" { shape: step }
+
 advance: "advance_cursor()\n(in transaction)" { shape: step }
 fail: "Write failed?" { shape: diamond }
 retry: "Retry with\nbackoff (3x)" { shape: step }
@@ -22,12 +32,26 @@ snapshot -> no_snap
 no_snap -> done: "yes"
 no_snap -> load: "no"
 load -> group
-group -> cdc: "for each snapshot group"
-cdc -> empty
+group -> mode: "for each snapshot group"
+
+mode -> cdc_changes: "yes (full CDC)"
+mode -> cdc_insert: "no (append-only)"
+
+cdc_changes -> empty
+cdc_insert -> empty
+
 empty -> advance_empty: "yes (0 rows)"
-empty -> route: "no"
-route -> write: "for each destination batch"
-write -> fail
+empty -> phase1: "no (full CDC)"
+empty -> route: "no (append-only)"
+
+phase1 -> route
+route -> phase2: "full CDC"
+route -> append: "append-only"
+phase2 -> phase3
+
+phase3 -> fail
+append -> fail
+
 fail -> advance: "no"
 fail -> retry: "yes"
 retry -> error: "exhausted"
