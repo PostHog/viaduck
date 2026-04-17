@@ -134,15 +134,47 @@ wheels = [
 [[package]]
 name = "pyducklake"
 version = "1.0.3"
-source = { registry = "https://pypi.org/simple" }
+source = { editable = "../pyducklake" }
 dependencies = [
     { name = "click" },
     { name = "duckdb" },
     { name = "pyarrow" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/85/41/ff5f82d34f0e11097e7c6ccba24ca4f455f52e35b5968493e653f4cb4286/pyducklake-1.0.3.tar.gz", hash = "sha256:6ffe636bbb410b77d3e514d8c24386d48bdfabbc3a70be7332a9cc63181054bc", size = 118831, upload-time = "2026-04-06T00:11:16.216Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a5/dc/37e2a79301f62dabfb690b6d564ea24a54e0b2cae9c1d18594919c4c7eab/pyducklake-1.0.3-py3-none-any.whl", hash = "sha256:9b789991017763aa18e3eeae694b5c74e52b3ca3b17ee9069fb7df1515603c51", size = 48905, upload-time = "2026-04-06T00:11:14.771Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "click", specifier = ">=8.0,<9" },
+    { name = "duckdb", specifier = ">=1.4,<2" },
+    { name = "pandas", marker = "extra == 'all'", specifier = ">=2.0" },
+    { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.0" },
+    { name = "polars", marker = "extra == 'all'", specifier = ">=0.20" },
+    { name = "polars", marker = "extra == 'polars'", specifier = ">=0.20" },
+    { name = "pyarrow", specifier = ">=18.0,<24" },
+    { name = "ray", extras = ["data"], marker = "extra == 'all'", specifier = ">=2.0" },
+    { name = "ray", extras = ["data"], marker = "extra == 'ray'", specifier = ">=2.0" },
+]
+provides-extras = ["pandas", "polars", "ray", "all"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "cryptography", specifier = ">=46.0.6" },
+    { name = "hypothesis", specifier = ">=6.151.12" },
+    { name = "minio", specifier = ">=7.2.20" },
+    { name = "mypy", specifier = ">=1.10" },
+    { name = "pandas", specifier = ">=2.0" },
+    { name = "pdoc", specifier = ">=16.0.0" },
+    { name = "polars", specifier = ">=1.39.3" },
+    { name = "psycopg2-binary", specifier = ">=2.9.11" },
+    { name = "pyarrow-stubs", specifier = ">=18.0" },
+    { name = "pymysql", specifier = ">=1.1.2" },
+    { name = "pyright", specifier = ">=1.1" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-benchmark", specifier = ">=5.2.3" },
+    { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "pytest-randomly", specifier = ">=4.0.1" },
+    { name = "pytz", specifier = ">=2026.1.post1" },
+    { name = "ruff", specifier = ">=0.8" },
+    { name = "testcontainers", specifier = ">=4.14.2" },
 ]
 
 [[package]]
@@ -168,6 +200,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7d/0d/549bd94f1a0a402dc8cf64563a117c0f3765662e2e668477624baeec44d5/pytest-9.0.3.tar.gz", hash = "sha256:b86ada508af81d19edeb213c681b1d48246c1a91d304c6c81a427674c17eb91c", size = 1572165, upload-time = "2026-04-07T17:16:18.027Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d4/24/a372aaf5c9b7208e7112038812994107bc65a84cd00e0354a88c2c77a617/pytest-9.0.3-py3-none-any.whl", hash = "sha256:2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9", size = 375249, upload-time = "2026-04-07T17:16:16.13Z" },
+]
+
+[[package]]
+name = "pytz"
+version = "2026.1.post1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/db/b8721d71d945e6a8ac63c0fc900b2067181dbb50805958d4d4661cf7d277/pytz-2026.1.post1.tar.gz", hash = "sha256:3378dde6a0c3d26719182142c56e60c7f9af7e968076f31aae569d72a0358ee1", size = 321088, upload-time = "2026-03-03T07:47:50.683Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/99/781fe0c827be2742bcc775efefccb3b048a3a9c6ce9aec0cbf4a101677e5/pytz-2026.1.post1-py2.py3-none-any.whl", hash = "sha256:f2fd16142fda348286a75e1a524be810bb05d444e5a081f37f7affc635035f7a", size = 510489, upload-time = "2026-03-03T07:47:49.167Z" },
 ]
 
 [[package]]
@@ -255,6 +296,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "pytz" },
     { name = "ruff" },
 ]
 
@@ -263,12 +305,13 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.4,<1.5" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "pyarrow", specifier = ">=18.0" },
-    { name = "pyducklake", specifier = ">=1.0" },
+    { name = "pyducklake", editable = "../pyducklake" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
+    { name = "pytz", specifier = ">=2026.1.post1" },
     { name = "ruff", specifier = ">=0.8" },
 ]

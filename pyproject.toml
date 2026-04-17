@@ -28,6 +28,7 @@ viaduck = "viaduck.main:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytz>=2026.1.post1",
     "ruff>=0.8",
 ]
 
@@ -37,6 +38,12 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+# TEMPORARY: pyducklake 1.0.3 on PyPI has a DuckDB 1.4.4 compat bug
+# (to_arrow_table → fetch_arrow_table). Remove this override once 1.0.4
+# is published.
+[tool.uv.sources]
+pyducklake = { path = "../pyducklake", editable = true }
 
 [tool.pytest.ini_options]
 markers = [

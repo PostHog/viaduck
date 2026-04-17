@@ -1,0 +1,169 @@
+services:
+  # --- Infrastructure ---
+
+  postgres-source:
+    image: postgres:17
+    hostname: postgres-source
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_USER: ducklake
+      POSTGRES_PASSWORD: ducklake
+      POSTGRES_DB: ducklake
+    healthcheck:
+      test: pg_isready -U ducklake -d ducklake
+      interval: 2s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  postgres-dest-1:
+    image: postgres:17
+    hostname: postgres-dest-1
+    environment:
+      POSTGRES_USER: ducklake
+      POSTGRES_PASSWORD: ducklake
+      POSTGRES_DB: ducklake
+    healthcheck:
+      test: pg_isready -U ducklake -d ducklake
+      interval: 2s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  postgres-dest-2:
+    image: postgres:17
+    hostname: postgres-dest-2
+    environment:
+      POSTGRES_USER: ducklake
+      POSTGRES_PASSWORD: ducklake
+      POSTGRES_DB: ducklake
+    healthcheck:
+      test: pg_isready -U ducklake -d ducklake
+      interval: 2s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    hostname: minio
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: mc ready local
+      interval: 2s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/source &&
+      mc mb --ignore-existing local/dest-1 &&
+      mc mb --ignore-existing local/dest-2
+      "
+
+  # --- Producer: writes sample events to source DuckLake ---
+
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VIADUCK_VERSION: "0.0.0.dev0"
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    entrypoint: python
+    command: /app/test/producer.py
+    environment:
+      SOURCE_POSTGRES_URI: "postgresql://ducklake:ducklake@postgres-source:5432/ducklake"
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_USE_SSL: "false"
+      S3_URL_STYLE: path
+      S3_DATA_PATH: s3://source/
+      BATCH_SIZE: "5"
+      BATCH_INTERVAL: "2"
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 10s
+    volumes:
+      - ./test:/app/test:ro
+
+  # --- Viaduck: CDC replication ---
+
+  viaduck:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VIADUCK_VERSION: "0.0.0.dev0"
+    depends_on:
+      producer:
+        condition: service_started
+      postgres-dest-1:
+        condition: service_healthy
+      postgres-dest-2:
+        condition: service_healthy
+    command: ["--config", "/app/test/viaduck-dev.yaml"]
+    environment:
+      SOURCE_POSTGRES_URI: "postgresql://ducklake:ducklake@postgres-source:5432/ducklake"
+      DEST_1_POSTGRES_URI: "postgresql://ducklake:ducklake@postgres-dest-1:5432/ducklake"
+      DEST_2_POSTGRES_URI: "postgresql://ducklake:ducklake@postgres-dest-2:5432/ducklake"
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - ./test:/app/test:ro
+
+  # --- Metrics & Dashboarding ---
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "127.0.0.1:9091:9090"
+    configs:
+      - source: prometheus-config
+        target: /etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+
+configs:
+  prometheus-config:
+    content: |
+      global:
+        scrape_interval: 5s
+      scrape_configs:
+        - job_name: viaduck
+          static_configs:
+            - targets:
+                - viaduck:8000
+        - job_name: minio
+          metrics_path: /minio/v2/metrics/cluster
+          static_configs:
+            - targets: ["minio:9000"]

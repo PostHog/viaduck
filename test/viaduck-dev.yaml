@@ -1,0 +1,42 @@
+source:
+  name: source
+  postgres_uri_env: SOURCE_POSTGRES_URI
+  data_path: s3://source/
+  table: events
+  properties:
+    s3_endpoint: minio:9000
+    s3_access_key_id_env: S3_ACCESS_KEY_ID
+    s3_secret_access_key_env: S3_SECRET_ACCESS_KEY
+    s3_use_ssl: "false"
+    s3_url_style: path
+
+routing:
+  field: company
+  key_columns: [event_id]
+
+defaults:
+  properties:
+    s3_endpoint: minio:9000
+    s3_access_key_id_env: S3_ACCESS_KEY_ID
+    s3_secret_access_key_env: S3_SECRET_ACCESS_KEY
+    s3_use_ssl: "false"
+    s3_url_style: path
+
+destinations:
+  - id: quacksworth-lake
+    routing_value: quacksworth
+    name: quacksworth
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+
+  - id: mallardine-lake
+    routing_value: mallardine
+    name: mallardine
+    postgres_uri_env: DEST_2_POSTGRES_URI
+    data_path: s3://dest-2/
+
+poll:
+  interval_seconds: 3
+
+server:
+  port: 8000
