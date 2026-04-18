@@ -14,7 +14,7 @@ from pyducklake.types import IntegerType, NestedField, StringType
 
 from viaduck import metrics
 from viaduck.config import RoutingConfig, StateConfig
-from viaduck.main import _apply_changes, _resolve_conflicts, _resolve_preimages
+from viaduck.main import _apply_changes, _resolve_conflicts, _resolve_preimages, _seed_new_destinations
 from viaduck.router import Router
 from viaduck.source import META_COLUMNS, strip_meta
 from viaduck.state import StateManager
@@ -447,3 +447,64 @@ def test_strip_meta_on_real_cdc_data(source_table):
     double_stripped = strip_meta(stripped)
     assert double_stripped.column_names == stripped.column_names
     assert double_stripped.num_rows == stripped.num_rows
+
+
+# ---------------------------------------------------------------------------
+# 8. Seed round trip
+# ---------------------------------------------------------------------------
+
+
+def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_table_a):
+    """Seed a new destination from a source with 4 rows (2 acme, 2 beta).
+
+    Verify destination gets only the 2 matching rows and cursor is at current snapshot.
+    """
+    from unittest.mock import MagicMock
+
+    # Insert 4 rows into source
+    source_table.append(
+        _arrow_rows(
+            [1, 2, 3, 4],
+            ["acme", "acme", "beta", "beta"],
+            [10, 20, 30, 40],
+        )
+    )
+
+    snap = source_table.current_snapshot()
+    assert snap is not None
+
+    # Set up StateManager
+    state_cfg = StateConfig(table="_viaduck_seed_test")
+    sm = StateManager(source_catalog, "seed-instance", state_cfg)
+    sm.initialize_destinations(["dest-acme"])
+
+    # Build a mock cfg that points at real routing config and destination
+    cfg = MagicMock()
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = ["event_id"]
+    cfg.routing.seed_mode = "scan"
+
+    dest_cfg = MagicMock()
+    dest_cfg.routing_value = "acme"
+    cfg.destination_by_id.return_value = dest_cfg
+
+    # Build a mock dest_pool that returns the real catalog and table
+    dest_pool = MagicMock()
+    dest_pool.get.return_value = (dest_catalog_a, dest_table_a)
+
+    # Capture snapshot as seen by _seed_new_destinations (after state table init advances it)
+    from viaduck import source as source_mod
+
+    expected_snap = source_mod.current_snapshot_id(source_table)
+
+    _seed_new_destinations(source_table, sm, dest_pool, cfg, ["dest-acme"])
+
+    # Verify destination has 2 acme rows
+    dest_scan = _read_all(dest_table_a)
+    assert dest_scan.num_rows == 2
+    assert sorted(dest_scan.column("event_id").to_pylist()) == [1, 2]
+    assert all(c == "acme" for c in dest_scan.column("company").to_pylist())
+
+    # Verify cursor is at the snapshot the seed function observed
+    cursors = sm.load_cursors(["dest-acme"])
+    assert cursors["dest-acme"].last_snapshot_id == expected_snap

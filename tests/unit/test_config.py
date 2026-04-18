@@ -440,3 +440,32 @@ def test_routing_config_has_key_columns():
 
     rc_default = RoutingConfig(field="company")
     assert rc_default.key_columns == []
+
+
+# --- seed_mode config ---
+
+
+def test_seed_mode_default_is_scan():
+    """RoutingConfig defaults seed_mode to 'scan'."""
+    rc = RoutingConfig(field="company")
+    assert rc.seed_mode == "scan"
+
+
+def test_seed_mode_cdc_replay():
+    """seed_mode='cdc_replay' is valid."""
+    rc = RoutingConfig(field="company", seed_mode="cdc_replay")
+    assert rc.seed_mode == "cdc_replay"
+
+
+def test_seed_mode_invalid():
+    """seed_mode='bogus' raises ConfigError."""
+    with pytest.raises(ConfigError, match="seed_mode"):
+        RoutingConfig(field="company", seed_mode="bogus")
+
+
+def test_load_with_seed_mode(tmp_path: Path):
+    """YAML with seed_mode parses correctly."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  seed_mode: cdc_replay"))
+    cfg = load(p)
+    assert cfg.routing.seed_mode == "cdc_replay"

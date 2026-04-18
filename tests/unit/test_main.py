@@ -15,6 +15,7 @@ from viaduck.main import (
     _poll_cycle,
     _resolve_conflicts,
     _resolve_preimages,
+    _seed_new_destinations,
     _write_with_retry,
 )
 from viaduck.router import RoutingError
@@ -1478,3 +1479,219 @@ def test_cdc_batch_rows_metric_observed():
         )
 
     mock_batch_metric.observe.assert_called_once_with(3)
+
+
+# ---------------------------------------------------------------------------
+# _seed_new_destinations
+# ---------------------------------------------------------------------------
+
+
+def test_seed_new_destinations_populates_from_scan():
+    """Scan returns 3 rows, they get appended to the destination table."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}  # no cursors -> snapshot_id=0
+
+    rows = pa.table({"company": ["acme", "acme", "acme"], "value": [1, 2, 3]})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow.return_value = rows
+    src_table.scan.return_value = mock_scan
+
+    mock_table = MagicMock()
+    dest_pool.get.return_value = (MagicMock(), mock_table)
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=100):
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    mock_table.append.assert_called_once_with(rows)
+    state_mgr.advance_cursor.assert_called_once_with("dest-1", 100, cumulative_rows=3)
+
+
+def test_seed_new_destinations_skips_existing():
+    """State manager returns a cursor with snapshot_id=50 (not 0). No scan happens."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    cursor = MagicMock()
+    cursor.last_snapshot_id = 50
+    state_mgr.load_cursors.return_value = {"dest-1": cursor}
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=100):
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    src_table.scan.assert_not_called()
+    dest_pool.get.assert_not_called()
+
+
+def test_seed_new_destinations_empty_source():
+    """source.current_snapshot_id returns None. Nothing happens."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=None):
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    state_mgr.load_cursors.assert_not_called()
+    src_table.scan.assert_not_called()
+
+
+def test_seed_new_destinations_no_matching_rows():
+    """Scan returns 0 rows. No append but cursor still advanced."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}
+
+    empty = pa.table({"company": pa.array([], type=pa.string()), "value": pa.array([], type=pa.int64())})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow.return_value = empty
+    src_table.scan.return_value = mock_scan
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=100):
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    dest_pool.get.assert_not_called()
+    state_mgr.advance_cursor.assert_called_once_with("dest-1", 100, cumulative_rows=0)
+
+
+def test_seed_new_destinations_uses_upsert_with_key_columns():
+    """cfg has key_columns=['event_id']. table.upsert() called instead of append."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = ["event_id"]
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}
+
+    rows = pa.table({"event_id": [1, 2], "company": ["acme", "acme"], "value": [10, 20]})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow.return_value = rows
+    src_table.scan.return_value = mock_scan
+
+    mock_table = MagicMock()
+    dest_pool.get.return_value = (MagicMock(), mock_table)
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=100):
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    mock_table.upsert.assert_called_once_with(rows, join_cols=["event_id"])
+    mock_table.append.assert_not_called()
+
+
+def test_seed_new_destinations_uses_append_without_key_columns():
+    """cfg has key_columns=[]. table.append() called."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}
+
+    rows = pa.table({"company": ["acme", "acme"], "value": [10, 20]})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow.return_value = rows
+    src_table.scan.return_value = mock_scan
+
+    mock_table = MagicMock()
+    dest_pool.get.return_value = (MagicMock(), mock_table)
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=100):
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    mock_table.append.assert_called_once_with(rows)
+    mock_table.upsert.assert_not_called()
+
+
+def test_seed_new_destinations_multiple():
+    """Multiple new destinations seeded independently."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme"), ("dest-2", "beta")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}  # both at snapshot_id=0
+
+    rows_acme = pa.table({"company": ["acme"], "value": [1]})
+    rows_beta = pa.table({"company": ["beta"], "value": [2]})
+
+    def mock_scan(row_filter, snapshot_id=None):
+        scan = MagicMock()
+        # EqualTo stores the value — extract it from the filter
+        if "acme" in str(row_filter):
+            scan.to_arrow.return_value = rows_acme
+        else:
+            scan.to_arrow.return_value = rows_beta
+        return scan
+
+    src_table.scan.side_effect = mock_scan
+
+    tables = {}
+
+    def mock_get(dest_id):
+        t = MagicMock()
+        tables[dest_id] = t
+        return (MagicMock(), t)
+
+    dest_pool.get.side_effect = mock_get
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=100):
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1", "dest-2"])
+
+    assert state_mgr.advance_cursor.call_count == 2
+    assert "dest-1" in tables
+    assert "dest-2" in tables
+
+
+def test_seed_new_destinations_pins_snapshot():
+    """Scan should be pinned to the captured snapshot_id."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}
+
+    empty = pa.table({"company": pa.array([], type=pa.string())})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow.return_value = empty
+    src_table.scan.return_value = mock_scan
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=42):
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    # Verify scan was called with snapshot_id pinned to the captured value
+    call_kwargs = src_table.scan.call_args.kwargs
+    assert call_kwargs["snapshot_id"] == 42

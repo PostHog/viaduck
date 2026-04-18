@@ -386,6 +386,69 @@ def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str])
 
 
 # ---------------------------------------------------------------------------
+# Destination seeding
+# ---------------------------------------------------------------------------
+
+
+def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
+    """Seed newly added destinations from a source table scan.
+
+    For each destination at snapshot_id=0 (just initialized), reads the current
+    source state filtered by routing value and bulk-loads the destination. Sets
+    the cursor to the current source snapshot.
+
+    This avoids replaying the entire CDC history for new destinations. Instead,
+    one filtered scan captures the current state in a single read.
+
+    When key_columns is configured, uses upsert for idempotency (safe if the
+    destination already has data from a prior run). Without key_columns, uses
+    append — crash between write and cursor advance will duplicate rows on
+    re-seed (same at-least-once semantics as CDC).
+
+    Memory note: scan().to_arrow() materializes the entire filtered result.
+    For very large source tables, reduce poll.interval_seconds to keep the
+    source small, or accept the initial memory spike during seeding.
+    """
+    from pyducklake.expressions import EqualTo
+
+    current_id = source.current_snapshot_id(src_table)
+    if current_id is None:
+        return  # empty source, nothing to seed
+
+    cursors = state_mgr.load_cursors(assigned_ids)
+    new_dest_ids = [did for did in assigned_ids if did not in cursors or cursors[did].last_snapshot_id == 0]
+
+    if not new_dest_ids:
+        return
+
+    key_columns = cfg.routing.key_columns
+
+    for dest_id in new_dest_ids:
+        dest_cfg = cfg.destination_by_id(dest_id)
+        routing_value = dest_cfg.routing_value
+
+        # Pin scan to the captured snapshot to avoid skew — ensures the cursor
+        # and the scanned data refer to the same point in time.
+        scan = src_table.scan(
+            row_filter=EqualTo(cfg.routing.field, routing_value),
+            snapshot_id=current_id,
+        )
+        rows = scan.to_arrow()
+
+        if rows.num_rows > 0:
+            catalog, table = dest_pool.get(dest_id)
+            if key_columns:
+                table.upsert(rows, join_cols=key_columns)
+            else:
+                table.append(rows)
+            log.info("Seeded destination %s with %d rows from source scan", dest_id, rows.num_rows)
+        else:
+            log.info("Destination %s has no matching rows in source, cursor advanced", dest_id)
+
+        state_mgr.advance_cursor(dest_id, current_id, cumulative_rows=rows.num_rows)
+
+
+# ---------------------------------------------------------------------------
 # Poll cycle
 # ---------------------------------------------------------------------------
 
@@ -415,6 +478,10 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     assigned_ids = cfg.assigned_destination_ids()
     state_mgr.initialize_destinations(assigned_ids)
+
+    # Seed new destinations from source scan (avoids CDC replay from snapshot 0)
+    if cfg.routing.seed_mode == "scan":
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids)
 
     key_columns = cfg.routing.key_columns
     full_cdc = len(key_columns) > 0

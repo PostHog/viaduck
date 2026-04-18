@@ -189,6 +189,36 @@ CrashAfterWrite(d, i) ==
     /\ everCrashed' = TRUE
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, cursors, opCount>>
 
+\* Seed: for a new destination (cursor at 0), read the current source state
+\* filtered by routing value and bulk-load the destination. Advances cursor
+\* to srcSnap. This bypasses CDC — it reads the current snapshot directly,
+\* not the change history.
+\*
+\* Seeding is a stronger operation than polling: it guarantees the destination
+\* matches the source partition at the seeded snapshot, regardless of CDC
+\* history or conflict resolution.
+SeedDestination(d, i) ==
+    /\ DestOwner[d] = i
+    /\ cursors[d] = 0             \* only seed new destinations
+    /\ srcSnap > 0                \* source has data
+    /\ LET seedRows == {[key |-> r.key, rv |-> r.rv, val |-> r.val] :
+                          r \in {s \in srcRows : s.rv = RoutingMap[d]}}
+       IN dstRows' = [dstRows EXCEPT ![d] = seedRows]
+    /\ cursors' = [cursors EXCEPT ![d] = srcSnap]
+    /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, opCount, everCrashed>>
+
+\* Crash after seed: destination seeded but cursor NOT advanced.
+\* Re-seed on restart is idempotent (same scan result applied again).
+CrashAfterSeed(d, i) ==
+    /\ DestOwner[d] = i
+    /\ cursors[d] = 0
+    /\ srcSnap > 0
+    /\ LET seedRows == {[key |-> r.key, rv |-> r.rv, val |-> r.val] :
+                          r \in {s \in srcRows : s.rv = RoutingMap[d]}}
+       IN dstRows' = [dstRows EXCEPT ![d] = seedRows]
+    /\ everCrashed' = TRUE
+    /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, cursors, opCount>>
+
 (***************************************************************************)
 (* Safety Properties                                                       *)
 (*                                                                         *)
@@ -262,7 +292,11 @@ Next ==
     \/ \E d \in Dests, i \in Instances :
          PollCycle(d, i)
     \/ \E d \in Dests, i \in Instances :
+         SeedDestination(d, i)
+    \/ \E d \in Dests, i \in Instances :
          CrashAfterWrite(d, i)
+    \/ \E d \in Dests, i \in Instances :
+         CrashAfterSeed(d, i)
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 

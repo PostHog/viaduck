@@ -84,7 +84,7 @@ and within-batch conflicts are resolved by rowid grouping.
 
 The CDC algorithm is formally specified in `tla/Viaduck.tla` and verified by
 TLC. Run via `flox activate` then `just tlc`. The spec models source operations,
-poll cycles, and crash-after-write scenarios, checking 5 invariants across 730K
+poll cycles, seeding, and crash scenarios, checking 5 invariants across 730K
 states. Modify the spec when changing the CDC algorithm or adding new failure
 modes. Always run `just tlc` after spec changes.
 
@@ -96,6 +96,7 @@ modes. Always run `just tlc` after spec changes.
 - **LRU connection pool**: bounds memory at high fanout (default 50 open connections)
 - **Per-destination error isolation**: one broken destination doesn't block others
 - **Grouped CDC reads**: destinations at the same cursor share a single CDC call
+- **Scan-based seeding**: new destinations bulk-load from a filtered source scan instead of replaying CDC history. Configurable via `seed_mode` (default: `scan`)
 
 ## Module Layout
 

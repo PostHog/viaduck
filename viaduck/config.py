@@ -64,6 +64,11 @@ class SourceConfig:
 class RoutingConfig:
     field: str
     key_columns: list[str] = field(default_factory=list)
+    seed_mode: str = "scan"  # "scan" or "cdc_replay"
+
+    def __post_init__(self):
+        if self.seed_mode not in ("scan", "cdc_replay"):
+            raise ConfigError(f"routing.seed_mode must be 'scan' or 'cdc_replay', got {self.seed_mode!r}")
 
 
 @dataclass(frozen=True)
@@ -221,6 +226,7 @@ def load(path: str | Path) -> ViaduckConfig:
     routing = RoutingConfig(
         field=_require_non_empty(rt.get("field", ""), "routing.field"),
         key_columns=rt.get("key_columns", []),
+        seed_mode=rt.get("seed_mode", "scan"),
     )
 
     # Defaults

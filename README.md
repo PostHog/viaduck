@@ -4,9 +4,27 @@ A standalone Python app that replicates data from a source DuckLake table to N d
 
 ## Naming
 
+<img src="imgs/1280px-Ouse_Valley_Viaduct_02.jpg" alt="A viaduct. By AndyScott - Own work, CC BY-SA 4.0, https://commons.wikimedia.org/w/index.php?curid=92763727" width="300" align="right">
+
 > **viaduct** (noun): a long bridge-like structure carrying a road or railroad across a valley or other low ground.
 
-Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* and *duck*, because [DuckLake](https://github.com/duckdb/ducklake).
+Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* and *duck*, because [DuckLake](https://github.com/duckdb/ducklake) and because [Why A Duck?](https://www.youtube.com/watch?v=kHMrLpDHXc0).
+
+## What
+
+- CDC replication from one source DuckLake table to N destination DuckLake tables
+- Routes rows by a configurable field (e.g. `company`) to per-tenant destinations
+- Full CDC: inserts, deletes, and updates (not just append-only)
+- 3-phase algorithm: preimage resolution, conflict resolution, atomic transactional apply
+- Scan-based seeding for new destinations (no full history replay)
+- YAML config with env var indirection for credentials
+- Per-destination error isolation — one broken destination doesn't block others
+- LRU connection pool for high fanout (100s-1000s of destinations)
+- Persistent cursor tracking on the source catalog
+- Horizontal scaling via hash or explicit destination partitioning
+- 19 Prometheus metrics, health checks (`/healthz`, `/readyz`)
+- At-least-once delivery with documented failure modes
+- [TLA+ formally verified](tla/Viaduck.tla): 5 safety invariants checked across 730K states
 
 ## Why
 
@@ -166,6 +184,7 @@ routing:
   field: "company"                           # column in source table to route on
   key_columns: ["event_id"]                  # primary key for delete/update replication
                                              # omit or [] for append-only mode
+  seed_mode: "scan"                          # "scan" (default) or "cdc_replay"
 
 destinations:
   - id: "quacksworth-lake"                   # internal identifier (state tracking, logs)
@@ -231,6 +250,21 @@ Viaduck stores per-destination replication cursors in a `_viaduck_state` table o
 State updates use `begin_transaction()` for atomicity — the delete + insert pair either both commit or both roll back ([`state.py:advance_cursor`](viaduck/state.py), tested: [`test_advance_cursor_uses_transaction`](tests/unit/test_state.py)).
 
 State is keyed by `(destination_id, instance_id)`, enabling multiple viaduck instances to independently track their assigned destinations without conflicts.
+
+## New Destination Seeding
+
+When a new destination is added to the config, it needs the current source data. Two modes are available via `routing.seed_mode`:
+
+| Mode | How it works | When to use |
+|------|-------------|-------------|
+| `scan` (default) | Reads current source state via filtered `table.scan()`, bulk-loads the destination, sets cursor to current snapshot | Most use cases. Fast — reads one snapshot, not historical CDC. |
+| `cdc_replay` | Starts cursor at snapshot 0, replays entire CDC history on first poll | Audit trails where you need to process every historical change |
+
+With `scan` mode, adding a new tenant is instant regardless of source history depth. The scan is pinned to the snapshot captured at startup, so no race condition between the scan and cursor advancement ([`main.py:_seed_new_destinations`](viaduck/main.py)).
+
+When `key_columns` is configured, seeding uses `upsert` for idempotency — safe if the process crashes mid-seed and re-seeds on restart. Without `key_columns`, seeding uses `append` (at-least-once semantics apply).
+
+Verified by TLC: the `SeedDestination` action in the TLA+ spec produces the same invariant-satisfying state as a full CDC replay ([`tla/Viaduck.tla`](tla/Viaduck.tla)).
 
 ## Connection Management
 
@@ -305,35 +339,6 @@ just up                # start docker-compose stack
 just down              # stop docker-compose stack
 ```
 
-## Formal Verification (TLA+)
-
-The 3-phase CDC algorithm is formally specified in TLA+ and verified by the TLC model checker. The spec models source operations (insert, delete, update), poll cycles, and crash-after-write scenarios, then exhaustively checks all reachable states.
-
-```bash
-flox activate          # enter flox env (provides tlaplus + JDK)
-just tlc               # run TLC model checker (~730K states, ~9s)
-just tlc-parse         # syntax/semantic check only (no model checking)
-just tlc-verbose       # model check + dump state graph as DOT
-```
-
-**Spec**: [`tla/Viaduck.tla`](tla/Viaduck.tla), **Config**: [`tla/Viaduck.cfg`](tla/Viaduck.cfg)
-
-Model parameters: `Keys={1,2}`, `Dests={d1,d2}`, `MaxOps=4`. TLC explores 2.8M transitions across 730K distinct states at depth 10.
-
-### Verified invariants
-
-| Invariant | What it means |
-|-----------|---------------|
-| `EventualConsistency` | When caught up and crash-free, each destination contains exactly the source rows matching its routing value |
-| `NoPhantomWhenCurrent` | No destination has rows that don't exist on the source |
-| `NoDataLossWhenCurrent` | Every source row appears in the correct destination |
-| `CursorMonotonicity` | Cursors never regress |
-| `PartitionCorrectness` | Rows only appear in the destination matching their routing value |
-
-### Known limitation found by TLC
-
-Crash-after-write followed by source delete before recovery causes **phantom data**: the insert+delete for the same rowid cancel in conflict resolution, but the destination already has the row from the crashed write. This is inherent to at-least-once delivery without cross-catalog transactions. Invariants are conditioned on crash-free execution (`~everCrashed`).
-
 ## Deployment
 
 ```bash
@@ -357,3 +362,6 @@ Why crash on source failure? The source catalog is the single point of truth. If
 ---
 
 MIT License. Copyright (c) 2026 PostHog, Inc.
+
+### Photo
+[By AndyScott - Own work, CC BY-SA 4.](https://commons.wikimedia.org/w/index.php?curid=92763727)
