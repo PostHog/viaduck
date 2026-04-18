@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: viaduck
+  # wiz-scan: ResourceQuota and LimitRange are namespace-level policies (managed by platform team)
+spec:
+  replicas: 1  # scale by adding instances with different configs
+  selector:
+    matchLabels:
+      app: viaduck
+  template:
+    metadata:
+      labels:
+        app: viaduck
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: viaduck
+        image: ghcr.io/posthog/viaduck:latest
+        args: ["--config", "/etc/viaduck/viaduck.yaml"]
+        ports:
+        - name: metrics
+          containerPort: 8000
+        env:
+        - name: SOURCE_POSTGRES_URI
+          valueFrom:
+            secretKeyRef:
+              name: viaduck-secrets
+              key: SOURCE_POSTGRES_URI
+        - name: DEST_POSTGRES_URI
+          valueFrom:
+            secretKeyRef:
+              name: viaduck-secrets
+              key: DEST_POSTGRES_URI
+              optional: true
+        - name: DEST_S3_POSTGRES_URI
+          valueFrom:
+            secretKeyRef:
+              name: viaduck-secrets
+              key: DEST_S3_POSTGRES_URI
+              optional: true
+        - name: S3_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: viaduck-secrets
+              key: S3_ACCESS_KEY_ID
+              optional: true
+        - name: S3_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: viaduck-secrets
+              key: S3_SECRET_ACCESS_KEY
+              optional: true
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: config
+          mountPath: /etc/viaduck
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp  # DuckDB spill-to-disk under memory pressure
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 4
+      volumes:
+      - name: config
+        configMap:
+          name: viaduck-config
+      - name: tmp
+        emptyDir: {}  # disk-backed, not RAM — spill shouldn't count against memory limit

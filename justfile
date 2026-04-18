@@ -58,6 +58,14 @@ test-integration:
 test-perf:
     uv run python -m pytest tests/perf -v -s
 
+# Run performance benchmarks and emit JSON results
+[group('test')]
+test-perf-json:
+    uv run python -m pytest tests/perf -v -s --perf-json perf-results.json
+    @echo ""
+    @echo "=== Performance Results ==="
+    @python3 -c "import json; rows=json.load(open('perf-results.json')); [print(f'  {r[\"test\"]:40s} {r[\"scale\"]:30s} {r[\"elapsed_s\"]:>8.4f}s') for r in rows]"
+
 # Run E2E test (brings up docker-compose stack automatically)
 [group('test')]
 test-e2e:

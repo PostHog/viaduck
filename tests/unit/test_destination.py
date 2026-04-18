@@ -206,3 +206,27 @@ def test_pool_get_source_schema_cached():
     mock_schema = MagicMock()
     pool._source_schema = mock_schema
     assert pool._get_source_schema() is mock_schema
+
+
+# --- LRU correctness at scale ---
+
+
+def test_pool_lru_correctness_at_scale():
+    """100 destinations cycling through 10 slots: verify eviction order and counts.
+
+    Tests OrderedDict LRU logic, not connection open/close latency (which is
+    DuckDB-bound at ~50-100ms per Catalog).
+    """
+    pool = DestinationPool(MagicMock(), max_open=10)
+    mock_catalog = MagicMock()
+
+    with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock())):
+        for i in range(100):
+            pool.get(f"dest-{i}")
+
+    assert pool.size == 10
+    for i in range(90, 100):
+        assert f"dest-{i}" in pool._pool
+    for i in range(90):
+        assert f"dest-{i}" not in pool._pool
+    assert mock_catalog.close.call_count == 90

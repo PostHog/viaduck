@@ -114,7 +114,14 @@ modes. Always run `just tlc` after spec changes.
 
 ## Testing
 
-- Unit tests: `tests/unit/` — mocked pyducklake, fast (187 tests)
-- Integration tests: `tests/integration/` — real pyducklake with local DuckDB (planned)
-- Performance tests: `tests/perf/` — high-fanout benchmarks (planned)
+- Unit tests: `tests/unit/` — mocked pyducklake, fast (200 tests)
+- Integration tests: `tests/integration/` — real pyducklake with local DuckDB (8 tests)
+- Performance tests: `tests/perf/` — fanout, preimage, conflict, delete filter benchmarks (6 tests)
 - E2E tests: `tests/e2e/` — full docker-compose stack (planned)
+
+Run all: `just ci` (unit + docs). Integration: `just test-integration`. Perf: `just test-perf`.
+Perf with JSON output: `just test-perf-json` → writes `perf-results.json`.
+
+## Grafana
+
+Dashboard at `grafana/dashboards/viaduck.json`. Available at `http://localhost:3000/d/viaduck/viaduck` when running `just up`.

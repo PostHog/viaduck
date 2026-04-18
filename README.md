@@ -160,8 +160,7 @@ Source: [`docs/failure-modes.d2`](docs/failure-modes.d2)
 - **Exactly-once delivery** — at-least-once only. No deduplication layer.
 - **Batching / coalescing** — writes are immediate per poll cycle. No local buffering across cycles to reduce small file count.
 - **Web UI** — planned SSE-based status page, not yet implemented.
-- **Grafana dashboard** — not yet created.
-- **E2E / integration tests** — unit tests only. Docker-compose stack and integration tests are planned.
+- **E2E tests** — automated docker-compose test suite not yet implemented.
 
 ## Configuration
 
@@ -331,13 +330,34 @@ just fmt               # format code
 just lint              # lint code
 just test              # run unit tests
 just test-integration  # run integration tests (local DuckDB)
-just test-e2e          # run E2E tests (docker-compose)
+just test-perf         # run performance benchmarks
+just test-perf-json    # benchmarks + JSON output to perf-results.json
 just ci                # format check + lint + unit tests + docs check
 just docs              # render d2 diagrams to SVG
 just docs-check        # verify all README links are valid
 just up                # start docker-compose stack
 just down              # stop docker-compose stack
 ```
+
+### Performance benchmarks
+
+7 benchmarks in [`tests/perf/test_fanout_perf.py`](tests/perf/test_fanout_perf.py) exercise the hot path at scale:
+
+| Benchmark | Scale | Budget | Typical |
+|-----------|-------|--------|---------|
+| Router split | 10K rows, 100 dests | <1s | ~4ms |
+| Router split | 100K rows, 1000 dests | <5s | ~160ms |
+| Router split | 1M rows, 10K dests | <60s | ~16s |
+| Preimage resolution | 50K CDC rows | <2s | ~55ms |
+| Conflict resolution | 50K rows, ~5% conflicts | <1s | ~45ms |
+| Delete filter (single key) | 1000 rows | <1s | ~18ms |
+| Delete filter (composite key) | 500 rows, 3-col key | <2s | ~2ms |
+
+`just test-perf-json` writes results to `perf-results.json` for CI regression tracking.
+
+### Grafana dashboard
+
+A [Grafana dashboard](grafana/dashboards/viaduck.json) covering all 19 metrics is included. Available at `http://localhost:3000/d/viaduck/viaduck` when running `just up`.
 
 ## Deployment
 
@@ -347,7 +367,7 @@ kubectl apply -f k8s/pdb.yaml
 kubectl apply -f k8s/deployment.yaml
 ```
 
-Viaduck runs as a K8s Deployment (not StatefulSet — no ordinal-based identity needed). For horizontal scaling, deploy multiple instances with different `instance.partition` configs.
+Viaduck runs as a K8s Deployment (not StatefulSet — no ordinal-based identity needed). For horizontal scaling, deploy multiple instances with different `instance.partition` configs. See [`k8s/deployment.yaml`](k8s/deployment.yaml) for manifests.
 
 ## Error Handling and Retries
 

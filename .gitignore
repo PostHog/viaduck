@@ -8,3 +8,5 @@ dist/
 .ruff_cache/
 .pytest_cache/
 viaduck/_version.py
+perf-results.json
+states.dot
