@@ -662,15 +662,17 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
         else:
             st = "healthy"
 
-        dest_statuses.append(DestStatus(
-            id=did,
-            routing_value=cfg.destination_by_id(did).routing_value,
-            snapshot=snap,
-            lag=lag,
-            rows_replicated=rows,
-            status=st,
-            last_error=last_err,
-        ))
+        dest_statuses.append(
+            DestStatus(
+                id=did,
+                routing_value=cfg.destination_by_id(did).routing_value,
+                snapshot=snap,
+                lag=lag,
+                rows_replicated=rows,
+                status=st,
+                last_error=last_err,
+            )
+        )
 
     status.update(
         source_table=f"{cfg.source.name}.{cfg.source.table}",

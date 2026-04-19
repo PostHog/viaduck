@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        fetch-depth: 0  # need full history for changelog and tag lookup
+
+    - name: Get latest tag
+      id: latest_tag
+      run: |
+        tag=$(git tag --sort=-v:refname | head -1 || echo "v0.0.0")
+        [ -z "$tag" ] && tag="v0.0.0"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+    - name: Bump patch version
+      id: next_tag
+      env:
+        CURRENT_TAG: ${{ steps.latest_tag.outputs.tag }}
+      run: |
+        version="${CURRENT_TAG#v}"
+        IFS='.' read -r major minor patch <<< "$version"
+        next="v${major}.${minor}.$((patch + 1))"
+        echo "tag=$next" >> "$GITHUB_OUTPUT"
+        echo "version=${next#v}" >> "$GITHUB_OUTPUT"
+
+    - name: Generate changelog
+      id: changelog
+      env:
+        PREV_TAG: ${{ steps.latest_tag.outputs.tag }}
+        COMMIT_SHA: ${{ github.sha }}
+      run: |
+        {
+          echo "body<<CHANGELOG_EOF"
+          echo "## Changes"
+          echo ""
+          if [ "$PREV_TAG" = "v0.0.0" ]; then
+            git log --pretty=format:"- %s (%h)" HEAD
+          else
+            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..HEAD"
+          fi
+          echo ""
+          echo ""
+          echo "---"
+          echo "**Commit:** ${COMMIT_SHA}"
+          echo "**Author:** $(git log -1 --pretty=format:'%an')"
+          echo "CHANGELOG_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Build release tarball
+      env:
+        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
+        NEXT_VERSION: ${{ steps.next_tag.outputs.version }}
+      run: |
+        echo "__version__ = \"${NEXT_VERSION}\"" > viaduck/_version.py
+        tar czf "viaduck-${NEXT_TAG}.tar.gz" \
+          --transform "s,^,viaduck-${NEXT_TAG}/," \
+          --exclude='.git' --exclude='*.pyc' --exclude='__pycache__' \
+          --exclude='.venv' --exclude='.flox' \
+          pyproject.toml uv.lock LICENSE README.md Dockerfile \
+          viaduck/ tests/ test/
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3
+
+    - name: Log in to GHCR
+      uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      with:
+        context: .
+        push: true
+        platforms: linux/amd64,linux/arm64
+        build-args: |
+          VIADUCK_VERSION=${{ steps.next_tag.outputs.version }}
+        tags: |
+          ghcr.io/posthog/viaduck:${{ steps.next_tag.outputs.tag }}
+          ghcr.io/posthog/viaduck:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Create git tag
+      env:
+        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
+      run: |
+        git tag "$NEXT_TAG"
+        git push origin "$NEXT_TAG"
+
+    - name: Create GitHub release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
+        COMMIT_SHA: ${{ github.sha }}
+        CHANGELOG_BODY: ${{ steps.changelog.outputs.body }}
+      run: |
+        gh release create "$NEXT_TAG" \
+          --title "${NEXT_TAG} (${COMMIT_SHA})" \
+          --notes "$CHANGELOG_BODY" \
+          "viaduck-${NEXT_TAG}.tar.gz"

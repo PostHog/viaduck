@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
