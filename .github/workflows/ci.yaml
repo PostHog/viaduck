@@ -18,7 +18,10 @@ jobs:
     # Clone pyducklake alongside for [tool.uv.sources] local path override.
     # Remove this step once pyducklake 1.0.4+ is published on PyPI.
     - name: Clone pyducklake
-      run: git clone --depth 1 https://github.com/posthog/pyducklake.git ../pyducklake
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        repository: posthog/pyducklake
+        path: ../pyducklake
 
     - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
 
