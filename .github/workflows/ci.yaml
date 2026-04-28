@@ -12,8 +12,6 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    env:
-      UV_FROZEN: "true"
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -24,20 +22,18 @@ jobs:
 
     - name: Lock check
       run: uv lock --check
-      env:
-        UV_FROZEN: ""
 
     - name: Format check
-      run: uv run ruff format --check --exclude viaduck/_version.py viaduck/ tests/
+      run: uv run --frozen ruff format --check --exclude viaduck/_version.py viaduck/ tests/
 
     - name: Lint
-      run: uv run ruff check viaduck/ tests/
+      run: uv run --frozen ruff check viaduck/ tests/
 
     - name: Unit tests
-      run: uv run pytest tests/unit
+      run: uv run --frozen pytest tests/unit
 
     - name: Integration tests
-      run: uv run pytest tests/integration
+      run: uv run --frozen pytest tests/integration
 
   dependency-review:
     runs-on: ubuntu-latest
