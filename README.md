@@ -2,6 +2,9 @@
 
 A standalone Python app that replicates data from a source DuckLake table to N destination DuckLake tables using CDC (Change Data Capture). Supports inserts, deletes, and updates. Single thread, single poll loop, no framework.
 
+**Contents:**
+[Naming](#naming) | [What](#what) | [Why](#why) | [Architecture](#architecture) | [Two Modes](#two-modes) | [Poll Cycle](#poll-cycle) | [CDC Operations](#cdc-operations-and-semantics) | [Failure Modes](#failure-modes) | [Configuration](#configuration) | [State Tracking](#state-tracking) | [Seeding](#new-destination-seeding) | [Connection Management](#connection-management) | [Horizontal Scaling](#horizontal-scaling) | [Metrics](#metrics) | [Setup](#setup) | [Development](#development) | [Formal Verification](#formal-verification-tla) | [Deployment](#deployment) | [Error Handling](#error-handling-and-retries)
+
 ## Naming
 
 <img src="imgs/1280px-Ouse_Valley_Viaduct_02.jpg" alt="A viaduct. By AndyScott - Own work, CC BY-SA 4.0, https://commons.wikimedia.org/w/index.php?curid=92763727" width="300" align="right">
@@ -323,6 +326,18 @@ just sync              # install dependencies
 just run -- -c my.yaml # run with config file
 ```
 
+### Required: semgrep
+
+`just ci` requires semgrep for security scanning. Install:
+
+```bash
+brew install semgrep
+```
+
+<!-- TODO: move semgrep (and other brew-installed tools) to flox once the flox
+     schema version mismatch (1.12.0 vs installed 1.11.4) is resolved. All
+     dev tooling should be managed via flox for reproducibility. -->
+
 ## Development
 
 ```bash
@@ -332,7 +347,7 @@ just test              # run unit tests
 just test-integration  # run integration tests (local DuckDB)
 just test-perf         # run performance benchmarks
 just test-perf-json    # benchmarks + JSON output to perf-results.json
-just ci                # format check + lint + unit tests + docs check
+just ci                # full CI: lock-check, format, lint, tests, semgrep, Docker build
 just docs              # render d2 diagrams to SVG
 just docs-check        # verify all README links are valid
 just up                # start docker-compose stack

@@ -26,10 +26,10 @@ run *ARGS:
 fmt:
     uv run ruff format viaduck/ tests/
 
-# Check formatting
+# Check formatting (excludes auto-generated _version.py)
 [group('dev')]
 fmt-check:
-    uv run ruff format --check viaduck/ tests/
+    uv run ruff format --check --exclude viaduck/_version.py viaduck/ tests/
 
 # Lint code
 [group('dev')]
@@ -46,22 +46,22 @@ lint-fix:
 # Run unit tests
 [group('test')]
 test:
-    uv run python -m pytest tests/unit
+    uv run pytest tests/unit
 
 # Run integration tests
 [group('test')]
 test-integration:
-    uv run python -m pytest tests/integration
+    uv run pytest tests/integration
 
 # Run performance benchmarks
 [group('test')]
 test-perf:
-    uv run python -m pytest tests/perf -v -s
+    uv run pytest tests/perf -v -s
 
 # Run performance benchmarks and emit JSON results
 [group('test')]
 test-perf-json:
-    uv run python -m pytest tests/perf -v -s --perf-json perf-results.json
+    uv run pytest tests/perf -v -s --perf-json perf-results.json
     @echo ""
     @echo "=== Performance Results ==="
     @python3 -c "import json; rows=json.load(open('perf-results.json')); [print(f'  {r[\"test\"]:40s} {r[\"scale\"]:30s} {r[\"elapsed_s\"]:>8.4f}s') for r in rows]"
@@ -69,11 +69,30 @@ test-perf-json:
 # Run E2E test (brings up docker-compose stack automatically)
 [group('test')]
 test-e2e:
-    uv run python -m pytest tests/e2e -v -s
+    uv run pytest tests/e2e -v -s
 
-# Full CI check
+# Verify uv.lock is consistent with pyproject.toml
 [group('test')]
-ci: fmt-check lint test docs-check
+lock-check:
+    uv lock --check
+
+# Run semgrep security scans (mirrors Semgrep CI workflow)
+[group('test')]
+semgrep:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v semgrep &> /dev/null; then
+        echo "ERROR: semgrep not installed. Install via: brew install semgrep"
+        exit 1
+    fi
+    echo "=== semgrep-python ==="
+    semgrep --config "p/python" --config "p/owasp-top-ten" --config "p/security-audit" --error --metrics=off --verbose viaduck/
+    echo "=== semgrep-general ==="
+    semgrep --config "p/owasp-top-ten" --config "p/security-audit" --config "p/trailofbits" --config "p/github-actions" --error --metrics=off --verbose --exclude ./viaduck/ .
+
+# Full CI check (mirrors GitHub Actions CI workflow)
+[group('test')]
+ci: lock-check fmt-check lint test test-integration docs-check semgrep build
 
 # === Docker ===
 
@@ -162,10 +181,10 @@ tlc-parse:
 
 # === Build ===
 
-# Build Docker image
+# Build Docker image (--no-cache avoids stale layers masking build failures)
 [group('build')]
 build:
-    docker build -t viaduck .
+    docker build --no-cache --build-arg VIADUCK_VERSION=0.0.0.dev0 -t viaduck .
 
 # Clean build artifacts
 [group('build')]

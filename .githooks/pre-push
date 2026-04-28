@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "pre-push: checking uv.lock consistency..."
+if uv lock --check 2>/dev/null; then
+    exit 0
+fi
+
+echo ""
+echo "ERROR: uv.lock is out of sync with pyproject.toml."
+
+if [ -t 1 ]; then
+    read -rp "Regenerate uv.lock? [y/N] " answer < /dev/tty
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        uv lock
+        echo "uv.lock regenerated. Stage and commit it, then re-push."
+    fi
+fi
+
+exit 1

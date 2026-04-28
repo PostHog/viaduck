@@ -185,7 +185,7 @@ class ViaduckConfig:
 
 def _stable_hash(value: str) -> int:
     """Deterministic hash for partition assignment (not Python's built-in hash which is randomized)."""
-    return int(hashlib.md5(value.encode()).hexdigest(), 16)
+    return int(hashlib.sha256(value.encode()).hexdigest(), 16)
 
 
 def _merge_defaults(dest_props: dict[str, str], default_props: dict[str, str]) -> dict[str, str]:

@@ -2,15 +2,32 @@
 
 ## Pre-push Checklist
 
-Always run before pushing:
+**Never push broken code to a PR.** Every push triggers CI for the whole org and wastes reviewer time. The push-test-push-test cycle is unacceptable.
+
+Before every commit and push, run:
 
 ```bash
-just lint       # ruff check
-just fmt-check  # ruff format --check
-just test       # unit tests
+just ci
 ```
 
-All three must pass. Do not push with lint or test failures.
+This runs the full local CI pipeline (mirrors CI workflow + Semgrep workflow):
+1. `lock-check` — verifies `uv.lock` is consistent with `pyproject.toml`
+2. `fmt-check` — ruff format (excludes auto-generated `_version.py`)
+3. `lint` — ruff check
+4. `test` — unit tests (`tests/unit/`)
+5. `test-integration` — integration tests (`tests/integration/`)
+6. `docs-check` — validates README links and d2 diagram SVGs
+7. `semgrep` — security scanning (requires `brew install semgrep`)
+8. `build` — Docker build with `--no-cache`
+
+All steps must pass. Do not push with any failures.
+
+If making changes to CI workflows, dependency pins, or the Dockerfile, spin up a QE lead engineer review (via Agent tool) focused specifically on local/CI parity before pushing. Check for:
+- Caching that could mask failures locally (Docker layer cache, uv venv cache)
+- Command differences between `justfile` and `.github/workflows/ci.yaml`
+- `--frozen` vs non-frozen dependency resolution
+- Python/uv version drift between local, CI, and Dockerfile
+- Test discovery differences (path-based vs marker-based)
 
 Prefer fixup commits over amending and force-pushing.
 
@@ -109,7 +126,7 @@ modes. Always run `just tlc` after spec changes.
 | `destination.py` | LRU connection pool for destination catalogs |
 | `state.py` | `_viaduck_state` table CRUD |
 | `metrics.py` | Prometheus metric definitions (19 metrics) |
-| `server.py` | HTTP /metrics, /healthz, /readyz |
+| `server.py` | HTTP /metrics, /healthz, /readyz, /status, /ui, /ui/sse |
 | `logging_config.py` | Structured logging setup |
 
 ## Testing
@@ -119,7 +136,7 @@ modes. Always run `just tlc` after spec changes.
 - Performance tests: `tests/perf/` — fanout, preimage, conflict, delete filter benchmarks (6 tests)
 - E2E tests: `tests/e2e/` — full docker-compose stack (planned)
 
-Run all: `just ci` (unit + docs). Integration: `just test-integration`. Perf: `just test-perf`.
+Run all: `just ci` (lock-check + format + lint + unit + integration + docs-check + Docker build). Perf: `just test-perf`.
 Perf with JSON output: `just test-perf-json` → writes `perf-results.json`.
 
 ## Grafana

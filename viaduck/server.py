@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -287,6 +287,7 @@ def _make_handler():
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
                 try:
                     while True:

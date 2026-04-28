@@ -51,7 +51,7 @@ import pyarrow.compute as pc
 from viaduck import config, logging_config, metrics, source
 from viaduck.destination import DestinationPool
 from viaduck.router import Router, RoutingError
-from viaduck.server import health
+from viaduck.server import DestStatus, health, status
 from viaduck.source import strip_meta
 from viaduck.state import StateManager
 
@@ -645,11 +645,45 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
         if no_data_ids:
             state_mgr.advance_cursors(no_data_ids, current_id)
 
-    # Update lag metrics
+    # Update lag metrics and status snapshot.
+    # Uses cursor_map loaded at the start of the cycle — status is one cycle stale.
+    dest_statuses = []
     for did in assigned_ids:
         cursor = cursor_map.get(did)
-        snap = cursor.last_snapshot_id if cursor else 0
-        metrics.dest_lag_snapshots.labels(destination=did).set(current_id - snap)
+        snap = getattr(cursor, "last_snapshot_id", 0) or 0
+        lag = current_id - snap
+        metrics.dest_lag_snapshots.labels(destination=did).set(lag)
+
+        rows = cursor.rows_replicated if cursor else 0
+        last_err = cursor.last_error if cursor else None
+        if last_err:
+            st = "error"
+        elif lag > 0:
+            st = "lagging"
+        else:
+            st = "healthy"
+
+        dest_statuses.append(
+            DestStatus(
+                id=did,
+                routing_value=cfg.destination_by_id(did).routing_value,
+                snapshot=snap,
+                lag=lag,
+                rows_replicated=rows,
+                status=st,
+                last_error=last_err,
+            )
+        )
+
+    status.update(
+        source_table=f"{cfg.source.name}.{cfg.source.table}",
+        source_snapshot=current_id,
+        mode="full_cdc" if full_cdc else "append_only",
+        poll_interval=cfg.poll.interval_seconds,
+        destinations=dest_statuses,
+        pool_open=dest_pool.size,
+        pool_max=dest_pool.max_open,
+    )
 
 
 def main():
