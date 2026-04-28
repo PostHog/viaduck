@@ -24,6 +24,8 @@ jobs:
 
     - name: Lock check
       run: uv lock --check
+      env:
+        UV_FROZEN: ""
 
     - name: Format check
       run: uv run ruff format --check --exclude viaduck/_version.py viaduck/ tests/
