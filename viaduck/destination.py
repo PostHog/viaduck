@@ -38,6 +38,10 @@ class DestinationPool:
     def size(self) -> int:
         return len(self._pool)
 
+    @property
+    def max_open(self) -> int:
+        return self._max_open
+
     def set_source_schema(self, schema: Schema) -> None:
         """Cache the source table schema to avoid repeated lookups."""
         self._source_schema = schema

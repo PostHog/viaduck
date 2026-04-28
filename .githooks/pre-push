@@ -9,8 +9,8 @@ fi
 echo ""
 echo "ERROR: uv.lock is out of sync with pyproject.toml."
 
-if [ -t 0 ]; then
-    read -rp "Regenerate uv.lock? [y/N] " answer
+if [ -t 1 ]; then
+    read -rp "Regenerate uv.lock? [y/N] " answer < /dev/tty
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         uv lock
         echo "uv.lock regenerated. Stage and commit it, then re-push."

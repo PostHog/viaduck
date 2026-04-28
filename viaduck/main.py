@@ -682,7 +682,7 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
         poll_interval=cfg.poll.interval_seconds,
         destinations=dest_statuses,
         pool_open=dest_pool.size,
-        pool_max=dest_pool._max_open,
+        pool_max=dest_pool.max_open,
     )
 
 
