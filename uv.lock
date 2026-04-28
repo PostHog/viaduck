@@ -133,48 +133,16 @@ wheels = [
 
 [[package]]
 name = "pyducklake"
-version = "1.0.3"
-source = { editable = "../pyducklake" }
+version = "1.0.9"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "duckdb" },
     { name = "pyarrow" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = ">=8.0,<9" },
-    { name = "duckdb", specifier = ">=1.4,<2" },
-    { name = "pandas", marker = "extra == 'all'", specifier = ">=2.0" },
-    { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.0" },
-    { name = "polars", marker = "extra == 'all'", specifier = ">=0.20" },
-    { name = "polars", marker = "extra == 'polars'", specifier = ">=0.20" },
-    { name = "pyarrow", specifier = ">=18.0,<24" },
-    { name = "ray", extras = ["data"], marker = "extra == 'all'", specifier = ">=2.0" },
-    { name = "ray", extras = ["data"], marker = "extra == 'ray'", specifier = ">=2.0" },
-]
-provides-extras = ["pandas", "polars", "ray", "all"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "cryptography", specifier = ">=46.0.6" },
-    { name = "hypothesis", specifier = ">=6.151.12" },
-    { name = "minio", specifier = ">=7.2.20" },
-    { name = "mypy", specifier = ">=1.10" },
-    { name = "pandas", specifier = ">=2.0" },
-    { name = "pdoc", specifier = ">=16.0.0" },
-    { name = "polars", specifier = ">=1.39.3" },
-    { name = "psycopg2-binary", specifier = ">=2.9.11" },
-    { name = "pyarrow-stubs", specifier = ">=18.0" },
-    { name = "pymysql", specifier = ">=1.1.2" },
-    { name = "pyright", specifier = ">=1.1" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-benchmark", specifier = ">=5.2.3" },
-    { name = "pytest-cov", specifier = ">=7.1.0" },
-    { name = "pytest-randomly", specifier = ">=4.0.1" },
-    { name = "pytz", specifier = ">=2026.1.post1" },
-    { name = "ruff", specifier = ">=0.8" },
-    { name = "testcontainers", specifier = ">=4.14.2" },
+sdist = { url = "https://files.pythonhosted.org/packages/5d/f1/e413b98604122a987334a7134eddc2aa8d5fe6b738534f90eb215c616d10/pyducklake-1.0.9.tar.gz", hash = "sha256:fac49336809879c49c9d63de694ebe87b3885e3aa615c6c0b98ee7935d942f30", size = 282587, upload-time = "2026-04-28T18:21:22.94Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/5a/2df5d29dc70603ac86053c95ae103e2cb093bc070543df565b6cf42a5162/pyducklake-1.0.9-py3-none-any.whl", hash = "sha256:78d71334dd2cf4e79ee2a05354697bb903466e1c699d5e953fdf857c6cd1099f", size = 50072, upload-time = "2026-04-28T18:21:21.669Z" },
 ]
 
 [[package]]
@@ -305,7 +273,7 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.4,<1.5" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "pyarrow", specifier = ">=18.0" },
-    { name = "pyducklake", editable = "../pyducklake" },
+    { name = "pyducklake", specifier = ">=1.0.9" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 

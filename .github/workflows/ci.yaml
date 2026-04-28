@@ -12,10 +12,18 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      UV_FROZEN: "true"
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      with:
+        version: "0.7.*"
+        python-version: "3.12"
+
+    - name: Lock check
+      run: uv lock --check
 
     - name: Format check
       run: uv run ruff format --check --exclude viaduck/_version.py viaduck/ tests/
@@ -24,7 +32,7 @@ jobs:
       run: uv run ruff check viaduck/ tests/
 
     - name: Unit tests
-      run: uv run pytest -m "not integration and not e2e and not perf"
+      run: uv run pytest tests/unit
 
     - name: Integration tests
       run: uv run pytest tests/integration

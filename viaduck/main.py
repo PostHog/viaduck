@@ -645,11 +645,12 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
         if no_data_ids:
             state_mgr.advance_cursors(no_data_ids, current_id)
 
-    # Update lag metrics and status snapshot
+    # Update lag metrics and status snapshot.
+    # Uses cursor_map loaded at the start of the cycle — status is one cycle stale.
     dest_statuses = []
     for did in assigned_ids:
         cursor = cursor_map.get(did)
-        snap = cursor.last_snapshot_id if cursor else 0
+        snap = getattr(cursor, "last_snapshot_id", 0) or 0
         lag = current_id - snap
         metrics.dest_lag_snapshots.labels(destination=did).set(lag)
 
