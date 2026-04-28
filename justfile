@@ -26,10 +26,10 @@ run *ARGS:
 fmt:
     uv run ruff format viaduck/ tests/
 
-# Check formatting
+# Check formatting (excludes auto-generated _version.py)
 [group('dev')]
 fmt-check:
-    uv run ruff format --check viaduck/ tests/
+    uv run ruff format --check --exclude viaduck/_version.py viaduck/ tests/
 
 # Lint code
 [group('dev')]
@@ -71,9 +71,9 @@ test-perf-json:
 test-e2e:
     uv run python -m pytest tests/e2e -v -s
 
-# Full CI check
+# Full CI check (mirrors GitHub Actions CI workflow)
 [group('test')]
-ci: fmt-check lint test docs-check
+ci: fmt-check lint test test-integration build
 
 # === Docker ===
 
