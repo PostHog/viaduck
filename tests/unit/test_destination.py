@@ -208,6 +208,45 @@ def test_pool_get_source_schema_cached():
     assert pool._get_source_schema() is mock_schema
 
 
+def test_pool_get_source_schema_live_treats_schema_as_property():
+    """Regression: pyducklake `Table.schema` is a @property, not a method.
+
+    Earlier versions called it as `src_tbl.schema()` which raised
+    `TypeError: 'Schema' object is not callable` at runtime — invisible to
+    MagicMock-based tests because `mock.schema()` happily returns another
+    Mock. This test uses a non-callable schema double so calling it as a
+    method would fail loudly.
+    """
+
+    class _FakeTable:
+        # `schema` is a plain attribute — accessing as `.schema` returns the
+        # value; calling as `.schema()` raises TypeError on the value.
+        def __init__(self, schema):
+            self.schema = schema
+
+    config = MagicMock()
+    config.source.name = "source"
+    config.source.postgres_uri_env = "SRC_PG"
+    config.source.postgres_uri = "postgres:host=localhost"
+    config.source.data_path = "/tmp/data"
+    config.source.table = "events"
+    config.source.resolved_properties.return_value = {}
+
+    fake_schema = "non-callable-sentinel"
+    fake_table = _FakeTable(schema=fake_schema)
+    fake_catalog = MagicMock()
+    fake_catalog.load_table.return_value = fake_table
+
+    pool = DestinationPool(config, max_open=50)
+    pool._source_schema = None
+
+    with patch("pyducklake.Catalog", return_value=fake_catalog):
+        result = pool._get_source_schema()
+
+    assert result == fake_schema
+    fake_catalog.close.assert_called_once()
+
+
 # --- LRU correctness at scale ---
 
 

@@ -45,8 +45,8 @@ def config_file(tmp_path: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def _set_env_vars(monkeypatch):
-    monkeypatch.setenv("SRC_PG", "postgres://src")
-    monkeypatch.setenv("DEST_QW_PG", "postgres://quacksworth")
+    monkeypatch.setenv("SRC_PG", "postgres:host=src")
+    monkeypatch.setenv("DEST_QW_PG", "postgres:host=quacksworth")
 
 
 # --- load() basics ---
@@ -121,7 +121,7 @@ def test_load_duplicate_destination_ids(tmp_path: Path):
 
 
 def test_load_duplicate_routing_values(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("D2_PG", "postgres://d2")
+    monkeypatch.setenv("D2_PG", "postgres:host=d2")
     p = tmp_path / "bad.yaml"
     content = MINIMAL_YAML + (
         "  - id: mallardine-lake\n    routing_value: quacksworth\n    name: b\n"
@@ -166,8 +166,8 @@ def test_resolve_env_properties_missing_var():
 
 def test_postgres_uri_resolved(config_file: Path):
     cfg = load(config_file)
-    assert cfg.source.postgres_uri == "postgres://src"
-    assert cfg.destinations[0].postgres_uri == "postgres://quacksworth"
+    assert cfg.source.postgres_uri == "postgres:host=src"
+    assert cfg.destinations[0].postgres_uri == "postgres:host=quacksworth"
 
 
 def test_postgres_uri_missing_env(config_file: Path, monkeypatch):
@@ -203,8 +203,8 @@ def test_partition_all(config_file: Path):
 
 
 def test_partition_explicit(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("D1_PG", "postgres://d1")
-    monkeypatch.setenv("D2_PG", "postgres://d2")
+    monkeypatch.setenv("D1_PG", "postgres:host=d1")
+    monkeypatch.setenv("D2_PG", "postgres:host=d2")
     p = tmp_path / "cfg.yaml"
     content = """\
 source:
@@ -347,7 +347,7 @@ def test_load_unicode_routing_value(tmp_path: Path):
 
 
 def test_full_config(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("D_PG", "postgres://d")
+    monkeypatch.setenv("D_PG", "postgres:host=d")
     monkeypatch.setenv("S3_KEY", "mykey")
     p = tmp_path / "full.yaml"
     p.write_text("""\

@@ -258,13 +258,13 @@ dependencies = [
     { name = "prometheus-client" },
     { name = "pyarrow" },
     { name = "pyducklake" },
+    { name = "pytz" },
     { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
-    { name = "pytz" },
     { name = "ruff" },
 ]
 
@@ -274,12 +274,12 @@ requires-dist = [
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "pyarrow", specifier = ">=18.0" },
     { name = "pyducklake", specifier = ">=1.0.9" },
+    { name = "pytz", specifier = ">=2026.1" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
-    { name = "pytz", specifier = ">=2026.1.post1" },
     { name = "ruff", specifier = ">=0.8" },
 ]

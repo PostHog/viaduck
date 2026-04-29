@@ -80,14 +80,14 @@ def test_connect():
         table="events",
     )
 
-    with patch.dict("os.environ", {"SRC_PG": "postgres://localhost/test"}):
+    with patch.dict("os.environ", {"SRC_PG": "postgres:host=localhost dbname=test"}):
         with patch("pyducklake.Catalog") as MockCatalog:
             from viaduck.source import connect
 
             connect(cfg)
             MockCatalog.assert_called_once_with(
                 "src",
-                "postgres://localhost/test",
+                "postgres:host=localhost dbname=test",
                 data_path="/tmp/data",
                 properties={},
             )

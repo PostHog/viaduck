@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import asdict, dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
@@ -236,6 +236,10 @@ connect();
 # ---------------------------------------------------------------------------
 
 _web_enabled = True
+# Set when the server is shutting down so long-lived handlers (SSE) can exit
+# their loops promptly. Without this, `http.shutdown()` blocks forever on any
+# active /ui/sse client.
+_shutdown_event = threading.Event()
 
 
 def _make_handler():
@@ -290,11 +294,16 @@ def _make_handler():
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
                 try:
-                    while True:
+                    # Loop exits on shutdown signal, client disconnect, or
+                    # any I/O error. Using `_shutdown_event.wait` instead of
+                    # raw `time.sleep` so server.shutdown() unblocks
+                    # immediately on terminate.
+                    while not _shutdown_event.is_set():
                         data = status.to_json()
                         self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
-                        time.sleep(2)
+                        if _shutdown_event.wait(timeout=2.0):
+                            break
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # client disconnected
             else:
@@ -307,10 +316,23 @@ def _make_handler():
     return Handler
 
 
-def start(port: int = 8000, web_enabled: bool = True) -> HTTPServer:
+def signal_shutdown() -> None:
+    """Tell long-lived handlers (SSE) to exit their loops.
+
+    Call this before `server.shutdown()` so any active /ui/sse client
+    releases its handler thread and shutdown() doesn't block.
+    """
+    _shutdown_event.set()
+
+
+def start(port: int = 8000, web_enabled: bool = True) -> ThreadingHTTPServer:
     global _web_enabled
     _web_enabled = web_enabled
-    server = HTTPServer(("", port), _make_handler())
+    # ThreadingHTTPServer (not HTTPServer) so a long-lived /ui/sse client
+    # can't block /healthz, /readyz, or /metrics. With single-threaded
+    # HTTPServer, k8s liveness probes time out under any UI traffic and
+    # the pod gets killed.
+    server = ThreadingHTTPServer(("", port), _make_handler())
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     endpoints = "/metrics, /healthz, /readyz"
