@@ -636,6 +636,31 @@ def test_resolve_conflicts_uses_rowid_not_just_key():
     assert result.column("rowid")[0].as_py() == 300
 
 
+def test_resolve_conflicts_insert_postimage_same_rowid_drops_insert():
+    """Same rowid with insert + update_postimage: drop the insert, keep postimage.
+
+    Repro for the flaky CI failure in tests/integration::test_full_cdc_update_round_trip.
+    When the source's table_changes range covers an INSERT and a later same-rowid
+    UPDATE (because the upsert reused the rowid rather than delete+insert), Phase 1
+    drops the same-tenant preimage, leaving INSERT(rowid=R, value=old) and
+    UPDATE_POSTIMAGE(rowid=R, value=new) for the same key. Phase 3 _apply_changes
+    feeds both rows into a single tbl.upsert(join_cols=...) — which has undefined
+    ordering for duplicate join keys, so the older value can win non-deterministically.
+
+    Phase 2 must collapse this pair: the postimage represents the newer state.
+    """
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 10, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+            {"company": "acme", "value": 999, "change_type": "update_postimage", "snapshot_id": 2, "rowid": 100},
+        ]
+    )
+    result = _resolve_conflicts(batch)
+    assert result.num_rows == 1
+    assert result.column("change_type")[0].as_py() == "update_postimage"
+    assert result.column("value")[0].as_py() == 999
+
+
 # ---------------------------------------------------------------------------
 # _build_delete_filter
 # ---------------------------------------------------------------------------

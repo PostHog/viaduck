@@ -226,6 +226,9 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
     Rules:
     - insert + delete for same rowid → cancel both (net no-op)
     - update_postimage + delete for same rowid → drop postimage, keep delete
+    - insert + update_postimage for same rowid → drop insert, keep postimage
+      (postimage carries the newer state; passing both to a single upsert
+      yields undefined ordering on the destination join key)
     """
     if batch.num_rows == 0:
         return batch
@@ -249,6 +252,12 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
             postimage_rowids.setdefault(rowid, []).append(i)
 
     rows_to_remove: set[int] = set()
+
+    for rowid, ins_indices in insert_rowids.items():
+        if rowid in postimage_rowids and rowid not in delete_rowids:
+            # insert + postimage same rowid → keep postimage (newer state)
+            rows_to_remove.update(ins_indices)
+            metrics.cdc_conflicts_resolved_total.inc()
 
     for rowid, del_indices in delete_rowids.items():
         if rowid in insert_rowids:
