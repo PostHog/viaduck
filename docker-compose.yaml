@@ -94,7 +94,7 @@ services:
     entrypoint: python
     command: /app/test/producer.py
     environment:
-      SOURCE_POSTGRES_URI: "postgresql://ducklake:ducklake@postgres-source:5432/ducklake"
+      SOURCE_POSTGRES_URI: "postgres:host=postgres-source port=5432 user=ducklake password=ducklake dbname=ducklake"
       S3_ENDPOINT: minio:9000
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
@@ -126,9 +126,9 @@ services:
         condition: service_healthy
     command: ["--config", "/app/test/viaduck-dev.yaml"]
     environment:
-      SOURCE_POSTGRES_URI: "postgresql://ducklake:ducklake@postgres-source:5432/ducklake"
-      DEST_1_POSTGRES_URI: "postgresql://ducklake:ducklake@postgres-dest-1:5432/ducklake"
-      DEST_2_POSTGRES_URI: "postgresql://ducklake:ducklake@postgres-dest-2:5432/ducklake"
+      SOURCE_POSTGRES_URI: "postgres:host=postgres-source port=5432 user=ducklake password=ducklake dbname=ducklake"
+      DEST_1_POSTGRES_URI: "postgres:host=postgres-dest-1 port=5432 user=ducklake password=ducklake dbname=ducklake"
+      DEST_2_POSTGRES_URI: "postgres:host=postgres-dest-2 port=5432 user=ducklake password=ducklake dbname=ducklake"
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
     volumes:

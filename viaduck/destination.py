@@ -110,7 +110,8 @@ class DestinationPool:
         )
         try:
             src_tbl = src_catalog.load_table(src_cfg.table)
-            self._source_schema = src_tbl.schema()
+            # `Table.schema` is a property in pyducklake -- do not call it.
+            self._source_schema = src_tbl.schema
         finally:
             src_catalog.close()
         return self._source_schema

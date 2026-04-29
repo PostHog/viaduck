@@ -63,14 +63,31 @@ class Router:
     def _make_scalar(self, value: str, column_type: pa.DataType) -> pa.Scalar:
         """Create a PyArrow scalar matching the column's actual type.
 
+        Handles every category of column type the routing field might be:
+        integer, floating, boolean, string-ish, and any other type that PyArrow
+        can cast a string to (decimal, date, timestamp, etc.). Falling back to
+        a string scalar for non-numeric types caused
+        `pc.equal(<bool|date|...> column, <string scalar>)` to raise
+        `ArrowNotImplementedError` at runtime.
+
         Raises RoutingError if the value cannot be converted to the column type.
         """
         try:
             if pa.types.is_integer(column_type):
                 return pa.scalar(int(value), type=column_type)
-            elif pa.types.is_floating(column_type):
+            if pa.types.is_floating(column_type):
                 return pa.scalar(float(value), type=column_type)
-            else:
-                return pa.scalar(value, type=pa.string())
-        except (ValueError, TypeError, pa.ArrowInvalid) as exc:
+            if pa.types.is_boolean(column_type):
+                normalized = value.strip().lower()
+                if normalized in ("true", "1", "yes", "t", "y"):
+                    return pa.scalar(True, type=column_type)
+                if normalized in ("false", "0", "no", "f", "n"):
+                    return pa.scalar(False, type=column_type)
+                raise ValueError(f"cannot interpret {value!r} as boolean")
+            if pa.types.is_string(column_type) or pa.types.is_large_string(column_type):
+                return pa.scalar(value, type=column_type)
+            # Decimal, date, timestamp, time, duration, etc. — let PyArrow's
+            # cast machinery parse the string against the column type.
+            return pa.scalar(value).cast(column_type)
+        except (ValueError, TypeError, pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
             raise RoutingError(f"Cannot convert routing value {value!r} to column type {column_type}: {exc}") from exc

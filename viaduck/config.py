@@ -1,4 +1,18 @@
-"""YAML config parsing with env var resolution for credentials."""
+"""YAML config parsing with env var resolution for credentials.
+
+Postgres URI format
+-------------------
+The env var named by `postgres_uri_env` must contain a DuckDB postgres
+extension keyword/value connection string, NOT a libpq URI:
+
+    postgres:host=H port=P user=U password=PWD dbname=DB
+
+The libpq URI form (`postgresql://U:PWD@H:P/DB`) looks valid but DuckLake's
+ATTACH does not recognize it and falls through to its file backend, failing
+at startup with `Cannot open file: No such file or directory`. viaduck
+passes the env value through unchanged to pyducklake; format selection lives
+entirely with whatever produces the env var (chart, docker-compose, etc.).
+"""
 
 from __future__ import annotations
 
@@ -12,6 +26,31 @@ import yaml
 
 class ConfigError(Exception):
     pass
+
+
+def _validate_string_dict(props: object, ctx: str) -> dict[str, str]:
+    """Validate that a YAML node is a mapping of str -> str.
+
+    Catches the common YAML foot-gun where `key: true`, `key: 5`, etc. produce
+    a non-string value that later code (e.g. `.endswith("_env")`) blows up on.
+    """
+    if not isinstance(props, dict):
+        raise ConfigError(f"{ctx} must be a mapping (got {type(props).__name__})")
+    for k, v in props.items():
+        if not isinstance(k, str):
+            raise ConfigError(f"{ctx}: keys must be strings (got {type(k).__name__})")
+        if not isinstance(v, str):
+            raise ConfigError(f"{ctx}.{k} must be a string (got {type(v).__name__}); quote scalars in YAML")
+    return props  # type: ignore[return-value]
+
+
+def _validate_int(value: object, ctx: str) -> int:
+    """Validate that a YAML node is an integer (and not a bool, which is an int subclass)."""
+    # Bool is technically an int subclass in Python; reject it explicitly so
+    # `partition.total: true` doesn't silently become 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{ctx} must be an integer (got {type(value).__name__})")
+    return value
 
 
 def _resolve_env_properties(props: dict[str, str]) -> dict[str, str]:
@@ -216,27 +255,35 @@ def load(path: str | Path) -> ViaduckConfig:
         postgres_uri_env=_require_non_empty(src.get("postgres_uri_env", ""), "source.postgres_uri_env"),
         data_path=_require_non_empty(src.get("data_path", ""), "source.data_path"),
         table=_require_non_empty(src.get("table", ""), "source.table"),
-        properties=src.get("properties", {}),
+        properties=_validate_string_dict(src.get("properties", {}), "source.properties"),
     )
 
     # Routing
     rt = raw.get("routing")
     if not rt:
         raise ConfigError("'routing' section is required")
+    raw_key_cols = rt.get("key_columns", [])
+    if not isinstance(raw_key_cols, list):
+        raise ConfigError(f"routing.key_columns must be a list (got {type(raw_key_cols).__name__})")
+    if not all(isinstance(k, str) for k in raw_key_cols):
+        raise ConfigError("routing.key_columns entries must all be strings")
     routing = RoutingConfig(
         field=_require_non_empty(rt.get("field", ""), "routing.field"),
-        key_columns=rt.get("key_columns", []),
+        key_columns=raw_key_cols,
         seed_mode=rt.get("seed_mode", "scan"),
     )
 
     # Defaults
-    default_props = raw.get("defaults", {}).get("properties", {})
+    default_props = _validate_string_dict(raw.get("defaults", {}).get("properties", {}), "defaults.properties")
 
     # Destinations
     dests_raw = raw.get("destinations", [])
     destinations = []
     for i, d in enumerate(dests_raw):
-        dest_props = _merge_defaults(d.get("properties", {}), default_props)
+        dest_props = _merge_defaults(
+            _validate_string_dict(d.get("properties", {}), f"destinations[{i}].properties"),
+            default_props,
+        )
         destinations.append(
             DestinationConfig(
                 id=_require_non_empty(str(d.get("id", "")), f"destinations[{i}].id"),
@@ -272,8 +319,8 @@ def load(path: str | Path) -> ViaduckConfig:
     partition = PartitionConfig(
         mode=part_raw.get("mode", "all"),
         include=part_raw.get("include", []),
-        total=part_raw.get("total", 1),
-        ordinal=part_raw.get("ordinal", 0),
+        total=_validate_int(part_raw.get("total", 1), "partition.total"),
+        ordinal=_validate_int(part_raw.get("ordinal", 0), "partition.ordinal"),
     )
     instance = InstanceConfig(
         id=inst_raw.get("id", "viaduck-0"),

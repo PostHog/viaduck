@@ -61,6 +61,24 @@ _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
 
 
+def _interruptible_sleep(total_seconds: float, should_stop, tick: float = 1.0) -> None:
+    """Sleep for `total_seconds` but check `should_stop()` every `tick` seconds.
+
+    Returns early as soon as `should_stop()` is truthy. Used so SIGTERM during
+    a long poll interval is honored within ~1s rather than waiting for the
+    full interval.
+    """
+    if total_seconds <= 0:
+        return
+    elapsed = 0.0
+    while elapsed < total_seconds:
+        if should_stop():
+            return
+        chunk = min(tick, total_seconds - elapsed)
+        time.sleep(chunk)
+        elapsed += chunk
+
+
 def _group_by_cursor(
     cursors: dict[str, int],
     all_dest_ids: list[str],
@@ -468,7 +486,7 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     from viaduck import server
 
-    http = server.start(cfg.server.port)
+    http = server.start(cfg.server.port, web_enabled=cfg.web.enabled)
 
     # Connect to source
     src_catalog = source.connect(cfg.source)
@@ -479,8 +497,9 @@ def run(cfg: config.ViaduckConfig) -> None:
     dest_pool = DestinationPool(cfg, max_open=50)
     router = Router(cfg.routing)
 
-    # Cache source schema for destination table creation
-    dest_pool.set_source_schema(src_table.schema())
+    # Cache source schema for destination table creation.
+    # `Table.schema` is a property in pyducklake — do not call it.
+    dest_pool.set_source_schema(src_table.schema)
 
     # Build routing_value -> dest_id mapping
     rv_to_dest: dict[str, str] = {d.routing_value: d.id for d in cfg.destinations}
@@ -525,7 +544,11 @@ def run(cfg: config.ViaduckConfig) -> None:
             break
 
         if not shutdown:
-            time.sleep(cfg.poll.interval_seconds)
+            # Chunked sleep so SIGTERM is honored within ~1s rather than
+            # waiting up to `interval_seconds`. With long poll intervals (e.g.
+            # 300s) and k8s `terminationGracePeriodSeconds` (default 30s), an
+            # uninterruptible sleep would let kubelet SIGKILL mid-poll.
+            _interruptible_sleep(cfg.poll.interval_seconds, lambda: shutdown)
 
     # Graceful shutdown
     log.info("Shutting down...")
@@ -534,6 +557,9 @@ def run(cfg: config.ViaduckConfig) -> None:
         src_catalog.close()
     except Exception:
         pass
+    # Tell SSE handlers to exit before calling http.shutdown(), otherwise
+    # an open /ui/sse client would block shutdown() forever.
+    server.signal_shutdown()
     http.shutdown()
     log.info("Shutdown complete")
 
