@@ -463,9 +463,11 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
     append — crash between write and cursor advance will duplicate rows on
     re-seed (same at-least-once semantics as CDC).
 
-    Memory note: scan().to_arrow() materializes the entire filtered result.
-    For very large source tables, reduce poll.interval_seconds to keep the
-    source small, or accept the initial memory spike during seeding.
+    Memory: streams the filtered scan via `scan.to_arrow_batch_reader()` and
+    writes one Arrow batch at a time, so peak memory is bounded by DuckDB's
+    record-batch size rather than the total filtered result. Cursor
+    advancement happens once after all batches succeed; a partial seed
+    leaves the cursor at 0 and re-seeds on restart (at-least-once).
     """
     from pyducklake.expressions import EqualTo
 
@@ -508,42 +510,62 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
         # this, a >max_poll_age_s seed gets the pod killed by the liveness
         # probe before the first poll cycle ever runs.
         stop_heartbeat = _start_progress_heartbeat(f"Seed scan for destination {dest_id}")
+        total_rows = 0
+        batch_count = 0
+        write_secs_total = 0.0
         try:
-            scan_t0 = time.monotonic()
+            seed_t0 = time.monotonic()
             # Pin scan to the captured snapshot to avoid skew — ensures the
             # cursor and the scanned data refer to the same point in time.
             scan = src_table.scan(
                 row_filter=EqualTo(cfg.routing.field, routing_value),
                 snapshot_id=current_id,
             )
-            rows = scan.to_arrow()
-            scan_secs = time.monotonic() - scan_t0
-
-            if rows.num_rows > 0:
-                write_t0 = time.monotonic()
+            # Stream record batches so peak memory is bounded by DuckDB's
+            # batch size, not the full filtered dataset.
+            reader = scan.to_arrow_batch_reader()
+            for batch in reader:
+                if batch.num_rows == 0:
+                    continue
+                batch_table = pa.Table.from_batches([batch])
                 catalog, table = dest_pool.get(dest_id)
+                write_t0 = time.monotonic()
                 if key_columns:
-                    table.upsert(rows, join_cols=key_columns)
+                    table.upsert(batch_table, join_cols=key_columns)
                 else:
-                    table.append(rows)
-                write_secs = time.monotonic() - write_t0
+                    table.append(batch_table)
+                write_secs_total += time.monotonic() - write_t0
+                total_rows += batch.num_rows
+                batch_count += 1
+                if batch_count == 1 or batch_count % 10 == 0:
+                    log.info(
+                        "Seeding destination %s: %d batches, %d rows written so far",
+                        dest_id,
+                        batch_count,
+                        total_rows,
+                    )
+
+            seed_secs = time.monotonic() - seed_t0
+
+            if total_rows > 0:
                 log.info(
-                    "Seeded destination %s: %d rows (scan=%.1fs, write=%.1fs)",
+                    "Seeded destination %s: %d rows in %d batches (total=%.1fs, write=%.1fs)",
                     dest_id,
-                    rows.num_rows,
-                    scan_secs,
-                    write_secs,
+                    total_rows,
+                    batch_count,
+                    seed_secs,
+                    write_secs_total,
                 )
             else:
                 log.info(
                     "Destination %s: no matching rows in source (scan=%.1fs); cursor advanced",
                     dest_id,
-                    scan_secs,
+                    seed_secs,
                 )
         finally:
             stop_heartbeat.set()
 
-        state_mgr.advance_cursor(dest_id, current_id, cumulative_rows=rows.num_rows)
+        state_mgr.advance_cursor(dest_id, current_id, cumulative_rows=total_rows)
 
 
 # ---------------------------------------------------------------------------

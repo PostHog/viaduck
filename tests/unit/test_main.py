@@ -1512,7 +1512,7 @@ def test_cdc_batch_rows_metric_observed():
 
 
 def test_seed_new_destinations_populates_from_scan():
-    """Scan returns 3 rows, they get appended to the destination table."""
+    """Scan streams 3 rows in one batch; they get appended to the destination."""
     src_table = MagicMock()
     state_mgr = MagicMock()
     dest_pool = MagicMock()
@@ -1525,7 +1525,7 @@ def test_seed_new_destinations_populates_from_scan():
 
     rows = pa.table({"company": ["acme", "acme", "acme"], "value": [1, 2, 3]})
     mock_scan = MagicMock()
-    mock_scan.to_arrow.return_value = rows
+    mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
@@ -1534,7 +1534,10 @@ def test_seed_new_destinations_populates_from_scan():
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
         _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
 
-    mock_table.append.assert_called_once_with(rows)
+    assert mock_table.append.call_count == 1
+    written = mock_table.append.call_args[0][0]
+    assert written.num_rows == 3
+    assert written.equals(rows)
     state_mgr.advance_cursor.assert_called_once_with("dest-1", 100, cumulative_rows=3)
 
 
@@ -1588,9 +1591,8 @@ def test_seed_new_destinations_no_matching_rows():
 
     state_mgr.load_cursors.return_value = {}
 
-    empty = pa.table({"company": pa.array([], type=pa.string()), "value": pa.array([], type=pa.int64())})
     mock_scan = MagicMock()
-    mock_scan.to_arrow.return_value = empty
+    mock_scan.to_arrow_batch_reader.return_value = iter([])
     src_table.scan.return_value = mock_scan
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
@@ -1614,7 +1616,7 @@ def test_seed_new_destinations_uses_upsert_with_key_columns():
 
     rows = pa.table({"event_id": [1, 2], "company": ["acme", "acme"], "value": [10, 20]})
     mock_scan = MagicMock()
-    mock_scan.to_arrow.return_value = rows
+    mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
@@ -1623,7 +1625,10 @@ def test_seed_new_destinations_uses_upsert_with_key_columns():
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
         _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
 
-    mock_table.upsert.assert_called_once_with(rows, join_cols=["event_id"])
+    assert mock_table.upsert.call_count == 1
+    written = mock_table.upsert.call_args[0][0]
+    assert written.equals(rows)
+    assert mock_table.upsert.call_args[1] == {"join_cols": ["event_id"]}
     mock_table.append.assert_not_called()
 
 
@@ -1641,7 +1646,7 @@ def test_seed_new_destinations_uses_append_without_key_columns():
 
     rows = pa.table({"company": ["acme", "acme"], "value": [10, 20]})
     mock_scan = MagicMock()
-    mock_scan.to_arrow.return_value = rows
+    mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
@@ -1650,7 +1655,9 @@ def test_seed_new_destinations_uses_append_without_key_columns():
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
         _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
 
-    mock_table.append.assert_called_once_with(rows)
+    assert mock_table.append.call_count == 1
+    written = mock_table.append.call_args[0][0]
+    assert written.equals(rows)
     mock_table.upsert.assert_not_called()
 
 
@@ -1673,9 +1680,9 @@ def test_seed_new_destinations_multiple():
         scan = MagicMock()
         # EqualTo stores the value — extract it from the filter
         if "acme" in str(row_filter):
-            scan.to_arrow.return_value = rows_acme
+            scan.to_arrow_batch_reader.return_value = iter(rows_acme.to_batches())
         else:
-            scan.to_arrow.return_value = rows_beta
+            scan.to_arrow_batch_reader.return_value = iter(rows_beta.to_batches())
         return scan
 
     src_table.scan.side_effect = mock_scan
@@ -1709,9 +1716,8 @@ def test_seed_new_destinations_pins_snapshot():
 
     state_mgr.load_cursors.return_value = {}
 
-    empty = pa.table({"company": pa.array([], type=pa.string())})
     mock_scan = MagicMock()
-    mock_scan.to_arrow.return_value = empty
+    mock_scan.to_arrow_batch_reader.return_value = iter([])
     src_table.scan.return_value = mock_scan
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=42):
