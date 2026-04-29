@@ -864,6 +864,11 @@ def main():
     args = parser.parse_args()
 
     logging_config.setup()
+    try:
+        from viaduck._version import __version__
+    except ImportError:
+        __version__ = "unknown"
+    log.info("viaduck %s starting", __version__)
     cfg = config.load(args.config)
     run(cfg)
 
