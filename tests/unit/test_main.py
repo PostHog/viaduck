@@ -1525,6 +1525,7 @@ def test_seed_new_destinations_populates_from_scan():
 
     rows = pa.table({"company": ["acme", "acme", "acme"], "value": [1, 2, 3]})
     mock_scan = MagicMock()
+    mock_scan.count.return_value = rows.num_rows
     mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
@@ -1592,6 +1593,7 @@ def test_seed_new_destinations_no_matching_rows():
     state_mgr.load_cursors.return_value = {}
 
     mock_scan = MagicMock()
+    mock_scan.count.return_value = 0
     mock_scan.to_arrow_batch_reader.return_value = iter([])
     src_table.scan.return_value = mock_scan
 
@@ -1616,6 +1618,7 @@ def test_seed_new_destinations_uses_upsert_with_key_columns():
 
     rows = pa.table({"event_id": [1, 2], "company": ["acme", "acme"], "value": [10, 20]})
     mock_scan = MagicMock()
+    mock_scan.count.return_value = rows.num_rows
     mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
@@ -1646,6 +1649,7 @@ def test_seed_new_destinations_uses_append_without_key_columns():
 
     rows = pa.table({"company": ["acme", "acme"], "value": [10, 20]})
     mock_scan = MagicMock()
+    mock_scan.count.return_value = rows.num_rows
     mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
@@ -1680,8 +1684,10 @@ def test_seed_new_destinations_multiple():
         scan = MagicMock()
         # EqualTo stores the value — extract it from the filter
         if "acme" in str(row_filter):
+            scan.count.return_value = rows_acme.num_rows
             scan.to_arrow_batch_reader.return_value = iter(rows_acme.to_batches())
         else:
+            scan.count.return_value = rows_beta.num_rows
             scan.to_arrow_batch_reader.return_value = iter(rows_beta.to_batches())
         return scan
 
@@ -1717,6 +1723,7 @@ def test_seed_new_destinations_pins_snapshot():
     state_mgr.load_cursors.return_value = {}
 
     mock_scan = MagicMock()
+    mock_scan.count.return_value = 0
     mock_scan.to_arrow_batch_reader.return_value = iter([])
     src_table.scan.return_value = mock_scan
 
