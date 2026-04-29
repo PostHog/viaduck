@@ -62,16 +62,34 @@ _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
 
 
-def _start_progress_heartbeat(label: str, interval_s: float = 30.0) -> threading.Event:
+def _start_progress_heartbeat(
+    label: str,
+    interval_s: float = 30.0,
+    state: dict | None = None,
+    early_interval_s: float | None = None,
+    early_duration_s: float = 60.0,
+) -> threading.Event:
     """Start a background heartbeat for a long-running blocking operation.
 
-    While the heartbeat runs, it:
-      - logs `<label>: still working (T seconds elapsed)` every `interval_s`,
-        so operators see the pod isn't hung;
-      - calls `health.record_poll()` on each tick, which touches `_last_poll`
-        and keeps liveness green during operations that exceed
-        `max_poll_age_s` (default 300s) — e.g. an initial source scan
-        against a large catalog.
+    Each tick while running:
+      - logs a progress line for `<label>`, including elapsed seconds and any
+        counters the caller put in `state` ("rows", "batches"); throughput is
+        derived as rows / elapsed if "rows" is present;
+      - calls `health.record_poll()` to touch `_last_poll`, keeping liveness
+        green during operations that exceed `max_poll_age_s` (default 300s).
+
+    `state` is a plain dict the caller mutates from its own thread (e.g.
+    `state["rows"] += batch.num_rows` after each batch). Reads here are not
+    locked: this relies on a strict single-writer / single-reader contract
+    on a fixed key set, so the reader may see a stale value but never a
+    torn one. If you parallelize the writer side, add a `Lock` or switch
+    to atomics — `+=` is read-modify-write and concurrent writers will
+    lose updates.
+
+    `early_interval_s` (if set) is used for the first `early_duration_s`
+    seconds, then the interval falls back to `interval_s`. This gives
+    operators faster confirmation the pod is alive during cold-start without
+    spamming the log forever.
 
     Returns a `threading.Event` the caller `.set()`s when the operation
     finishes (use try/finally). The thread is a daemon so it won't block
@@ -83,9 +101,26 @@ def _start_progress_heartbeat(label: str, interval_s: float = 30.0) -> threading
     def _tick() -> None:
         from viaduck.server import health  # local to avoid import cycles
 
-        while not stop.wait(timeout=interval_s):
+        while True:
             elapsed = time.monotonic() - start_t
-            log.info("%s: still working (%.0fs elapsed)", label, elapsed)
+            wait_s = early_interval_s if (early_interval_s is not None and elapsed < early_duration_s) else interval_s
+            if stop.wait(timeout=wait_s):
+                return
+            elapsed = time.monotonic() - start_t
+            if state and "rows" in state:
+                rows = state["rows"]
+                batches = state.get("batches", 0)
+                rate = rows / elapsed if elapsed > 0 else 0
+                log.info(
+                    "%s: %d rows in %d batches, %.0fs elapsed (%.0f rows/s)",
+                    label,
+                    rows,
+                    batches,
+                    elapsed,
+                    rate,
+                )
+            else:
+                log.info("%s: still working (%.0fs elapsed)", label, elapsed)
             health.record_poll()
 
     threading.Thread(target=_tick, daemon=True).start()
@@ -492,6 +527,24 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
         current_id,
     )
 
+    # Snapshot-level metadata stats — order-of-magnitude sense of how much
+    # work the source scan will do. One quick metadata query, shared across
+    # all destinations being seeded since they all read the same snapshot.
+    try:
+        files = src_table.inspect().files(snapshot_id=current_id)
+        file_count = files.num_rows
+        data_bytes = pc.sum(files.column("data_file_size_bytes")).as_py() or 0
+        delete_bytes = pc.sum(files.column("delete_file_size_bytes")).as_py() or 0
+        log.info(
+            "Source snapshot %d: %d data files (%.2f GiB), %.2f MiB of delete data",
+            current_id,
+            file_count,
+            data_bytes / (1024**3),
+            delete_bytes / (1024**2),
+        )
+    except Exception:
+        log.exception("Could not read snapshot file inventory; continuing without it")
+
     key_columns = cfg.routing.key_columns
 
     for dest_id in new_dest_ids:
@@ -509,9 +562,17 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
         # write block (both can run minutes against a large source). Without
         # this, a >max_poll_age_s seed gets the pod killed by the liveness
         # probe before the first poll cycle ever runs.
-        stop_heartbeat = _start_progress_heartbeat(f"Seed scan for destination {dest_id}")
-        total_rows = 0
-        batch_count = 0
+        progress: dict[str, int] = {"rows": 0, "batches": 0}
+        # Faster heartbeat for the first 60s so operators see liveness during
+        # the often-slow DuckDB pre-execution phase (snapshot resolution,
+        # zone-map evaluation) before the first batch arrives. Backs off to
+        # 30s once streaming is under way.
+        stop_heartbeat = _start_progress_heartbeat(
+            f"Seed scan for destination {dest_id}",
+            state=progress,
+            early_interval_s=5.0,
+            early_duration_s=60.0,
+        )
         write_secs_total = 0.0
         try:
             seed_t0 = time.monotonic()
@@ -521,20 +582,21 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
                 row_filter=EqualTo(cfg.routing.field, routing_value),
                 snapshot_id=current_id,
             )
-            # Quick COUNT query against parquet metadata to drive a percent
-            # progress indicator. Independent from the streaming reader.
-            total_expected = scan.count()
-            log.info(
-                "Seeding destination %s: %d rows to seed at snapshot %d",
-                dest_id,
-                total_expected,
-                current_id,
-            )
-
             # Stream record batches so peak memory is bounded by DuckDB's
-            # batch size, not the full filtered dataset.
+            # batch size, not the full filtered dataset. Per-batch progress
+            # surfaces via the heartbeat thread reading `progress`.
             reader = scan.to_arrow_batch_reader()
+            first_batch_logged = False
             for batch in reader:
+                if not first_batch_logged:
+                    pre_exec_secs = time.monotonic() - seed_t0
+                    log.info(
+                        "Seed scan for destination %s: first batch in %.1fs "
+                        "(DuckDB pre-execution complete; streaming started)",
+                        dest_id,
+                        pre_exec_secs,
+                    )
+                    first_batch_logged = True
                 if batch.num_rows == 0:
                     continue
                 batch_table = pa.Table.from_batches([batch])
@@ -545,20 +607,12 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
                 else:
                     table.append(batch_table)
                 write_secs_total += time.monotonic() - write_t0
-                total_rows += batch.num_rows
-                batch_count += 1
-                if batch_count == 1 or batch_count % 10 == 0:
-                    pct = (total_rows / total_expected * 100.0) if total_expected > 0 else 100.0
-                    log.info(
-                        "Seeding destination %s: %d / %d rows (%.1f%%) in %d batches",
-                        dest_id,
-                        total_rows,
-                        total_expected,
-                        pct,
-                        batch_count,
-                    )
+                progress["rows"] += batch.num_rows
+                progress["batches"] += 1
 
             seed_secs = time.monotonic() - seed_t0
+            total_rows = progress["rows"]
+            batch_count = progress["batches"]
 
             if total_rows > 0:
                 log.info(

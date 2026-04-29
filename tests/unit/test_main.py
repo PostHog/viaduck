@@ -16,6 +16,7 @@ from viaduck.main import (
     _resolve_conflicts,
     _resolve_preimages,
     _seed_new_destinations,
+    _start_progress_heartbeat,
     _write_with_retry,
 )
 from viaduck.router import RoutingError
@@ -1525,7 +1526,6 @@ def test_seed_new_destinations_populates_from_scan():
 
     rows = pa.table({"company": ["acme", "acme", "acme"], "value": [1, 2, 3]})
     mock_scan = MagicMock()
-    mock_scan.count.return_value = rows.num_rows
     mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
@@ -1593,7 +1593,6 @@ def test_seed_new_destinations_no_matching_rows():
     state_mgr.load_cursors.return_value = {}
 
     mock_scan = MagicMock()
-    mock_scan.count.return_value = 0
     mock_scan.to_arrow_batch_reader.return_value = iter([])
     src_table.scan.return_value = mock_scan
 
@@ -1618,7 +1617,6 @@ def test_seed_new_destinations_uses_upsert_with_key_columns():
 
     rows = pa.table({"event_id": [1, 2], "company": ["acme", "acme"], "value": [10, 20]})
     mock_scan = MagicMock()
-    mock_scan.count.return_value = rows.num_rows
     mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
@@ -1649,7 +1647,6 @@ def test_seed_new_destinations_uses_append_without_key_columns():
 
     rows = pa.table({"company": ["acme", "acme"], "value": [10, 20]})
     mock_scan = MagicMock()
-    mock_scan.count.return_value = rows.num_rows
     mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
     src_table.scan.return_value = mock_scan
 
@@ -1684,10 +1681,8 @@ def test_seed_new_destinations_multiple():
         scan = MagicMock()
         # EqualTo stores the value — extract it from the filter
         if "acme" in str(row_filter):
-            scan.count.return_value = rows_acme.num_rows
             scan.to_arrow_batch_reader.return_value = iter(rows_acme.to_batches())
         else:
-            scan.count.return_value = rows_beta.num_rows
             scan.to_arrow_batch_reader.return_value = iter(rows_beta.to_batches())
         return scan
 
@@ -1723,7 +1718,6 @@ def test_seed_new_destinations_pins_snapshot():
     state_mgr.load_cursors.return_value = {}
 
     mock_scan = MagicMock()
-    mock_scan.count.return_value = 0
     mock_scan.to_arrow_batch_reader.return_value = iter([])
     src_table.scan.return_value = mock_scan
 
@@ -1733,3 +1727,254 @@ def test_seed_new_destinations_pins_snapshot():
     # Verify scan was called with snapshot_id pinned to the captured value
     call_kwargs = src_table.scan.call_args.kwargs
     assert call_kwargs["snapshot_id"] == 42
+
+
+# ---------------------------------------------------------------------------
+# _start_progress_heartbeat
+# ---------------------------------------------------------------------------
+#
+# These tests run the tick loop synchronously: the spawned thread is replaced
+# with a no-op, `time.monotonic` is driven by a virtual clock dict, and
+# `stop.wait` advances the clock by its `timeout` argument and decides when
+# to terminate the loop. No real sleeps, no real threads — fully deterministic.
+
+
+def _install_fake_heartbeat_runtime(monkeypatch):
+    """Patch threading.Thread + time.monotonic. Returns (captured, clock).
+
+    `captured["target"]` is the tick callable, runnable synchronously.
+    `clock["t"]` is the virtual clock; advance it from the fake `wait`.
+    """
+    captured: dict = {}
+
+    class _FakeThread:
+        def __init__(self, *, target, daemon):
+            captured["target"] = target
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("viaduck.main.threading.Thread", _FakeThread)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr("viaduck.main.time.monotonic", lambda: clock["t"])
+    return captured, clock
+
+
+def test_progress_heartbeat_logs_state_with_rate(caplog, monkeypatch):
+    """With a state dict, the heartbeat logs rows + batches + derived rate."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+
+    state = {"rows": 10, "batches": 4}
+    stop = _start_progress_heartbeat("test-label", interval_s=2.0, state=state)
+
+    waits: list[float] = []
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock["t"] += timeout
+        return len(waits) >= 2  # one tick logs, then exit
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "test-label" in r.message]
+    assert msgs, f"No heartbeat log captured; records: {[r.message for r in caplog.records]}"
+    msg = msgs[0]
+    assert "10 rows" in msg
+    assert "4 batches" in msg
+    # rate = 10 rows / 2.0s elapsed = 5 rows/s
+    assert "5 rows/s" in msg
+
+
+def test_progress_heartbeat_falls_back_to_still_working_without_state(caplog, monkeypatch):
+    """Without a state arg, the heartbeat keeps the still-working format."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+
+    stop = _start_progress_heartbeat("plain-label", interval_s=2.0)
+
+    waits: list[float] = []
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock["t"] += timeout
+        return len(waits) >= 2
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "plain-label" in r.message]
+    assert msgs
+    assert "still working" in msgs[0]
+
+
+def test_progress_heartbeat_state_updates_visible_to_thread(caplog, monkeypatch):
+    """A mid-loop mutation by the writer is visible to the next reader log."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+
+    state = {"rows": 0, "batches": 0}
+    stop = _start_progress_heartbeat("growing", interval_s=1.0, state=state)
+
+    call_count = {"n": 0}
+
+    def fake_wait(timeout):
+        call_count["n"] += 1
+        clock["t"] += timeout
+        if call_count["n"] == 1:
+            state["rows"] = 100
+            state["batches"] = 10
+        return call_count["n"] >= 2
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "growing" in r.message]
+    assert any("100 rows" in m and "10 batches" in m for m in msgs)
+
+
+def test_progress_heartbeat_early_to_normal_cadence_transition(monkeypatch):
+    """Heartbeat fires every `early_interval_s` until elapsed >= early_duration_s, then `interval_s`."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+
+    stop = _start_progress_heartbeat(
+        "transition-label",
+        interval_s=30.0,
+        early_interval_s=5.0,
+        early_duration_s=60.0,
+    )
+
+    waits: list[float] = []
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock["t"] += timeout
+        # Stop once we have at least one early + one normal tick.
+        return any(w == 30.0 for w in waits)
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+
+    captured["target"]()
+
+    early = [w for w in waits if w == 5.0]
+    normal = [w for w in waits if w == 30.0]
+    assert early, f"Expected early-window waits of 5.0s; got: {waits}"
+    assert normal, f"Expected at least one normal-cadence wait of 30.0s; got: {waits}"
+    # All early waits precede all normal waits.
+    last_early_idx = max(i for i, w in enumerate(waits) if w == 5.0)
+    first_normal_idx = min(i for i, w in enumerate(waits) if w == 30.0)
+    assert last_early_idx < first_normal_idx, f"Early/normal waits interleaved: {waits}"
+
+
+# ---------------------------------------------------------------------------
+# _seed_new_destinations: pre-scan stats + first-batch milestone
+# ---------------------------------------------------------------------------
+
+
+def test_seed_new_destinations_logs_prescan_stats(caplog):
+    """`inspect().files(...)` is summed and a one-line stats summary is logged."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}
+
+    files_table = pa.table(
+        {
+            "data_file_size_bytes": [1024**3, 2 * 1024**3],  # 1 GiB + 2 GiB = 3 GiB
+            "delete_file_size_bytes": [512 * 1024, 256 * 1024],  # 768 KiB = 0.75 MiB
+        }
+    )
+    src_table.inspect.return_value.files.return_value = files_table
+
+    rows = pa.table({"company": ["acme"], "value": [1]})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
+    src_table.scan.return_value = mock_scan
+
+    mock_table = MagicMock()
+    dest_pool.get.return_value = (MagicMock(), mock_table)
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=42):
+        with caplog.at_level("INFO", logger="viaduck.main"):
+            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    src_table.inspect.return_value.files.assert_called_once_with(snapshot_id=42)
+
+    msgs = [r.message for r in caplog.records]
+    prescan = [m for m in msgs if "Source snapshot 42" in m and "data files" in m]
+    assert prescan, f"No prescan stats line; got: {msgs}"
+    line = prescan[0]
+    assert "2 data files" in line
+    assert "3.00 GiB" in line
+    assert "0.75 MiB" in line
+
+
+def test_seed_new_destinations_continues_when_prescan_stats_fail(caplog):
+    """If `inspect().files` raises, seed completes anyway and the failure is logged."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}
+    src_table.inspect.return_value.files.side_effect = RuntimeError("metadata unavailable")
+
+    rows = pa.table({"company": ["acme"], "value": [1]})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
+    src_table.scan.return_value = mock_scan
+
+    mock_table = MagicMock()
+    dest_pool.get.return_value = (MagicMock(), mock_table)
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=42):
+        with caplog.at_level("WARNING", logger="viaduck.main"):
+            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    state_mgr.advance_cursor.assert_called_once()
+    err = [r for r in caplog.records if r.levelname == "ERROR" and "snapshot file inventory" in r.message]
+    assert err, f"Expected ERROR log for failed prescan; got: {[(r.levelname, r.message) for r in caplog.records]}"
+
+
+def test_seed_new_destinations_logs_first_batch_milestone(caplog):
+    """The first batch from `to_arrow_batch_reader` triggers a milestone log line."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}
+
+    rows = pa.table({"company": ["acme", "acme"], "value": [1, 2]})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
+    src_table.scan.return_value = mock_scan
+
+    mock_table = MagicMock()
+    dest_pool.get.return_value = (MagicMock(), mock_table)
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=99):
+        with caplog.at_level("INFO", logger="viaduck.main"):
+            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    msgs = [r.message for r in caplog.records]
+    milestone = [m for m in msgs if "first batch in" in m and "dest-1" in m]
+    assert milestone, f"No first-batch milestone line; got: {msgs}"
+    assert "DuckDB pre-execution complete" in milestone[0]
+    assert "streaming started" in milestone[0]
