@@ -521,6 +521,16 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
                 row_filter=EqualTo(cfg.routing.field, routing_value),
                 snapshot_id=current_id,
             )
+            # Quick COUNT query against parquet metadata to drive a percent
+            # progress indicator. Independent from the streaming reader.
+            total_expected = scan.count()
+            log.info(
+                "Seeding destination %s: %d rows to seed at snapshot %d",
+                dest_id,
+                total_expected,
+                current_id,
+            )
+
             # Stream record batches so peak memory is bounded by DuckDB's
             # batch size, not the full filtered dataset.
             reader = scan.to_arrow_batch_reader()
@@ -538,11 +548,14 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
                 total_rows += batch.num_rows
                 batch_count += 1
                 if batch_count == 1 or batch_count % 10 == 0:
+                    pct = (total_rows / total_expected * 100.0) if total_expected > 0 else 100.0
                     log.info(
-                        "Seeding destination %s: %d batches, %d rows written so far",
+                        "Seeding destination %s: %d / %d rows (%.1f%%) in %d batches",
                         dest_id,
-                        batch_count,
                         total_rows,
+                        total_expected,
+                        pct,
+                        batch_count,
                     )
 
             seed_secs = time.monotonic() - seed_t0
