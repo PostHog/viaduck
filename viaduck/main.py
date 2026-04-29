@@ -488,6 +488,15 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     http = server.start(cfg.server.port, web_enabled=cfg.web.enabled)
 
+    # Mark the process as started BEFORE any heavy bring-up work (catalog
+    # ATTACH, destination seeding). Otherwise /healthz returns 503 for the
+    # whole bring-up phase and kubelet kills the pod long before viaduck
+    # ever reaches its poll loop. mark_started seeds `_last_poll` with now,
+    # so we get `max_poll_age_s` (default 300s) of grace for bring-up.
+    # If the initial seed legitimately takes longer than that, raise
+    # `max_poll_age_s` rather than reverting this ordering.
+    health.mark_started()
+
     # Connect to source
     src_catalog = source.connect(cfg.source)
     src_table = source.load_table(src_catalog, cfg.source.table)
@@ -533,8 +542,6 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
-
-    health.mark_started()
 
     while not shutdown:
         try:
