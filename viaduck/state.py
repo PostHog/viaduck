@@ -96,6 +96,10 @@ class StateManager:
         new_ids = [did for did in destination_ids if did not in existing]
 
         if not new_ids:
+            log.info(
+                "All %d assigned destinations already have state rows; nothing to initialize",
+                len(destination_ids),
+            )
             return
 
         now = datetime.now(UTC)

@@ -43,6 +43,7 @@ Phases:
 import argparse
 import logging
 import signal
+import threading
 import time
 
 import pyarrow as pa
@@ -59,6 +60,36 @@ log = logging.getLogger(__name__)
 
 _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
+
+
+def _start_progress_heartbeat(label: str, interval_s: float = 30.0) -> threading.Event:
+    """Start a background heartbeat for a long-running blocking operation.
+
+    While the heartbeat runs, it:
+      - logs `<label>: still working (T seconds elapsed)` every `interval_s`,
+        so operators see the pod isn't hung;
+      - calls `health.record_poll()` on each tick, which touches `_last_poll`
+        and keeps liveness green during operations that exceed
+        `max_poll_age_s` (default 300s) — e.g. an initial source scan
+        against a large catalog.
+
+    Returns a `threading.Event` the caller `.set()`s when the operation
+    finishes (use try/finally). The thread is a daemon so it won't block
+    process exit even if .set() is missed.
+    """
+    stop = threading.Event()
+    start_t = time.monotonic()
+
+    def _tick() -> None:
+        from viaduck.server import health  # local to avoid import cycles
+
+        while not stop.wait(timeout=interval_s):
+            elapsed = time.monotonic() - start_t
+            log.info("%s: still working (%.0fs elapsed)", label, elapsed)
+            health.record_poll()
+
+    threading.Thread(target=_tick, daemon=True).start()
+    return stop
 
 
 def _interruptible_sleep(total_seconds: float, should_stop, tick: float = 1.0) -> None:
@@ -440,13 +471,24 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
 
     current_id = source.current_snapshot_id(src_table)
     if current_id is None:
+        log.info("Source has no snapshots yet; nothing to seed")
         return  # empty source, nothing to seed
 
     cursors = state_mgr.load_cursors(assigned_ids)
     new_dest_ids = [did for did in assigned_ids if did not in cursors or cursors[did].last_snapshot_id == 0]
 
     if not new_dest_ids:
+        log.info(
+            "Seed scan: all %d assigned destinations already past snapshot 0; skipping",
+            len(assigned_ids),
+        )
         return
+
+    log.info(
+        "Seed scan: %d destinations need initial seed (source snapshot=%d)",
+        len(new_dest_ids),
+        current_id,
+    )
 
     key_columns = cfg.routing.key_columns
 
@@ -454,23 +496,52 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
         dest_cfg = cfg.destination_by_id(dest_id)
         routing_value = dest_cfg.routing_value
 
-        # Pin scan to the captured snapshot to avoid skew — ensures the cursor
-        # and the scanned data refer to the same point in time.
-        scan = src_table.scan(
-            row_filter=EqualTo(cfg.routing.field, routing_value),
-            snapshot_id=current_id,
+        log.info(
+            "Seeding destination %s: scanning source for routing_value=%s, snapshot=%d",
+            dest_id,
+            routing_value,
+            current_id,
         )
-        rows = scan.to_arrow()
 
-        if rows.num_rows > 0:
-            catalog, table = dest_pool.get(dest_id)
-            if key_columns:
-                table.upsert(rows, join_cols=key_columns)
+        # Heartbeat keeps liveness green and emits progress while the scan +
+        # write block (both can run minutes against a large source). Without
+        # this, a >max_poll_age_s seed gets the pod killed by the liveness
+        # probe before the first poll cycle ever runs.
+        stop_heartbeat = _start_progress_heartbeat(f"Seed scan for destination {dest_id}")
+        try:
+            scan_t0 = time.monotonic()
+            # Pin scan to the captured snapshot to avoid skew — ensures the
+            # cursor and the scanned data refer to the same point in time.
+            scan = src_table.scan(
+                row_filter=EqualTo(cfg.routing.field, routing_value),
+                snapshot_id=current_id,
+            )
+            rows = scan.to_arrow()
+            scan_secs = time.monotonic() - scan_t0
+
+            if rows.num_rows > 0:
+                write_t0 = time.monotonic()
+                catalog, table = dest_pool.get(dest_id)
+                if key_columns:
+                    table.upsert(rows, join_cols=key_columns)
+                else:
+                    table.append(rows)
+                write_secs = time.monotonic() - write_t0
+                log.info(
+                    "Seeded destination %s: %d rows (scan=%.1fs, write=%.1fs)",
+                    dest_id,
+                    rows.num_rows,
+                    scan_secs,
+                    write_secs,
+                )
             else:
-                table.append(rows)
-            log.info("Seeded destination %s with %d rows from source scan", dest_id, rows.num_rows)
-        else:
-            log.info("Destination %s has no matching rows in source, cursor advanced", dest_id)
+                log.info(
+                    "Destination %s: no matching rows in source (scan=%.1fs); cursor advanced",
+                    dest_id,
+                    scan_secs,
+                )
+        finally:
+            stop_heartbeat.set()
 
         state_mgr.advance_cursor(dest_id, current_id, cumulative_rows=rows.num_rows)
 
@@ -576,6 +647,11 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
     metrics.polls_total.inc()
     health.record_poll()
 
+    cycle_t0 = time.monotonic()
+    cycle_rows_read = 0
+    cycle_rows_written = 0
+    cycle_groups_processed = 0
+
     current_id = source.current_snapshot_id(src_table)
     if current_id is None:
         log.debug("No snapshots on source table yet")
@@ -591,6 +667,7 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
     for start_snap, dest_ids in groups.items():
         if start_snap >= current_id:
             continue  # already caught up
+        cycle_groups_processed += 1
 
         # Map dest_ids to their routing values for filter/split
         routing_values = [cfg.destination_by_id(d).routing_value for d in dest_ids]
@@ -610,6 +687,8 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
             metrics.cdc_batch_rows.observe(raw_data.num_rows)
         except Exception:
             log.warning("Failed to record CDC batch size metric")
+
+        cycle_rows_read += raw_data.num_rows
 
         if raw_data.num_rows == 0:
             state_mgr.advance_cursors(dest_ids, current_id)
@@ -675,6 +754,7 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
                 state_mgr.advance_cursor(dest_id, current_id, cumulative_rows=prev_rows + ops_count)
                 metrics.dest_last_snapshot_id.labels(destination=dest_id).set(current_id)
                 health.record_replication()
+                cycle_rows_written += ops_count
             except Exception:
                 log.exception("Failed to write to destination %s", dest_id)
                 metrics.errors_total.labels(type="dest_write", destination=dest_id).inc()
@@ -726,6 +806,21 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
         pool_open=dest_pool.size,
         pool_max=dest_pool.max_open,
     )
+
+    # Per-cycle summary log. Quiet for empty cycles (no work) so steady-state
+    # idleness doesn't flood the log; verbose when there's work to report.
+    cycle_secs = time.monotonic() - cycle_t0
+    if cycle_groups_processed > 0 or cycle_rows_read > 0 or cycle_rows_written > 0:
+        max_lag = max((current_id - (getattr(cursor_map.get(did), "last_snapshot_id", 0) or 0)) for did in assigned_ids)
+        log.info(
+            "Poll cycle: snapshot=%d, groups=%d, cdc_rows_read=%d, rows_written=%d, max_lag=%d, duration=%.2fs",
+            current_id,
+            cycle_groups_processed,
+            cycle_rows_read,
+            cycle_rows_written,
+            max_lag,
+            cycle_secs,
+        )
 
 
 def main():
