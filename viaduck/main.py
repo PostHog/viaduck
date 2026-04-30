@@ -68,6 +68,7 @@ def _start_progress_heartbeat(
     state: dict | None = None,
     early_interval_s: float | None = None,
     early_duration_s: float = 60.0,
+    pre_progress_label: str = "no progress yet",
 ) -> threading.Event:
     """Start a background heartbeat for a long-running blocking operation.
 
@@ -91,6 +92,13 @@ def _start_progress_heartbeat(
     operators faster confirmation the pod is alive during cold-start without
     spamming the log forever.
 
+    The rate format only kicks in once `state["rows"] > 0`. While the
+    counter is still at 0 — i.e. no batch has arrived yet — the tick
+    instead logs `<label>: <pre_progress_label>, Ns elapsed`, since
+    "0 rows/s" conveys no signal beyond elapsed time. Callers should
+    set `pre_progress_label` to something that names the opaque phase
+    being waited on (e.g. "DuckDB pre-execution").
+
     Returns a `threading.Event` the caller `.set()`s when the operation
     finishes (use try/finally). The thread is a daemon so it won't block
     process exit even if .set() is missed.
@@ -109,16 +117,19 @@ def _start_progress_heartbeat(
             elapsed = time.monotonic() - start_t
             if state and "rows" in state:
                 rows = state["rows"]
-                batches = state.get("batches", 0)
-                rate = rows / elapsed if elapsed > 0 else 0
-                log.info(
-                    "%s: %d rows in %d batches, %.0fs elapsed (%.0f rows/s)",
-                    label,
-                    rows,
-                    batches,
-                    elapsed,
-                    rate,
-                )
+                if rows > 0:
+                    batches = state.get("batches", 0)
+                    rate = rows / elapsed if elapsed > 0 else 0
+                    log.info(
+                        "%s: %d rows in %d batches, %.0fs elapsed (%.0f rows/s)",
+                        label,
+                        rows,
+                        batches,
+                        elapsed,
+                        rate,
+                    )
+                else:
+                    log.info("%s: %s, %.0fs elapsed", label, pre_progress_label, elapsed)
             else:
                 log.info("%s: still working (%.0fs elapsed)", label, elapsed)
             health.record_poll()
@@ -572,6 +583,7 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
             state=progress,
             early_interval_s=5.0,
             early_duration_s=60.0,
+            pre_progress_label="DuckDB pre-execution",
         )
         write_secs_total = 0.0
         try:
