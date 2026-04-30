@@ -1838,6 +1838,100 @@ def test_progress_heartbeat_state_updates_visible_to_thread(caplog, monkeypatch)
     assert any("100 rows" in m and "10 batches" in m for m in msgs)
 
 
+def test_progress_heartbeat_uses_pre_progress_label_when_rows_zero(caplog, monkeypatch):
+    """With state present but `rows == 0`, the tick uses `pre_progress_label`, not the rate format."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+
+    state = {"rows": 0, "batches": 0}
+    stop = _start_progress_heartbeat(
+        "seed-label",
+        interval_s=2.0,
+        state=state,
+        pre_progress_label="DuckDB pre-execution",
+    )
+
+    waits: list[float] = []
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock["t"] += timeout
+        return len(waits) >= 2
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "seed-label" in r.message]
+    assert msgs
+    msg = msgs[0]
+    assert "DuckDB pre-execution" in msg
+    assert "rows/s" not in msg
+    assert "0 rows in 0 batches" not in msg
+
+
+def test_progress_heartbeat_pre_progress_default_label(caplog, monkeypatch):
+    """Without an explicit `pre_progress_label`, the default `no progress yet` is used."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+
+    state = {"rows": 0, "batches": 0}
+    stop = _start_progress_heartbeat("default-label", interval_s=2.0, state=state)
+
+    waits: list[float] = []
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock["t"] += timeout
+        return len(waits) >= 2
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "default-label" in r.message]
+    assert msgs
+    assert "no progress yet" in msgs[0]
+
+
+def test_progress_heartbeat_transitions_pre_progress_to_rate(caplog, monkeypatch):
+    """First tick logs pre-progress; once `rows` is non-zero, subsequent ticks log the rate format."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+
+    state = {"rows": 0, "batches": 0}
+    stop = _start_progress_heartbeat(
+        "transition-label",
+        interval_s=2.0,
+        state=state,
+        pre_progress_label="DuckDB pre-execution",
+    )
+
+    call_count = {"n": 0}
+
+    def fake_wait(timeout):
+        call_count["n"] += 1
+        clock["t"] += timeout
+        # Leave rows at 0 through the first log; mutate before the second wait
+        # so the second tick reads a positive rows count.
+        if call_count["n"] == 2:
+            state["rows"] = 50
+            state["batches"] = 5
+        return call_count["n"] >= 3
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "transition-label" in r.message]
+    assert len(msgs) >= 2, f"Expected at least 2 ticks; got: {msgs}"
+    assert "DuckDB pre-execution" in msgs[0]
+    assert "rows/s" not in msgs[0]
+    assert "50 rows" in msgs[1]
+    assert "5 batches" in msgs[1]
+    assert "rows/s" in msgs[1]
+
+
 def test_progress_heartbeat_early_to_normal_cadence_transition(monkeypatch):
     """Heartbeat fires every `early_interval_s` until elapsed >= early_duration_s, then `interval_s`."""
     captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
