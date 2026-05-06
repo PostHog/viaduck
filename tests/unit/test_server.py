@@ -27,18 +27,20 @@ def test_health_poll_recency():
     assert not h.is_alive()
 
 
-def test_health_replication_recency():
-    h = _HealthState(max_replication_age_s=0.01)
-    h.mark_started()
-    h.record_replication()
-    time.sleep(0.02)
-    assert not h.is_ready()
-
-
 def test_health_ready_without_replication():
-    """If no replication has happened yet, should still be ready (idle source)."""
+    """An idle source (no writes ever) should still be ready."""
     h = _HealthState()
     h.mark_started()
+    assert h.is_ready()
+
+
+def test_health_ready_with_stale_replication():
+    """Long-stale `_last_replication` must not flip the pod to NotReady; an
+    idle source is normal and readiness is gated only on poll recency."""
+    h = _HealthState(max_poll_age_s=10)
+    h.mark_started()
+    h.record_replication()
+    h._last_replication -= 100_000  # simulate ~28h since last write
     assert h.is_ready()
 
 
