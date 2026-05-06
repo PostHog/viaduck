@@ -23,23 +23,28 @@ class _HealthState:
     Thread-safe: the main loop writes state, the HTTP handler thread reads it.
     """
 
-    def __init__(self, max_poll_age_s: float = 300, max_replication_age_s: float = 600):
+    def __init__(self, max_poll_age_s: float = 300):
         self.max_poll_age_s = max_poll_age_s
-        self.max_replication_age_s = max_replication_age_s
         self._lock = threading.Lock()
         self._last_poll: float = 0
-        self._last_replication: float = 0
+        # `None` means "never replicated"; using a sentinel rather than 0.0
+        # because `time.monotonic()` is permitted to return 0.0 (and tests
+        # in this repo drive a virtual clock that starts at 0), so a real
+        # replication recorded at t=0 must not be misreported as "never".
+        self._last_replication: float | None = None
         self._started: bool = False
-        self._has_replicated: bool = False
 
     def record_poll(self) -> None:
         with self._lock:
             self._last_poll = time.monotonic()
 
     def record_replication(self) -> None:
+        # Tracked only for diagnostics in `status_body`; not gated on by
+        # `is_ready`. An idle source legitimately produces long stretches
+        # with no writes, and gating readiness on write recency caused
+        # healthy pods to flap to NotReady whenever the source went quiet.
         with self._lock:
             self._last_replication = time.monotonic()
-            self._has_replicated = True
 
     def mark_started(self) -> None:
         with self._lock:
@@ -57,17 +62,13 @@ class _HealthState:
         with self._lock:
             if not self._started:
                 return False
-            if (time.monotonic() - self._last_poll) >= self.max_poll_age_s:
-                return False
-            if self._has_replicated:
-                return (time.monotonic() - self._last_replication) < self.max_replication_age_s
-            return True
+            return (time.monotonic() - self._last_poll) < self.max_poll_age_s
 
     def status_body(self) -> str:
         with self._lock:
             now = time.monotonic()
             poll_age = f"{now - self._last_poll:.1f}s ago" if self._started else "never"
-            repl_age = f"{now - self._last_replication:.1f}s ago" if self._has_replicated else "never"
+            repl_age = f"{now - self._last_replication:.1f}s ago" if self._last_replication is not None else "never"
         return f"poll={poll_age} replication={repl_age}"
 
 
