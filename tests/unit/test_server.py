@@ -34,13 +34,17 @@ def test_health_ready_without_replication():
     assert h.is_ready()
 
 
-def test_health_ready_with_stale_replication():
+def test_health_ready_with_stale_replication(monkeypatch):
     """Long-stale `_last_replication` must not flip the pod to NotReady; an
     idle source is normal and readiness is gated only on poll recency."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr("viaduck.server.time.monotonic", lambda: clock["t"])
+
     h = _HealthState(max_poll_age_s=10)
     h.mark_started()
     h.record_replication()
-    h._last_replication -= 100_000  # simulate ~28h since last write
+    clock["t"] = 100_000.0  # ~28h later — far past any plausible gate
+    h.record_poll()  # poll loop is still turning
     assert h.is_ready()
 
 

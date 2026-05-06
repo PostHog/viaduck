@@ -27,7 +27,11 @@ class _HealthState:
         self.max_poll_age_s = max_poll_age_s
         self._lock = threading.Lock()
         self._last_poll: float = 0
-        self._last_replication: float = 0
+        # `None` means "never replicated"; using a sentinel rather than 0.0
+        # because `time.monotonic()` is permitted to return 0.0 (and tests
+        # in this repo drive a virtual clock that starts at 0), so a real
+        # replication recorded at t=0 must not be misreported as "never".
+        self._last_replication: float | None = None
         self._started: bool = False
 
     def record_poll(self) -> None:
@@ -64,7 +68,7 @@ class _HealthState:
         with self._lock:
             now = time.monotonic()
             poll_age = f"{now - self._last_poll:.1f}s ago" if self._started else "never"
-            repl_age = f"{now - self._last_replication:.1f}s ago" if self._last_replication else "never"
+            repl_age = f"{now - self._last_replication:.1f}s ago" if self._last_replication is not None else "never"
         return f"poll={poll_age} replication={repl_age}"
 
 
