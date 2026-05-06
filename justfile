@@ -66,11 +66,6 @@ test-perf-json:
     @echo "=== Performance Results ==="
     @python3 -c "import json; rows=json.load(open('perf-results.json')); [print(f'  {r[\"test\"]:40s} {r[\"scale\"]:30s} {r[\"elapsed_s\"]:>8.4f}s') for r in rows]"
 
-# Run E2E test (brings up docker-compose stack automatically)
-[group('test')]
-test-e2e:
-    uv run pytest tests/e2e -v -s
-
 # Verify uv.lock is consistent with pyproject.toml
 [group('test')]
 lock-check:
@@ -116,6 +111,11 @@ dashboard:
 [group('docker')]
 minio:
     open http://localhost:9001
+
+# Open the Viaduck web UI (requires `just up` first)
+[group('docker')]
+webui:
+    open http://localhost:8000/ui
 
 # === Docs ===
 

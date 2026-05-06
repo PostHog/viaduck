@@ -15,8 +15,8 @@ description = "DuckLake to DuckLake CDC replication"
 license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
-    "pyducklake>=1.0.12",
-    "duckdb>=1.5",
+    "pyducklake>=1.0.14",
+    "duckdb==1.5.1",
     "pyarrow>=18.0",
     "prometheus-client>=0.21",
     "pyyaml>=6.0",

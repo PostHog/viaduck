@@ -124,6 +124,8 @@ services:
         condition: service_healthy
       postgres-dest-2:
         condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
     command: ["--config", "/app/test/viaduck-dev.yaml"]
     environment:
       SOURCE_POSTGRES_URI: "postgres:host=postgres-source port=5432 user=ducklake password=ducklake dbname=ducklake"
