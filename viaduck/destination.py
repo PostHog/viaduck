@@ -7,6 +7,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 from viaduck import metrics
+from viaduck.source import with_pool_defaults
 
 if TYPE_CHECKING:
     from pyducklake import Catalog, Table
@@ -106,7 +107,7 @@ class DestinationPool:
             src_cfg.name,
             src_cfg.postgres_uri,
             data_path=src_cfg.data_path,
-            properties=src_cfg.resolved_properties(),
+            properties=with_pool_defaults(src_cfg.resolved_properties()),
         )
         try:
             src_tbl = src_catalog.load_table(src_cfg.table)
@@ -129,7 +130,7 @@ class DestinationPool:
                 dest_cfg.name,
                 dest_cfg.postgres_uri,
                 data_path=dest_cfg.data_path,
-                properties=dest_cfg.resolved_properties(),
+                properties=with_pool_defaults(dest_cfg.resolved_properties()),
             )
             table = catalog.create_table_if_not_exists(dest_cfg.table, schema)
             log.info(

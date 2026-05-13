@@ -20,6 +20,25 @@ log = logging.getLogger(__name__)
 
 META_COLUMNS = ("change_type", "snapshot_id", "rowid")
 
+# DuckDB's postgres extension sized `pg_pool_max_connections` to the thread
+# count (e.g. 12) in older builds. A parallel CDC scan on the source catalog
+# can claim every slot, leaving a concurrent state-table write to wait the
+# full 30s pool timeout and fail (observed: production container exits with
+# the loop's fatal-error path). Pin an explicit floor regardless of upstream
+# defaults drifting. `pg_connection_limit` is the legacy alias for
+# `pg_pool_max_connections`; the new name is registered but not SET-able in
+# duckdb 1.5.2's postgres extension.
+_PG_POOL_DEFAULTS = {
+    "pg_connection_limit": "64",
+}
+
+
+def with_pool_defaults(props: dict[str, str]) -> dict[str, str]:
+    """Merge pg pool defaults under user-supplied properties (user wins)."""
+    merged = dict(_PG_POOL_DEFAULTS)
+    merged.update(props)
+    return merged
+
 
 def connect(cfg: SourceConfig) -> Catalog:
     """Create a Catalog connection to the source DuckLake."""
@@ -29,7 +48,7 @@ def connect(cfg: SourceConfig) -> Catalog:
         cfg.name,
         cfg.postgres_uri,
         data_path=cfg.data_path,
-        properties=cfg.resolved_properties(),
+        properties=with_pool_defaults(cfg.resolved_properties()),
     )
 
 
