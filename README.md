@@ -27,7 +27,7 @@ Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* an
 - Horizontal scaling via hash or explicit destination partitioning
 - 19 Prometheus metrics, health checks (`/healthz`, `/readyz`)
 - At-least-once delivery with documented failure modes
-- [TLA+ formally verified](tla/Viaduck.tla): 5 safety invariants checked across 730K states
+- [TLA+ formally verified](tla/Viaduck.tla): 7 safety invariants checked across 26.8M states (incl. buffered delivery, concurrent flushes, and crash recovery)
 
 ## Why
 
