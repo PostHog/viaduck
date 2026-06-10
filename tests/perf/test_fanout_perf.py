@@ -195,6 +195,33 @@ def test_resolve_preimages_large_batch(perf_timer):
     assert "update_preimage" not in result.column("change_type").to_pylist()
 
 
+@pytest.mark.perf
+def test_resolve_preimages_matched_pairs(perf_timer):
+    """50K rows of MATCHED update pre/postimage pairs — exercises the
+    join-probe-hit and same-tenant-drop paths, which the mixed batch
+    (unique rowids, all orphans) never reaches."""
+    n_pairs = 25_000
+    rowids = list(range(n_pairs)) * 2
+    change_types = ["update_preimage"] * n_pairs + ["update_postimage"] * n_pairs
+    companies = [f"dest_{i % 50}" for i in range(n_pairs)] * 2
+    batch = pa.table(
+        {
+            "change_type": pa.array(change_types, type=pa.string()),
+            "rowid": pa.array(rowids, type=pa.int64()),
+            "company": pa.array(companies, type=pa.string()),
+            "value": pa.array(list(range(n_pairs)) * 2, type=pa.int64()),
+        }
+    )
+
+    with perf_timer("resolve_preimages_matched", "50K rows, all matched pairs") as t:
+        result = _resolve_preimages(batch, "company", ["value"])
+
+    print(f"_resolve_preimages (50K rows, matched pairs): {t.elapsed:.3f}s")
+    assert t.elapsed < 2.0, f"Took {t.elapsed:.3f}s, expected < 2s"
+    # All preimages dropped (same-tenant), all postimages kept.
+    assert result.num_rows == n_pairs
+
+
 # ---------------------------------------------------------------------------
 # _resolve_conflicts performance
 # ---------------------------------------------------------------------------

@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from viaduck.arrowutil import row_indices
+
 if TYPE_CHECKING:
     from viaduck.config import RoutingConfig
 
@@ -56,12 +58,19 @@ class Router:
             return result, table.num_rows
 
         column = table.column(self.field)
-        # Typed value set, reusing the per-type conversion rules (and their
-        # error reporting) from _make_scalar.
-        value_set = pa.array(
-            [self._make_scalar(val, column.type).as_py() for val in routing_values],
-            type=column.type,
-        )
+        value_set = self._typed_value_set(routing_values, column.type)
+
+        # Two configured routing values that collide after type conversion
+        # ("1" and "01" on an int column) would silently deliver rows only
+        # to the first (index_in returns the first match). The predecessor
+        # delivered the same rows to BOTH destinations — also wrong, just
+        # quieter. Reject the config instead of picking a wrong behavior.
+        distinct = pc.count_distinct(value_set).as_py()
+        if distinct != len(value_set):
+            raise RoutingError(
+                f"Routing values collide after conversion to column type {column.type}: "
+                f"{routing_values!r} maps to {value_set.to_pylist()!r}"
+            )
 
         codes = pc.index_in(column, value_set=value_set)
         routed_mask = pc.is_valid(codes)
@@ -73,7 +82,7 @@ class Router:
         # Stable sort of routed row indices by code: per-destination rows
         # stay in original order (matching the old filter behavior), and
         # each destination is a contiguous slice of the permutation.
-        idx = pa.table({"__code": codes, "__idx": pa.array(range(table.num_rows), type=pa.int64())})
+        idx = pa.table({"__code": codes, "__idx": row_indices(table.num_rows)})
         idx = idx.filter(routed_mask).sort_by("__code")
         sorted_codes = idx.column("__code")
         sorted_idx = idx.column("__idx")
@@ -85,6 +94,31 @@ class Router:
             offset += count
 
         return result, unrouted
+
+    def _typed_value_set(self, values: list[str], column_type: pa.DataType) -> pa.Array:
+        """Convert configured routing values (strings) to a typed Arrow array.
+
+        int/float/bool reuse _make_scalar's parsing rules (e.g. "yes"/"t"
+        accepted as booleans) — their as_py() round-trip is lossless. All
+        other types cast the string array directly with Arrow's cast
+        machinery: no Python-object round-trip, so sub-microsecond
+        timestamp precision and decimal exactness survive.
+        """
+        if (
+            pa.types.is_integer(column_type)
+            or pa.types.is_floating(column_type)
+            or pa.types.is_boolean(column_type)
+            or pa.types.is_string(column_type)
+            or pa.types.is_large_string(column_type)
+        ):
+            return pa.array(
+                [self._make_scalar(val, column_type).as_py() for val in values],
+                type=column_type,
+            )
+        try:
+            return pc.cast(pa.array(values, type=pa.string()), column_type)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
+            raise RoutingError(f"Cannot convert routing values {values!r} to column type {column_type}: {exc}") from exc
 
     def _make_scalar(self, value: str, column_type: pa.DataType) -> pa.Scalar:
         """Create a PyArrow scalar matching the column's actual type.

@@ -50,6 +50,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from viaduck import config, logging_config, metrics, source
+from viaduck.arrowutil import full_bool, row_indices
 from viaduck.destination import DestinationPool
 from viaduck.router import Router, RoutingError
 from viaduck.server import DestStatus, health, status
@@ -203,6 +204,20 @@ def _write_with_retry(dest_pool, destination_id, operation):
 # ---------------------------------------------------------------------------
 
 
+def _require_non_null_rowids(batch: pa.Table) -> None:
+    """Reject null rowids loudly. Stable, non-null rowids are a contract
+    assumption (see the module docstring + tla/Viaduck.tla); the Arrow hash
+    joins in Phases 1/2 do not match null keys, so a null rowid would be
+    silently misclassified (orphaned / never cancelled) rather than paired.
+    Fail fast instead."""
+    rowid_nulls = batch.column("rowid").null_count
+    if rowid_nulls:
+        raise ValueError(
+            f"CDC batch contains {rowid_nulls} null rowid(s); rowids are assumed "
+            "stable and non-null (DuckLake contract). Refusing to resolve."
+        )
+
+
 def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[str]) -> pa.Table:
     """Resolve update preimages before routing.
 
@@ -230,10 +245,11 @@ def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[st
 
     # Flatten chunking once so kernel outputs and masks align as plain arrays.
     batch = batch.combine_chunks()
+    _require_non_null_rowids(batch)
     ct_col = batch.column("change_type")
     pre_mask = pc.equal(ct_col, pa.scalar("update_preimage")).combine_chunks()
     n = batch.num_rows
-    row_idx = pa.array(range(n), type=pa.int64())
+    row_idx = row_indices(n)
 
     # rowid -> postimage routing value. Duplicate postimage rowids within a
     # batch are out of contract (stable rowids + closed snapshot range), but
@@ -252,7 +268,7 @@ def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[st
     ).drop(["__post_idx"])
     # __matched disambiguates a join miss (orphan) from a genuinely-null
     # postimage routing value.
-    post_map = post_map.append_column("__matched", pa.array([True] * post_map.num_rows, type=pa.bool_()))
+    post_map = post_map.append_column("__matched", full_bool(post_map.num_rows, True))
 
     # Join preimage rows against the postimage map. Joins don't preserve
     # order; carry the original row index and sort back afterwards.
@@ -298,12 +314,12 @@ def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[st
     # arrays via replace_with_mask (replacements align positionally with the
     # mask's true slots, which are in row order).
     pre_keep = pc.or_(orphaned, mutated)
-    keep_mask = pc.replace_with_mask(pa.array([True] * n), pre_mask, pre_keep.combine_chunks())
-    new_ct = pc.replace_with_mask(
-        pc.cast(ct_col, pa.string()).combine_chunks(),
-        pre_mask,
-        pa.array(["delete"] * len(joined), type=pa.string()),
-    )
+    keep_mask = pc.replace_with_mask(full_bool(n, True), pre_mask, pre_keep.combine_chunks())
+    # Preserve the change_type column's exact dtype (string vs large_string):
+    # downstream buffering concatenates Phase-1 outputs across reads, and
+    # concat_tables rejects mixed schemas.
+    delete_fill = pc.cast(pc.fill_null(pa.nulls(len(joined), pa.string()), "delete"), ct_col.type)
+    new_ct = pc.replace_with_mask(ct_col.combine_chunks(), pre_mask, delete_fill)
 
     idx = batch.column_names.index("change_type")
     result = batch.set_column(idx, "change_type", new_ct)
@@ -342,6 +358,7 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
         return batch
 
     batch = batch.combine_chunks()
+    _require_non_null_rowids(batch)
     ct_col = batch.column("change_type")
     is_insert = pc.equal(ct_col, pa.scalar("insert"))
     is_delete = pc.equal(ct_col, pa.scalar("delete"))
@@ -363,7 +380,7 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
         .aggregate([("__ins", "max"), ("__del", "max"), ("__post", "max")])
     )
     work = (
-        pa.table({"rowid": batch.column("rowid"), "__idx": pa.array(range(n), type=pa.int64())})
+        pa.table({"rowid": batch.column("rowid"), "__idx": row_indices(n)})
         .join(flags, keys="rowid", join_type="left outer")
         .sort_by("__idx")
     )
@@ -465,13 +482,16 @@ def _build_delete_filter(delete_rows: pa.Table, key_columns: list[str]) -> str:
             expr = And(expr, eq)
         row_filters.append(expr)
 
-    # Chain Or for multiple rows
-    if len(row_filters) == 1:
-        return row_filters[0].to_sql()
-    result = row_filters[0]
-    for f in row_filters[1:]:
-        result = Or(result, f)
-    return result.to_sql()
+    # Combine per-row filters with a BALANCED Or tree. A left-fold builds a
+    # right-deep chain whose to_sql() recurses once per node — Python's
+    # recursion limit (~1000) makes a single full delete chunk crash. Tree
+    # reduction keeps the depth at log2(rows) (~10 for a 1000-row chunk).
+    while len(row_filters) > 1:
+        row_filters = [
+            Or(row_filters[i], row_filters[i + 1]) if i + 1 < len(row_filters) else row_filters[i]
+            for i in range(0, len(row_filters), 2)
+        ]
+    return row_filters[0].to_sql()
 
 
 def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str]) -> dict[str, int]:

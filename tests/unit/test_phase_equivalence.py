@@ -282,3 +282,147 @@ def test_resolve_preimages_all_orphans_no_postimages():
     actual = _resolve_preimages(batch, "company", [])
     expected = _oracle_resolve_preimages(batch, "company")
     _assert_tables_equal(actual, expected, "all-orphans")
+
+
+# ---------------------------------------------------------------------------
+# Contract-edge equivalence (M1 review findings)
+# ---------------------------------------------------------------------------
+
+
+def _table(change_types, rowids, routings, **extra):
+    cols = {
+        "change_type": pa.array(change_types, type=pa.string()),
+        "rowid": pa.array(rowids, type=pa.int64()),
+        "company": pa.array(routings, type=pa.string()),
+    }
+    cols.update(extra)
+    return pa.table(cols)
+
+
+def test_duplicate_postimages_last_wins():
+    """Out-of-contract: two postimages for one rowid. The predecessor's dict
+    build made the LAST row win for preimage classification; the vectorized
+    max-index dedup must match."""
+    batch = _table(
+        ["update_preimage", "update_postimage", "update_postimage"],
+        [7, 7, 7],
+        ["a", "b", "a"],  # last postimage routing == preimage routing -> drop preimage
+    )
+    actual = _resolve_preimages(batch, "company", [])
+    expected = _oracle_resolve_preimages(batch, "company")
+    _assert_tables_equal(actual, expected, "dup-postimage-last-wins")
+    # And the reverse order: last postimage differs -> preimage becomes delete
+    batch2 = _table(
+        ["update_preimage", "update_postimage", "update_postimage"],
+        [7, 7, 7],
+        ["a", "a", "b"],
+    )
+    _assert_tables_equal(
+        _resolve_preimages(batch2, "company", []),
+        _oracle_resolve_preimages(batch2, "company"),
+        "dup-postimage-last-wins-mutated",
+    )
+
+
+def test_duplicate_preimages_and_multiple_update_pairs():
+    batch = _table(
+        ["update_preimage", "update_preimage", "update_postimage", "insert", "update_preimage", "update_postimage"],
+        [3, 3, 3, 4, 4, 4],
+        ["a", "a", "a", "b", "b", "b"],
+    )
+    _assert_tables_equal(
+        _resolve_preimages(batch, "company", []),
+        _oracle_resolve_preimages(batch, "company"),
+        "dup-preimages-multi-pairs",
+    )
+
+
+def test_mutation_direction_null_asymmetry():
+    """pre=None/post='a' and pre='a'/post=None must classify exactly like the
+    predecessor's Python != (both are mutations)."""
+    batch = _table(
+        ["update_preimage", "update_postimage", "update_preimage", "update_postimage"],
+        [1, 1, 2, 2],
+        [None, "a", "a", None],
+    )
+    _assert_tables_equal(
+        _resolve_preimages(batch, "company", []),
+        _oracle_resolve_preimages(batch, "company"),
+        "null-mutation-directions",
+    )
+
+
+@pytest.mark.parametrize(
+    "column,values",
+    [
+        (pa.array([1, 2, 3, 2, None], type=pa.int64()), ["1", "2"]),
+        (pa.array([True, False, True, None, False], type=pa.bool_()), ["true", "no"]),
+    ],
+)
+def test_split_and_count_typed_columns_equivalence(column, values):
+    table = pa.table({"company": column, "v": pa.array(range(len(column)), type=pa.int64())})
+    router = Router(RoutingConfig(field="company", key_columns=[], seed_mode="scan"))
+    actual_routed, actual_unrouted = router.split_and_count(table, values)
+    expected_routed, expected_unrouted = _oracle_split_and_count(router, table, values)
+    assert actual_unrouted == expected_unrouted
+    assert set(actual_routed) == set(expected_routed)
+    for val in expected_routed:
+        _assert_tables_equal(actual_routed[val], expected_routed[val], f"typed-router[{val}]")
+
+
+def test_split_and_count_rejects_converted_value_collision():
+    """'1' and '01' both convert to int 1. The predecessor silently delivered
+    the same rows to BOTH destinations (double delivery); the vectorized
+    router rejects the configuration instead. Deliberate divergence."""
+    from viaduck.router import RoutingError as RErr
+
+    table = pa.table({"company": pa.array([1, 2], type=pa.int64())})
+    router = Router(RoutingConfig(field="company", key_columns=[], seed_mode="scan"))
+    with pytest.raises(RErr, match="collide"):
+        router.split_and_count(table, ["1", "01"])
+
+
+@pytest.mark.parametrize("phase", ["preimages", "conflicts"])
+def test_null_rowid_rejected(phase):
+    """Null rowids violate the stable-rowid contract; Arrow hash joins would
+    silently misclassify them (the predecessor's dicts keyed None), so the
+    vectorized phases fail fast instead. Deliberate divergence."""
+    batch = _table(["update_preimage", "insert"], [None, 2], ["a", "b"])
+    with pytest.raises(ValueError, match="null rowid"):
+        if phase == "preimages":
+            _resolve_preimages(batch, "company", [])
+        else:
+            _resolve_conflicts(batch)
+
+
+def _counter_value(name: str) -> float:
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value(name, {"pipeline": "test"}) or 0.0
+
+
+def test_metric_parity_locked():
+    """Counter-delta lock: per-ROW orphan/mutation increments, per-ROWID
+    conflict increments — the predecessor's exact semantics."""
+    # 2 orphan rows (one rowid twice), 1 mutated row.
+    batch = _table(
+        ["update_preimage", "update_preimage", "update_preimage", "update_postimage"],
+        [1, 1, 2, 2],
+        ["a", "a", "a", "b"],
+    )
+    orphans_before = _counter_value("viaduck_cdc_orphaned_preimages_total")
+    mutations_before = _counter_value("viaduck_cdc_routing_mutations_total")
+    _resolve_preimages(batch, "company", [])
+    assert _counter_value("viaduck_cdc_orphaned_preimages_total") - orphans_before == 2
+    assert _counter_value("viaduck_cdc_routing_mutations_total") - mutations_before == 1
+
+    # Conflicts: rowid 1 = insert+delete (1 inc), rowid 2 = insert+postimage
+    # no delete (1 inc), rowid 3 = postimage+delete only (0 inc).
+    conflict_batch = _table(
+        ["insert", "delete", "insert", "update_postimage", "update_postimage", "delete"],
+        [1, 1, 2, 2, 3, 3],
+        ["a"] * 6,
+    )
+    conflicts_before = _counter_value("viaduck_cdc_conflicts_resolved_total")
+    _resolve_conflicts(conflict_batch)
+    assert _counter_value("viaduck_cdc_conflicts_resolved_total") - conflicts_before == 2
