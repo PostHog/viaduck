@@ -735,8 +735,10 @@ def run(cfg: config.ViaduckConfig) -> None:
     src_catalog = source.connect(cfg.source)
     src_table = source.load_table(src_catalog, cfg.source.table)
 
-    # Initialize state and destinations
-    state_mgr = StateManager(src_catalog, cfg.instance.id, cfg.state)
+    # Initialize state and destinations. Cursor state lives on plain
+    # Postgres (NOT a DuckLake table): a cursor advance must not create
+    # catalog snapshots, or idle destinations generate CDC work forever.
+    state_mgr = StateManager(cfg.state.resolve_postgres_uri(cfg.source), cfg.instance.id, cfg.state)
     dest_pool = DestinationPool(cfg, max_open=50)
     router = Router(cfg.routing)
 
@@ -794,6 +796,7 @@ def run(cfg: config.ViaduckConfig) -> None:
     # Graceful shutdown
     log.info("Shutting down...")
     dest_pool.close_all()
+    state_mgr.close()
     try:
         src_catalog.close()
     except Exception:

@@ -171,7 +171,16 @@ class InstanceConfig:
 
 @dataclass(frozen=True)
 class StateConfig:
-    table: str = "_viaduck_state"
+    table: str = "viaduck_state"
+    # Postgres for the cursor store. Defaults to the source catalog's URI
+    # (the same database already hosting the ducklake metadata). Set
+    # explicitly when the source catalog isn't Postgres-backed (e.g. a
+    # local DuckDB file in dev).
+    postgres_uri_env: str | None = None
+
+    def resolve_postgres_uri(self, source: SourceConfig) -> str:
+        env = self.postgres_uri_env or source.postgres_uri_env
+        return _resolve_env_value(env)
 
 
 @dataclass(frozen=True)
@@ -312,7 +321,10 @@ def load(path: str | Path) -> ViaduckConfig:
     )
 
     state_raw = raw.get("state", {})
-    state = StateConfig(table=state_raw.get("table", "_viaduck_state"))
+    state = StateConfig(
+        table=state_raw.get("table", "viaduck_state"),
+        postgres_uri_env=state_raw.get("postgres_uri_env") or None,
+    )
 
     inst_raw = raw.get("instance", {})
     part_raw = inst_raw.get("partition", {})

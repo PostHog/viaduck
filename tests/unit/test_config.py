@@ -70,7 +70,8 @@ def test_load_defaults_applied(config_file: Path):
     assert cfg.web.port == 8001
     assert cfg.instance.id == "viaduck-0"
     assert cfg.instance.partition.mode == "all"
-    assert cfg.state.table == "_viaduck_state"
+    assert cfg.state.table == "viaduck_state"
+    assert cfg.state.postgres_uri_env is None
 
 
 def test_load_missing_file():
@@ -469,3 +470,23 @@ def test_load_with_seed_mode(tmp_path: Path):
     p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  seed_mode: cdc_replay"))
     cfg = load(p)
     assert cfg.routing.seed_mode == "cdc_replay"
+
+
+def test_state_postgres_uri_defaults_to_source(config_file, monkeypatch):
+    """state.postgres_uri_env unset → the cursor store shares the source
+    catalog's Postgres."""
+    monkeypatch.setenv("SRC_PG", "postgresql://src:5432/meta")
+    cfg = load(config_file)
+    assert cfg.state.resolve_postgres_uri(cfg.source) == "postgresql://src:5432/meta"
+
+
+def test_state_postgres_uri_explicit_override(config_file, monkeypatch, tmp_path):
+    import yaml as _yaml
+
+    raw = _yaml.safe_load(config_file.read_text())
+    raw["state"] = {"postgres_uri_env": "STATE_PG_URI"}
+    override = tmp_path / "viaduck-state-override.yaml"
+    override.write_text(_yaml.dump(raw))
+    monkeypatch.setenv("STATE_PG_URI", "postgresql://state-host:5432/cursors")
+    cfg = load(override)
+    assert cfg.state.resolve_postgres_uri(cfg.source) == "postgresql://state-host:5432/cursors"

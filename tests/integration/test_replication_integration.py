@@ -300,10 +300,10 @@ def test_full_cdc_insert_then_delete_same_key(source_catalog, source_table, dest
 # ---------------------------------------------------------------------------
 
 
-def test_state_manager_round_trip(source_catalog):
+def test_state_manager_round_trip(pg_uri, state_table_name):
     """Create a real StateManager, initialize destinations, advance cursors, verify persistence."""
-    state_cfg = StateConfig(table="_viaduck_state_test")
-    sm = StateManager(source_catalog, "test-instance", state_cfg)
+    state_cfg = StateConfig(table=state_table_name)
+    sm = StateManager(pg_uri, "test-instance", state_cfg)
 
     dest_ids = ["dest-alpha", "dest-beta"]
     sm.initialize_destinations(dest_ids)
@@ -454,7 +454,7 @@ def test_strip_meta_on_real_cdc_data(source_table):
 # ---------------------------------------------------------------------------
 
 
-def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_table_a):
+def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_table_a, pg_uri, state_table_name):
     """Seed a new destination from a source with 4 rows (2 acme, 2 beta).
 
     Verify destination gets only the 2 matching rows and cursor is at current snapshot.
@@ -474,8 +474,8 @@ def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_tabl
     assert snap is not None
 
     # Set up StateManager
-    state_cfg = StateConfig(table="_viaduck_seed_test")
-    sm = StateManager(source_catalog, "seed-instance", state_cfg)
+    state_cfg = StateConfig(table=state_table_name)
+    sm = StateManager(pg_uri, "seed-instance", state_cfg)
     sm.initialize_destinations(["dest-acme"])
 
     # Build a mock cfg that points at real routing config and destination
