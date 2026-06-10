@@ -490,3 +490,24 @@ def test_state_postgres_uri_explicit_override(config_file, monkeypatch, tmp_path
     monkeypatch.setenv("STATE_PG_URI", "postgresql://state-host:5432/cursors")
     cfg = load(override)
     assert cfg.state.resolve_postgres_uri(cfg.source) == "postgresql://state-host:5432/cursors"
+
+
+def test_state_uri_translates_duckdb_attach_format(config_file, monkeypatch):
+    """The source URI uses DuckDB's ATTACH format ('postgres:' + libpq
+    keyword/value). The state store must receive valid libpq conninfo."""
+    monkeypatch.setenv("SRC_PG", "postgres:host=postgres-source port=5432 dbname=meta user=v password=x")
+    cfg = load(config_file)
+    assert cfg.state.resolve_postgres_uri(cfg.source) == (
+        "host=postgres-source port=5432 dbname=meta user=v password=x"
+    )
+
+
+def test_state_uri_passes_through_libpq_forms(config_file, monkeypatch):
+    for raw in (
+        "postgresql://u:p@h:5432/db",
+        "postgres://u:p@h:5432/db",
+        "host=h port=5432 dbname=db",
+    ):
+        monkeypatch.setenv("SRC_PG", raw)
+        cfg = load(config_file)
+        assert cfg.state.resolve_postgres_uri(cfg.source) == raw

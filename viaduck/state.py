@@ -42,6 +42,13 @@ log = logging.getLogger(__name__)
 # so a config typo can't smuggle SQL.
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
+# Bound every state operation: the lock in _run serializes ALL cursor
+# traffic (flush workers + the poll thread), so one hung connection during
+# a catalog-PG failover would otherwise stall the whole pipeline silently
+# instead of tripping the loop's fatal path.
+_CONNECT_TIMEOUT_S = 10
+_STATEMENT_TIMEOUT_MS = 30_000
+
 
 @dataclass
 class DestinationCursor:
@@ -71,8 +78,18 @@ class StateManager:
     def _connection(self) -> psycopg.Connection:
         """Open (or reuse) the connection. Caller must hold the lock."""
         if self._conn is None or self._conn.closed:
-            self._conn = psycopg.connect(self._uri, autocommit=True)
-            self._conn.execute(
+            self._conn = psycopg.connect(
+                self._uri,
+                autocommit=True,
+                connect_timeout=_CONNECT_TIMEOUT_S,
+                options=f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
+            )
+            self._ensure_table(self._conn)
+        return self._conn
+
+    def _ensure_table(self, conn: psycopg.Connection) -> None:
+        try:
+            conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self._table} (
                     destination_id     text        NOT NULL,
@@ -87,10 +104,14 @@ class StateManager:
                 )
                 """
             )
-            if not self._table_ensured:
-                log.info("State table '%s' ready", self._table)
-                self._table_ensured = True
-        return self._conn
+        except (psycopg.errors.DuplicateTable, psycopg.errors.UniqueViolation):
+            # Two instances racing the first boot: IF NOT EXISTS still
+            # raises a unique violation on the pg_class/pg_type insert in
+            # one of them. The table exists either way.
+            log.info("State table '%s' created concurrently by another instance", self._table)
+        if not self._table_ensured:
+            log.info("State table '%s' ready", self._table)
+            self._table_ensured = True
 
     def _run(self, op: Callable[[psycopg.Connection], Any]) -> Any:
         """Run op under the lock, with one reconnect retry on connection loss."""
@@ -168,7 +189,11 @@ class StateManager:
 
         A single upsert — atomic by construction. If cumulative_rows is
         None, the existing value is preserved. A successful advance clears
-        any recorded error.
+        any recorded error. Stale writes (snapshot_id below the stored
+        cursor) are dropped entirely — cursors never regress
+        (CursorMonotonicity in tla/Viaduck.tla); per-destination flush
+        serialization should prevent out-of-order acks, this is
+        defense-in-depth.
         """
         now = datetime.now(UTC)
 
@@ -186,6 +211,7 @@ class StateManager:
                     last_error         = NULL,
                     last_error_at      = NULL,
                     updated_at         = EXCLUDED.updated_at
+                WHERE {self._table}.last_snapshot_id <= EXCLUDED.last_snapshot_id
                 """,
                 (destination_id, self._instance_id, snapshot_id, now, cumulative_rows, now, cumulative_rows),
             )
@@ -217,6 +243,7 @@ class StateManager:
                     last_error         = NULL,
                     last_error_at      = NULL,
                     updated_at         = EXCLUDED.updated_at
+                WHERE {self._table}.last_snapshot_id <= EXCLUDED.last_snapshot_id
                 """,
                 (destination_ids, self._instance_id, snapshot_id, now, now),
             )

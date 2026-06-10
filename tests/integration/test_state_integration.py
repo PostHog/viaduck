@@ -157,3 +157,73 @@ def test_state_rows_visible_via_plain_sql(sm, pg_uri, state_table_name):
             "WHERE destination_id = 'd1' AND instance_id = 'i1'"
         ).fetchone()
     assert row == (12, 3, None)
+
+
+def test_stale_advance_is_dropped(sm):
+    """Monotonicity guard: a stale ack (lower snapshot) must not move the
+    cursor backwards nor clobber rows_replicated — defense-in-depth under
+    M3's concurrent flush workers."""
+    sm.initialize_destinations(["d1"])
+    sm.advance_cursor("d1", snapshot_id=10, cumulative_rows=100)
+    sm.advance_cursor("d1", snapshot_id=5, cumulative_rows=50)  # stale
+    cur = sm.load_cursors(["d1"])["d1"]
+    assert cur.last_snapshot_id == 10
+    assert cur.rows_replicated == 100
+    # Equal snapshot is allowed (idempotent re-ack).
+    sm.advance_cursor("d1", snapshot_id=10, cumulative_rows=110)
+    assert sm.load_cursors(["d1"])["d1"].rows_replicated == 110
+
+
+def test_stale_batch_advance_is_dropped(sm):
+    sm.initialize_destinations(["d1", "d2"])
+    sm.advance_cursor("d1", snapshot_id=20)
+    sm.advance_cursors(["d1", "d2"], snapshot_id=8)  # stale for d1, fresh for d2
+    cursors = sm.load_cursors(["d1", "d2"])
+    assert cursors["d1"].last_snapshot_id == 20
+    assert cursors["d2"].last_snapshot_id == 8
+
+
+def test_advance_without_initialize_creates_row(sm):
+    """The INSERT arm: advancing a never-initialized destination creates its
+    row (cumulative_rows None -> 0), matching the predecessor's
+    delete+insert behavior."""
+    sm.advance_cursor("d-fresh", snapshot_id=3, cumulative_rows=None)
+    cur = sm.load_cursors(["d-fresh"])["d-fresh"]
+    assert cur.last_snapshot_id == 3
+    assert cur.rows_replicated == 0
+
+
+def test_reconnect_after_backend_killed_mid_session(sm, pg_uri):
+    """Kill the manager's backend server-side (not a clean local close) —
+    the next op must hit OperationalError and recover via the retry. All
+    statements are idempotent under retry-after-partial-apply."""
+    sm.initialize_destinations(["d1"])
+    with psycopg.connect(pg_uri, autocommit=True) as admin:
+        admin.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE pid <> pg_backend_pid() AND application_name = '' AND state = 'idle'"
+        )
+    sm.advance_cursor("d1", snapshot_id=21)
+    assert sm.load_cursors(["d1"])["d1"].last_snapshot_id == 21
+
+
+def test_concurrent_create_table_race(pg_uri, state_table_name):
+    """Two instances bootstrapping the same table concurrently must both
+    survive (IF NOT EXISTS can still raise a unique violation in one)."""
+    managers = [StateManager(pg_uri, f"i{n}", StateConfig(table=state_table_name)) for n in range(4)]
+    errors: list[Exception] = []
+
+    def _boot(mgr, n):
+        try:
+            mgr.initialize_destinations([f"d{n}"])
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_boot, args=(m, n)) for n, m in enumerate(managers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for m in managers:
+        m.close()
+    assert not errors

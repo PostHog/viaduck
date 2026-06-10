@@ -44,7 +44,23 @@ jobs:
     - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
       with:
         fail-on-severity: moderate
-        allow-licenses: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, PSF-2.0
+        # SPDX `AND` is conjunction: every atom in a package's license
+        # expression must be on this list. Python-2.0 and 0BSD appear in
+        # PSF-family expressions (typing-extensions, etc.).
+        allow-licenses: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, PSF-2.0, Python-2.0, 0BSD
+        # Per-package exemptions for license-metadata noise, mirroring the
+        # millpond CI precedent:
+        #   - typing-extensions  PSF-licensed in substance (same family as
+        #     CPython); its PEP 639 expression includes GPL-1.0-or-later
+        #     atoms from the historical CNRI/BeOpen license chain, which
+        #     the conjunction rule would otherwise reject.
+        #   - psycopg, psycopg-binary  LGPL-3.0-or-later: we link, don't
+        #     modify; LGPL terms are satisfied — accepted as a
+        #     PostHog-cloud-infra precedent (see millpond's ci.yaml).
+        allow-dependencies-licenses: >-
+          pkg:pypi/typing-extensions,
+          pkg:pypi/psycopg,
+          pkg:pypi/psycopg-binary
 
   build:
     runs-on: ubuntu-latest

@@ -169,6 +169,24 @@ class InstanceConfig:
     partition: PartitionConfig = field(default_factory=PartitionConfig)
 
 
+def _to_libpq_conninfo(uri: str) -> str:
+    """Translate the source catalog's URI format into something psycopg accepts.
+
+    The source/destination `postgres_uri_env` values use DuckDB's ATTACH
+    format: ``postgres:host=H port=P dbname=DB ...`` — a ``postgres:``
+    prefix on a libpq keyword/value string. psycopg rejects that verbatim
+    (no ``//``, so libpq parses ``postgres:host`` as an invalid keyword).
+    Stripping the prefix yields a valid libpq conninfo. Real libpq URIs
+    (``postgresql://`` / ``postgres://``) and bare keyword/value strings
+    pass through untouched.
+    """
+    if uri.startswith(("postgresql://", "postgres://")):
+        return uri
+    if uri.startswith("postgres:"):
+        return uri[len("postgres:") :]
+    return uri
+
+
 @dataclass(frozen=True)
 class StateConfig:
     table: str = "viaduck_state"
@@ -180,7 +198,7 @@ class StateConfig:
 
     def resolve_postgres_uri(self, source: SourceConfig) -> str:
         env = self.postgres_uri_env or source.postgres_uri_env
-        return _resolve_env_value(env)
+        return _to_libpq_conninfo(_resolve_env_value(env))
 
 
 @dataclass(frozen=True)
