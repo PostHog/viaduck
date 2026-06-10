@@ -60,6 +60,7 @@ log = logging.getLogger(__name__)
 
 _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
+_DELETE_CHUNK_ROWS = 1000
 
 
 def _start_progress_heartbeat(
@@ -212,10 +213,10 @@ def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[st
 
     Returns the batch with preimages resolved.
 
-    Memory note: converts Arrow columns to Python lists via to_pylist() for
-    row-level pairing logic. For very large CDC batches (10M+ rows), this
-    materializes ~3 Python lists. If this becomes a bottleneck, reduce
-    poll.interval_seconds to keep batch sizes smaller.
+    Arrow-native: the preimage↔postimage pairing is a hash join on rowid;
+    classification and the change_type rewrite are compute kernels. No
+    per-row Python. Equivalence with the row-loop predecessor is locked by
+    tests/unit/test_phase_equivalence.py.
     """
     # Validate key columns exist
     for col in key_columns:
@@ -223,85 +224,97 @@ def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[st
             raise RoutingError(f"Key column {col!r} not found in CDC data. Available: {batch.column_names}")
 
     ct_col = batch.column("change_type")
-
-    # Check if there are any preimages to resolve
-    has_preimages = False
-    for val in ct_col.to_pylist():
-        if val == "update_preimage":
-            has_preimages = True
-            break
-    if not has_preimages:
+    pre_mask = pc.equal(ct_col, pa.scalar("update_preimage"))
+    if not pc.any(pre_mask).as_py():
         return batch
 
-    # Batch-convert columns to Python lists for performance (avoid per-cell .as_py())
-    ct_list = ct_col.to_pylist()
-    routing_list = batch.column(routing_field).to_pylist()
-    rowid_list = batch.column("rowid").to_pylist()
+    # Flatten chunking once so kernel outputs and masks align as plain arrays.
+    batch = batch.combine_chunks()
+    ct_col = batch.column("change_type")
+    pre_mask = pc.equal(ct_col, pa.scalar("update_preimage")).combine_chunks()
+    n = batch.num_rows
+    row_idx = pa.array(range(n), type=pa.int64())
 
-    # Build rowid -> routing value map for postimages
-    postimage_routing: dict = {}
-    for i in range(batch.num_rows):
-        if ct_list[i] == "update_postimage":
-            postimage_routing[rowid_list[i]] = routing_list[i]
+    # rowid -> postimage routing value. Duplicate postimage rowids within a
+    # batch are out of contract (stable rowids + closed snapshot range), but
+    # the predecessor's dict build made the last row win — preserve that via
+    # max(row index) so behavior is identical even under contract violations.
+    post_tbl = pa.table(
+        {
+            "rowid": batch.column("rowid"),
+            "__post_routing": batch.column(routing_field),
+            "__post_idx": row_idx,
+        }
+    ).filter(pc.equal(ct_col, pa.scalar("update_postimage")))
+    last_idx = post_tbl.group_by("rowid").aggregate([("__post_idx", "max")])
+    post_map = post_tbl.join(
+        last_idx, keys=["rowid", "__post_idx"], right_keys=["rowid", "__post_idx_max"], join_type="inner"
+    ).drop(["__post_idx"])
+    # __matched disambiguates a join miss (orphan) from a genuinely-null
+    # postimage routing value.
+    post_map = post_map.append_column("__matched", pa.array([True] * post_map.num_rows, type=pa.bool_()))
 
-    # Process each row
-    keep_mask = []
-    new_change_types = list(ct_list)
+    # Join preimage rows against the postimage map. Joins don't preserve
+    # order; carry the original row index and sort back afterwards.
+    pre_tbl = pa.table(
+        {
+            "rowid": batch.column("rowid"),
+            "__pre_routing": batch.column(routing_field),
+            "__pre_idx": row_idx,
+        }
+    ).filter(pre_mask)
+    joined = pre_tbl.join(post_map, keys="rowid", join_type="left outer").sort_by("__pre_idx")
 
-    _SENTINEL = object()
+    orphaned = pc.is_null(joined.column("__matched"))
+    pre_r = joined.column("__pre_routing")
+    post_r = joined.column("__post_routing")
+    # Null-safe equality: null == null is a match (the predecessor compared
+    # Python values, where None == None).
+    routing_same = pc.or_(
+        pc.fill_null(pc.equal(pre_r, post_r), False),
+        pc.and_(pc.is_null(pre_r), pc.is_null(post_r)),
+    )
+    mutated = pc.and_(pc.invert(orphaned), pc.invert(routing_same))
 
-    for i in range(batch.num_rows):
-        ct = ct_list[i]
-        if ct != "update_preimage":
-            keep_mask.append(True)
-            continue
+    n_orphaned = pc.sum(pc.cast(orphaned, pa.int64())).as_py() or 0
+    n_mutated = pc.sum(pc.cast(mutated, pa.int64())).as_py() or 0
+    if n_orphaned:
+        metrics.cdc_orphaned_preimages_total.inc(n_orphaned)
+        log.debug("%d orphaned preimage(s) converted to delete", n_orphaned)
+    if n_mutated:
+        metrics.cdc_routing_mutations_total.inc(n_mutated)
+        sample = joined.filter(mutated).column("rowid").slice(0, 5).to_pylist()
+        log.error(
+            "Routing column mutation detected on %d row(s) (sample rowids: %s). "
+            "The routing column should not be updated. Handling defensively "
+            "(delete from old destination, upsert to new), but CDC filter "
+            "pushdown may have dropped other preimages. Verify data integrity.",
+            n_mutated,
+            sample,
+        )
 
-        rowid = rowid_list[i]
-        pre_routing = routing_list[i]
-        post_routing = postimage_routing.get(rowid, _SENTINEL)
+    # Per-preimage-row verdicts, in original row order: keep (as delete) when
+    # orphaned or mutated; drop when same-tenant. Scatter back into full-size
+    # arrays via replace_with_mask (replacements align positionally with the
+    # mask's true slots, which are in row order).
+    pre_keep = pc.or_(orphaned, mutated)
+    keep_mask = pc.replace_with_mask(pa.array([True] * n), pre_mask, pre_keep.combine_chunks())
+    new_ct = pc.replace_with_mask(
+        pc.cast(ct_col, pa.string()).combine_chunks(),
+        pre_mask,
+        pa.array(["delete"] * len(joined), type=pa.string()),
+    )
 
-        if post_routing is _SENTINEL:
-            # Orphaned preimage — no matching postimage. Convert to delete.
-            new_change_types[i] = "delete"
-            keep_mask.append(True)
-            metrics.cdc_orphaned_preimages_total.inc()
-            log.debug("Orphaned preimage (rowid=%s) converted to delete", rowid)
-        elif pre_routing != post_routing:
-            # Routing column mutation detected — this violates the design assumption
-            # that the routing column is immutable. Handle defensively by converting
-            # the preimage to a delete on the old destination, but log loudly.
-            new_change_types[i] = "delete"
-            keep_mask.append(True)
-            metrics.cdc_routing_mutations_total.inc()
-            log.error(
-                "Routing column mutation detected (rowid=%s): %s → %s. "
-                "The routing column should not be updated. Handling defensively "
-                "(delete from old destination, upsert to new), but CDC filter "
-                "pushdown may have dropped other preimages. Verify data integrity.",
-                rowid,
-                pre_routing,
-                post_routing,
-            )
-        else:
-            # Same-tenant update — drop preimage (upsert handles it).
-            keep_mask.append(False)
-
-    # Rebuild batch with modified change_types
-    if all(keep_mask):
-        # Only need to update change_type column
-        idx = batch.column_names.index("change_type")
-        result = batch.set_column(idx, "change_type", pa.array(new_change_types, type=pa.string()))
-    else:
-        # Filter out dropped preimages and update change_types
-        idx = batch.column_names.index("change_type")
-        batch = batch.set_column(idx, "change_type", pa.array(new_change_types, type=pa.string()))
-        result = batch.filter(pa.array(keep_mask))
+    idx = batch.column_names.index("change_type")
+    result = batch.set_column(idx, "change_type", new_ct)
+    if not pc.all(keep_mask).as_py():
+        result = result.filter(keep_mask)
 
     # Post-condition: no preimages should remain after resolution
-    remaining_types = result.column("change_type").to_pylist()
-    assert "update_preimage" not in remaining_types, (
-        f"Bug: {remaining_types.count('update_preimage')} update_preimage rows remain after Phase 1 resolution"
-    )
+    remaining = pc.sum(
+        pc.cast(pc.equal(result.column("change_type"), pa.scalar("update_preimage")), pa.int64())
+    ).as_py()
+    assert not remaining, f"Bug: {remaining} update_preimage rows remain after Phase 1 resolution"
     return result
 
 
@@ -328,56 +341,79 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
     if batch.num_rows == 0:
         return batch
 
-    ct_list = batch.column("change_type").to_pylist()
-    rowid_list = batch.column("rowid").to_pylist()
+    batch = batch.combine_chunks()
+    ct_col = batch.column("change_type")
+    is_insert = pc.equal(ct_col, pa.scalar("insert"))
+    is_delete = pc.equal(ct_col, pa.scalar("delete"))
+    is_post = pc.equal(ct_col, pa.scalar("update_postimage"))
 
-    # Index rows by (rowid, change_type)
-    delete_rowids: dict[int, list[int]] = {}  # rowid -> [row indices]
-    insert_rowids: dict[int, list[int]] = {}
-    postimage_rowids: dict[int, list[int]] = {}
+    # Per-rowid presence flags via group_by, joined back onto every row.
+    # Joins don't preserve order; carry the row index and sort back.
+    n = batch.num_rows
+    flags = (
+        pa.table(
+            {
+                "rowid": batch.column("rowid"),
+                "__ins": is_insert,
+                "__del": is_delete,
+                "__post": is_post,
+            }
+        )
+        .group_by("rowid")
+        .aggregate([("__ins", "max"), ("__del", "max"), ("__post", "max")])
+    )
+    work = (
+        pa.table({"rowid": batch.column("rowid"), "__idx": pa.array(range(n), type=pa.int64())})
+        .join(flags, keys="rowid", join_type="left outer")
+        .sort_by("__idx")
+    )
 
-    for i in range(batch.num_rows):
-        ct = ct_list[i]
-        rowid = rowid_list[i]
-        if ct == "delete":
-            delete_rowids.setdefault(rowid, []).append(i)
-        elif ct == "insert":
-            insert_rowids.setdefault(rowid, []).append(i)
-        elif ct == "update_postimage":
-            postimage_rowids.setdefault(rowid, []).append(i)
+    has_ins = work.column("__ins_max")
+    has_del = work.column("__del_max")
+    has_post = work.column("__post_max")
 
-    rows_to_remove: set[int] = set()
+    # Drop rules (same as the row-loop predecessor):
+    #   insert row:    dropped when a postimage exists (newer state wins) or
+    #                  a delete exists (insert+delete cancel)
+    #   delete row:    dropped when an insert exists (cancel pair)
+    #   postimage row: dropped when a delete exists (delete wins)
+    drop = pc.or_(
+        pc.or_(
+            pc.and_(is_insert, pc.or_(has_post, has_del)),
+            pc.and_(is_delete, has_ins),
+        ),
+        pc.and_(is_post, has_del),
+    )
+    keep_mask = pc.invert(pc.fill_null(drop, False)).combine_chunks()
 
-    for rowid, ins_indices in insert_rowids.items():
-        if rowid in postimage_rowids and rowid not in delete_rowids:
-            # insert + postimage same rowid → keep postimage (newer state)
-            rows_to_remove.update(ins_indices)
-            metrics.cdc_conflicts_resolved_total.inc()
+    # Metric parity with the predecessor: one increment per rowid with an
+    # insert+postimage (no delete) conflict, one per rowid with an
+    # insert+delete cancellation.
+    n_conflicts = pc.sum(
+        pc.cast(
+            pc.or_(
+                pc.and_(
+                    pc.and_(flags.column("__ins_max"), flags.column("__post_max")), pc.invert(flags.column("__del_max"))
+                ),
+                pc.and_(flags.column("__ins_max"), flags.column("__del_max")),
+            ),
+            pa.int64(),
+        )
+    ).as_py()
+    if n_conflicts:
+        metrics.cdc_conflicts_resolved_total.inc(n_conflicts)
 
-    for rowid, del_indices in delete_rowids.items():
-        if rowid in insert_rowids:
-            # insert + delete for same rowid → cancel both
-            rows_to_remove.update(del_indices)
-            rows_to_remove.update(insert_rowids[rowid])
-            metrics.cdc_conflicts_resolved_total.inc()
-        if rowid in postimage_rowids:
-            # update_postimage + delete for same rowid → drop postimage, keep delete
-            rows_to_remove.update(postimage_rowids[rowid])
-
-    if not rows_to_remove:
-        result = batch
-    else:
-        keep_mask = [i not in rows_to_remove for i in range(batch.num_rows)]
-        result = batch.filter(pa.array(keep_mask))
+    result = batch if pc.all(keep_mask).as_py() else batch.filter(keep_mask)
 
     # Post-condition: no rowid should appear in both insert and delete sets
     if result.num_rows > 0:
-        remaining_ct = result.column("change_type").to_pylist()
-        remaining_rid = result.column("rowid").to_pylist()
-        insert_rids = {remaining_rid[i] for i in range(len(remaining_ct)) if remaining_ct[i] == "insert"}
-        delete_rids = {remaining_rid[i] for i in range(len(remaining_ct)) if remaining_ct[i] == "delete"}
-        overlap = insert_rids & delete_rids
-        assert not overlap, f"Bug: rowids {overlap} appear in both insert and delete after Phase 2 conflict resolution"
+        res_ct = result.column("change_type")
+        ins_rids = result.filter(pc.equal(res_ct, pa.scalar("insert"))).column("rowid")
+        del_rids = result.filter(pc.equal(res_ct, pa.scalar("delete"))).column("rowid")
+        overlap = pc.filter(ins_rids, pc.is_in(ins_rids, value_set=del_rids.combine_chunks()))
+        assert len(overlap) == 0, (
+            f"Bug: rowids {overlap.to_pylist()} appear in both insert and delete after Phase 2 conflict resolution"
+        )
 
     return result
 
@@ -477,8 +513,14 @@ def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str])
         tbl = txn.load_table(dest_table.identifier)
 
         if delete_rows.num_rows > 0:
-            filter_sql = _build_delete_filter(delete_rows, key_columns)
-            tbl.delete(filter_sql)
+            # Chunked: a single filter over 100k+ keys builds an O(rows)
+            # expression tree and a giant SQL string (the composite-key path
+            # is one Or(And(...)) per row). 1,000 keys per delete() keeps
+            # each statement parseable; all chunks share the transaction, so
+            # atomicity is unchanged.
+            for start in range(0, delete_rows.num_rows, _DELETE_CHUNK_ROWS):
+                chunk = delete_rows.slice(start, _DELETE_CHUNK_ROWS)
+                tbl.delete(_build_delete_filter(chunk, key_columns))
             counts["deleted"] = delete_rows.num_rows
 
         if upsert_rows.num_rows > 0:

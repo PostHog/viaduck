@@ -39,6 +39,12 @@ class Router:
         """Split Arrow table by routing field and count unrouted rows in one pass.
 
         Returns (routed_dict, unrouted_count).
+
+        Single pass over the data: one ``index_in`` kernel maps each row to
+        its routing-value code (null = unrouted), one stable sort groups the
+        row indices by code, and each destination's batch is a contiguous
+        ``take``. Replaces the one-filter-per-destination loop, which was
+        O(destinations x rows) per group.
         """
         if self.field not in table.column_names:
             raise RoutingError(
@@ -46,18 +52,38 @@ class Router:
             )
 
         result: dict[str, pa.Table] = {}
+        if not routing_values:
+            return result, table.num_rows
+
         column = table.column(self.field)
-        total_routed = 0
+        # Typed value set, reusing the per-type conversion rules (and their
+        # error reporting) from _make_scalar.
+        value_set = pa.array(
+            [self._make_scalar(val, column.type).as_py() for val in routing_values],
+            type=column.type,
+        )
 
-        for val in routing_values:
-            scalar = self._make_scalar(val, column.type)
-            mask = pc.equal(column, scalar)
-            filtered = table.filter(mask)
-            if filtered.num_rows > 0:
-                result[val] = filtered
-                total_routed += filtered.num_rows
-
+        codes = pc.index_in(column, value_set=value_set)
+        routed_mask = pc.is_valid(codes)
+        total_routed = pc.sum(pc.cast(routed_mask, pa.int64())).as_py() or 0
         unrouted = table.num_rows - total_routed
+        if total_routed == 0:
+            return result, unrouted
+
+        # Stable sort of routed row indices by code: per-destination rows
+        # stay in original order (matching the old filter behavior), and
+        # each destination is a contiguous slice of the permutation.
+        idx = pa.table({"__code": codes, "__idx": pa.array(range(table.num_rows), type=pa.int64())})
+        idx = idx.filter(routed_mask).sort_by("__code")
+        sorted_codes = idx.column("__code")
+        sorted_idx = idx.column("__idx")
+
+        counts = pa.table({"c": sorted_codes}).group_by("c").aggregate([("c", "count")]).sort_by("c")
+        offset = 0
+        for code, count in zip(counts.column("c").to_pylist(), counts.column("c_count").to_pylist()):
+            result[routing_values[code]] = table.take(sorted_idx.slice(offset, count))
+            offset += count
+
         return result, unrouted
 
     def _make_scalar(self, value: str, column_type: pa.DataType) -> pa.Scalar:
