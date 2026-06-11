@@ -121,6 +121,36 @@ _cdc_orphaned_preimages_total = Counter(
     "Update preimages with no matching postimage (converted to deletes)",
     ["pipeline"],
 )
+_delivery_buffer_rows = Gauge(
+    "viaduck_delivery_buffer_rows",
+    "Rows currently buffered awaiting flush",
+    ["pipeline", "destination"],
+)
+_delivery_buffer_bytes = Gauge(
+    "viaduck_delivery_buffer_bytes",
+    "Bytes currently buffered awaiting flush",
+    ["pipeline", "destination"],
+)
+_delivery_buffer_total_bytes = Gauge(
+    "viaduck_delivery_buffer_total_bytes",
+    "Bytes buffered across all destinations",
+    ["pipeline"],
+)
+_delivery_flushes_total = Counter(
+    "viaduck_delivery_flushes_total",
+    "Completed destination flushes by trigger (interval/rows/bytes/memory/shutdown)",
+    ["pipeline", "destination", "trigger"],
+)
+_delivery_flush_seconds = Histogram(
+    "viaduck_delivery_flush_seconds",
+    "Wall time of a destination flush (conflict resolution + write + cursor)",
+    ["pipeline", "destination"],
+)
+_delivery_buffers_dropped_total = Counter(
+    "viaduck_delivery_buffers_dropped_total",
+    "Buffers discarded after a failed flush (range will be re-read)",
+    ["pipeline", "destination"],
+)
 
 # --- Public names (replaced by init() with pipeline-bound instances) ---
 
@@ -150,6 +180,13 @@ cdc_routing_mutations_total = _cdc_routing_mutations_total
 cdc_conflicts_resolved_total = _cdc_conflicts_resolved_total
 cdc_orphaned_preimages_total = _cdc_orphaned_preimages_total
 
+delivery_buffer_rows = _delivery_buffer_rows
+delivery_buffer_bytes = _delivery_buffer_bytes
+delivery_buffer_total_bytes = _delivery_buffer_total_bytes
+delivery_flushes_total = _delivery_flushes_total
+delivery_flush_seconds = _delivery_flush_seconds
+delivery_buffers_dropped_total = _delivery_buffers_dropped_total
+
 
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
@@ -161,9 +198,16 @@ def init(pipeline: str):
     global cdc_batch_rows
     global dest_rows_deleted_total, dest_rows_upserted_total, dest_upsert_matched_total
     global cdc_routing_mutations_total, cdc_conflicts_resolved_total, cdc_orphaned_preimages_total
+    global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
+    global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
 
     # Metrics with additional labels — wrap so .labels() auto-injects pipeline
     dest_write_seconds = _AutoPipelineLabels(_dest_write_seconds, pipeline)
+    delivery_buffer_rows = _AutoPipelineLabels(_delivery_buffer_rows, pipeline)
+    delivery_buffer_bytes = _AutoPipelineLabels(_delivery_buffer_bytes, pipeline)
+    delivery_flushes_total = _AutoPipelineLabels(_delivery_flushes_total, pipeline)
+    delivery_flush_seconds = _AutoPipelineLabels(_delivery_flush_seconds, pipeline)
+    delivery_buffers_dropped_total = _AutoPipelineLabels(_delivery_buffers_dropped_total, pipeline)
     dest_rows_written_total = _AutoPipelineLabels(_dest_rows_written_total, pipeline)
     dest_last_snapshot_id = _AutoPipelineLabels(_dest_last_snapshot_id, pipeline)
     dest_lag_snapshots = _AutoPipelineLabels(_dest_lag_snapshots, pipeline)
@@ -177,6 +221,7 @@ def init(pipeline: str):
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
     source_snapshot_id = _source_snapshot_id.labels(pipeline=pipeline)
+    delivery_buffer_total_bytes = _delivery_buffer_total_bytes.labels(pipeline=pipeline)
     unrouted_rows_total = _unrouted_rows_total.labels(pipeline=pipeline)
     pool_open_connections = _pool_open_connections.labels(pipeline=pipeline)
     pool_evictions_total = _pool_evictions_total.labels(pipeline=pipeline)

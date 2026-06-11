@@ -50,11 +50,12 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from viaduck import config, logging_config, metrics, source
+from viaduck.apply import _require_non_null_rowids
 from viaduck.arrowutil import full_bool, row_indices
+from viaduck.delivery import DeliveryManager
 from viaduck.destination import DestinationPool
 from viaduck.router import Router, RoutingError
 from viaduck.server import DestStatus, health, status
-from viaduck.source import strip_meta
 from viaduck.state import StateManager
 
 log = logging.getLogger(__name__)
@@ -174,50 +175,6 @@ def _group_by_cursor(
     return groups
 
 
-def _write_with_retry(dest_pool, destination_id, operation):
-    """Execute a write operation on a destination with exponential backoff.
-
-    operation: callable that takes (catalog, table) and performs the write.
-    """
-    for attempt in range(_WRITE_MAX_RETRIES):
-        try:
-            catalog, table = dest_pool.get(destination_id)
-            return operation(catalog, table)
-        except Exception as exc:
-            if attempt == _WRITE_MAX_RETRIES - 1:
-                raise
-            delay = _WRITE_BASE_DELAY_S * (2**attempt)
-            log.warning(
-                "Write to %s failed (attempt %d/%d, error: %s), retrying in %.1fs",
-                destination_id,
-                attempt + 1,
-                _WRITE_MAX_RETRIES,
-                exc,
-                delay,
-            )
-            dest_pool.evict(destination_id)
-            time.sleep(delay)
-
-
-# ---------------------------------------------------------------------------
-# Phase 1: Preimage Resolution (before routing)
-# ---------------------------------------------------------------------------
-
-
-def _require_non_null_rowids(batch: pa.Table) -> None:
-    """Reject null rowids loudly. Stable, non-null rowids are a contract
-    assumption (see the module docstring + tla/Viaduck.tla); the Arrow hash
-    joins in Phases 1/2 do not match null keys, so a null rowid would be
-    silently misclassified (orphaned / never cancelled) rather than paired.
-    Fail fast instead."""
-    rowid_nulls = batch.column("rowid").null_count
-    if rowid_nulls:
-        raise ValueError(
-            f"CDC batch contains {rowid_nulls} null rowid(s); rowids are assumed "
-            "stable and non-null (DuckLake contract). Refusing to resolve."
-        )
-
-
 def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[str]) -> pa.Table:
     """Resolve update preimages before routing.
 
@@ -332,223 +289,6 @@ def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[st
     ).as_py()
     assert not remaining, f"Bug: {remaining} update_preimage rows remain after Phase 1 resolution"
     return result
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: Conflict Resolution (per-destination, after routing)
-# ---------------------------------------------------------------------------
-
-
-def _resolve_conflicts(batch: pa.Table) -> pa.Table:
-    """Resolve conflicting changes for the same rowid within a batch.
-
-    Uses rowid (not just key_columns) to identify the same logical row.
-    This depends on DuckLake rowids being monotonically increasing and never
-    reused. If rowids were recycled, unrelated rows could be incorrectly
-    cancelled.
-
-    Rules:
-    - insert + delete for same rowid → cancel both (net no-op)
-    - update_postimage + delete for same rowid → drop postimage, keep delete
-    - insert + update_postimage for same rowid → drop insert, keep postimage
-      (postimage carries the newer state; passing both to a single upsert
-      yields undefined ordering on the destination join key)
-    """
-    if batch.num_rows == 0:
-        return batch
-
-    batch = batch.combine_chunks()
-    _require_non_null_rowids(batch)
-    ct_col = batch.column("change_type")
-    is_insert = pc.equal(ct_col, pa.scalar("insert"))
-    is_delete = pc.equal(ct_col, pa.scalar("delete"))
-    is_post = pc.equal(ct_col, pa.scalar("update_postimage"))
-
-    # Per-rowid presence flags via group_by, joined back onto every row.
-    # Joins don't preserve order; carry the row index and sort back.
-    n = batch.num_rows
-    flags = (
-        pa.table(
-            {
-                "rowid": batch.column("rowid"),
-                "__ins": is_insert,
-                "__del": is_delete,
-                "__post": is_post,
-            }
-        )
-        .group_by("rowid")
-        .aggregate([("__ins", "max"), ("__del", "max"), ("__post", "max")])
-    )
-    work = (
-        pa.table({"rowid": batch.column("rowid"), "__idx": row_indices(n)})
-        .join(flags, keys="rowid", join_type="left outer")
-        .sort_by("__idx")
-    )
-
-    has_ins = work.column("__ins_max")
-    has_del = work.column("__del_max")
-    has_post = work.column("__post_max")
-
-    # Drop rules (same as the row-loop predecessor):
-    #   insert row:    dropped when a postimage exists (newer state wins) or
-    #                  a delete exists (insert+delete cancel)
-    #   delete row:    dropped when an insert exists (cancel pair)
-    #   postimage row: dropped when a delete exists (delete wins)
-    drop = pc.or_(
-        pc.or_(
-            pc.and_(is_insert, pc.or_(has_post, has_del)),
-            pc.and_(is_delete, has_ins),
-        ),
-        pc.and_(is_post, has_del),
-    )
-    keep_mask = pc.invert(pc.fill_null(drop, False)).combine_chunks()
-
-    # Metric parity with the predecessor: one increment per rowid with an
-    # insert+postimage (no delete) conflict, one per rowid with an
-    # insert+delete cancellation.
-    n_conflicts = pc.sum(
-        pc.cast(
-            pc.or_(
-                pc.and_(
-                    pc.and_(flags.column("__ins_max"), flags.column("__post_max")), pc.invert(flags.column("__del_max"))
-                ),
-                pc.and_(flags.column("__ins_max"), flags.column("__del_max")),
-            ),
-            pa.int64(),
-        )
-    ).as_py()
-    if n_conflicts:
-        metrics.cdc_conflicts_resolved_total.inc(n_conflicts)
-
-    result = batch if pc.all(keep_mask).as_py() else batch.filter(keep_mask)
-
-    # Post-condition: no rowid should appear in both insert and delete sets
-    if result.num_rows > 0:
-        res_ct = result.column("change_type")
-        ins_rids = result.filter(pc.equal(res_ct, pa.scalar("insert"))).column("rowid")
-        del_rids = result.filter(pc.equal(res_ct, pa.scalar("delete"))).column("rowid")
-        overlap = pc.filter(ins_rids, pc.is_in(ins_rids, value_set=del_rids.combine_chunks()))
-        assert len(overlap) == 0, (
-            f"Bug: rowids {overlap.to_pylist()} appear in both insert and delete after Phase 2 conflict resolution"
-        )
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: Apply changes (per-destination, atomic)
-# ---------------------------------------------------------------------------
-
-
-def _build_delete_filter(delete_rows: pa.Table, key_columns: list[str]) -> str:
-    """Build a SQL filter expression to delete rows matching the given keys.
-
-    Uses pyducklake expressions for proper escaping and NULL handling.
-    """
-    from pyducklake.expressions import And, EqualTo, In, IsNull, Or
-
-    # Validate key columns exist
-    for col in key_columns:
-        if col not in delete_rows.column_names:
-            raise RoutingError(f"Key column {col!r} not found in delete data. Available: {delete_rows.column_names}")
-
-    if len(key_columns) == 1:
-        col = key_columns[0]
-        values = delete_rows.column(col).to_pylist()
-        non_null = [v for v in values if v is not None]
-        has_null = None in values
-
-        if non_null and has_null:
-            return Or(In(col, tuple(non_null)), IsNull(col)).to_sql()
-        elif has_null:
-            return IsNull(col).to_sql()
-        else:
-            return In(col, tuple(non_null)).to_sql()
-
-    # Multi-column composite key: Or(And(col1=v1, col2=v2), And(col1=v3, col2=v4), ...)
-    key_lists = {col: delete_rows.column(col).to_pylist() for col in key_columns}
-    row_filters = []
-    for i in range(delete_rows.num_rows):
-        col_eqs = []
-        for col in key_columns:
-            val = key_lists[col][i]
-            if val is None:
-                col_eqs.append(IsNull(col))
-            else:
-                col_eqs.append(EqualTo(col, val))
-        # Chain And for multiple columns
-        expr = col_eqs[0]
-        for eq in col_eqs[1:]:
-            expr = And(expr, eq)
-        row_filters.append(expr)
-
-    # Combine per-row filters with a BALANCED Or tree. A left-fold builds a
-    # right-deep chain whose to_sql() recurses once per node — Python's
-    # recursion limit (~1000) makes a single full delete chunk crash. Tree
-    # reduction keeps the depth at log2(rows) (~10 for a 1000-row chunk).
-    while len(row_filters) > 1:
-        row_filters = [
-            Or(row_filters[i], row_filters[i + 1]) if i + 1 < len(row_filters) else row_filters[i]
-            for i in range(0, len(row_filters), 2)
-        ]
-    return row_filters[0].to_sql()
-
-
-def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str]) -> dict[str, int]:
-    """Apply CDC changes to a destination table atomically.
-
-    Deletes are applied first, then upserts, within a single catalog transaction.
-    If the transaction fails, both are rolled back — no partial state on the
-    destination.
-
-    Delete and upsert are idempotent under single-master assumptions: deleting an
-    already-deleted row is a no-op, and upserting the same row twice produces the
-    same result. This enables safe at-least-once retry on crash recovery.
-    Destinations must not be written to by other sources.
-
-    Returns dict of counts: {"deleted": N, "upserted": N, "upsert_matched": N}.
-
-    - deleted: rows sent to delete (input count; delete API doesn't return affected count)
-    - upserted: rows sent to upsert (input count)
-    - upsert_matched: rows that matched existing rows during upsert (from UpsertResult.rows_updated)
-    """
-    ct_col = batch.column("change_type")
-
-    # Separate by change type
-    delete_mask = pc.equal(ct_col, pa.scalar("delete"))
-    delete_rows = strip_meta(batch.filter(delete_mask))
-
-    upsert_mask = pc.or_(
-        pc.equal(ct_col, pa.scalar("insert")),
-        pc.equal(ct_col, pa.scalar("update_postimage")),
-    )
-    upsert_rows = strip_meta(batch.filter(upsert_mask))
-
-    counts = {"deleted": 0, "upserted": 0, "upsert_matched": 0}
-
-    if delete_rows.num_rows == 0 and upsert_rows.num_rows == 0:
-        return counts
-
-    with catalog.begin_transaction() as txn:
-        tbl = txn.load_table(dest_table.identifier)
-
-        if delete_rows.num_rows > 0:
-            # Chunked: a single filter over 100k+ keys builds an O(rows)
-            # expression tree and a giant SQL string (the composite-key path
-            # is one Or(And(...)) per row). 1,000 keys per delete() keeps
-            # each statement parseable; all chunks share the transaction, so
-            # atomicity is unchanged.
-            for start in range(0, delete_rows.num_rows, _DELETE_CHUNK_ROWS):
-                chunk = delete_rows.slice(start, _DELETE_CHUNK_ROWS)
-                tbl.delete(_build_delete_filter(chunk, key_columns))
-            counts["deleted"] = delete_rows.num_rows
-
-        if upsert_rows.num_rows > 0:
-            upsert_result = tbl.upsert(upsert_rows, join_cols=key_columns)
-            counts["upserted"] = upsert_rows.num_rows
-            counts["upsert_matched"] = upsert_result.rows_updated
-
-    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +499,19 @@ def run(cfg: config.ViaduckConfig) -> None:
     key_columns = cfg.routing.key_columns
     full_cdc = len(key_columns) > 0
 
+    # Buffered delivery: per-destination buffers + flush worker pool
+    # (constructed AFTER seeding so positions initialize from the
+    # post-seed cursors). Workers report successful flushes into the
+    # readiness signal.
+    delivery = DeliveryManager(
+        cfg.delivery,
+        state_mgr,
+        dest_pool,
+        key_columns,
+        assigned_ids,
+        on_flush_success=health.record_replication,
+    )
+
     log.info(
         "Viaduck started: source=%s.%s, routing_field=%s, mode=%s, destinations=%d, instance=%s",
         cfg.source.name,
@@ -781,7 +534,7 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     while not shutdown:
         try:
-            _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, full_cdc)
+            _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, full_cdc)
         except Exception:
             log.exception("Fatal error in poll cycle")
             break
@@ -793,8 +546,10 @@ def run(cfg: config.ViaduckConfig) -> None:
             # uninterruptible sleep would let kubelet SIGKILL mid-poll.
             _interruptible_sleep(cfg.poll.interval_seconds, lambda: shutdown)
 
-    # Graceful shutdown
+    # Graceful shutdown: flush everything buffered (the spec's
+    # shutdown-trigger FlushStart), wait for workers, then close.
     log.info("Shutting down...")
+    delivery.drain()
     dest_pool.close_all()
     state_mgr.close()
     try:
@@ -808,144 +563,115 @@ def run(cfg: config.ViaduckConfig) -> None:
     log.info("Shutdown complete")
 
 
-def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, full_cdc):
-    """Execute one poll cycle: read CDC, route, write to destinations, update state."""
+def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, full_cdc):
+    """One poll cycle: read CDC from each position group into buffers,
+    advance in-memory positions, evaluate flush triggers.
+
+    Writes happen on the delivery manager's worker pool at flush cadence —
+    this thread only reads, routes (Phase 1 included), and buffers. See
+    viaduck/delivery.py and tla/Viaduck.tla (BufferRead / FlushStart).
+    """
     metrics.polls_total.inc()
     health.record_poll()
 
     cycle_t0 = time.monotonic()
     cycle_rows_read = 0
-    cycle_rows_written = 0
     cycle_groups_processed = 0
 
     current_id = source.current_snapshot_id(src_table)
-    if current_id is None:
-        log.debug("No snapshots on source table yet")
-        return
+    if current_id is not None:
+        metrics.source_snapshot_id.set(current_id)
 
-    metrics.source_snapshot_id.set(current_id)
-
-    # Load cursors and group by snapshot
-    cursor_map = state_mgr.load_cursors(assigned_ids)
-    cursor_snapshots = {did: c.last_snapshot_id for did, c in cursor_map.items()}
-    groups = _group_by_cursor(cursor_snapshots, assigned_ids)
-
-    for start_snap, dest_ids in groups.items():
-        if start_snap >= current_id:
-            continue  # already caught up
-        cycle_groups_processed += 1
-
-        # Map dest_ids to their routing values for filter/split
-        routing_values = [cfg.destination_by_id(d).routing_value for d in dest_ids]
-        filter_expr = router.build_filter_expr(routing_values)
-
-        # Read CDC — full changes or insertions only
-        if full_cdc:
-            raw_data = source.read_cdc_changes(
-                src_table, start_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
-            )
+        if delivery.should_pause_reads():
+            # Global buffer watermark exceeded and every buffering
+            # destination is already in flight — reading more only grows
+            # memory. Skip reads; flushes in flight will relieve it.
+            log.warning("Buffer watermark exceeded with all flushes in flight; pausing CDC reads this cycle")
         else:
-            raw_data = source.read_cdc(
-                src_table, start_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
-            )
+            positions = delivery.positions()
+            groups = _group_by_cursor(positions, assigned_ids)
 
-        try:
-            metrics.cdc_batch_rows.observe(raw_data.num_rows)
-        except Exception:
-            log.warning("Failed to record CDC batch size metric")
+            for start_snap, dest_ids in groups.items():
+                if start_snap >= current_id:
+                    continue  # already read through the current snapshot
+                cycle_groups_processed += 1
 
-        cycle_rows_read += raw_data.num_rows
+                # Map dest_ids to their routing values for filter/split
+                routing_values = [cfg.destination_by_id(d).routing_value for d in dest_ids]
+                filter_expr = router.build_filter_expr(routing_values)
 
-        if raw_data.num_rows == 0:
-            state_mgr.advance_cursors(dest_ids, current_id)
-            continue
-
-        # Phase 1: Resolve preimages (full CDC only, before routing)
-        if full_cdc:
-            try:
-                raw_data = _resolve_preimages(raw_data, cfg.routing.field, key_columns)
-            except RoutingError:
-                log.exception("Preimage resolution failed — key column may be missing from CDC data")
-                metrics.errors_total.labels(type="routing", destination="").inc()
-                break
-
-        # Route in a single pass (split + count unrouted)
-        try:
-            routed, unrouted = router.split_and_count(raw_data, routing_values)
-        except RoutingError:
-            log.exception("Routing failed — routing field may be missing from source schema")
-            metrics.errors_total.labels(type="routing", destination="").inc()
-            break
-
-        if unrouted > 0:
-            metrics.unrouted_rows_total.inc(unrouted)
-
-        # Write to each destination
-        for routing_val, batch in routed.items():
-            dest_id = rv_to_dest[routing_val]
-            if batch.num_rows == 0:
-                continue
-
-            cursor = cursor_map.get(dest_id)
-            prev_rows = cursor.rows_replicated if cursor else 0
-
-            try:
-                t0 = time.monotonic()
-
+                # Read CDC — full changes or insertions only
                 if full_cdc:
-                    # Phase 2: Resolve conflicts, Phase 3: Apply
-                    resolved = _resolve_conflicts(batch)
-                    if resolved.num_rows > 0:
-                        counts = _write_with_retry(
-                            dest_pool,
-                            dest_id,
-                            lambda cat, tbl, b=resolved, kc=key_columns: _apply_changes(cat, tbl, b, kc),
-                        )
-                        if counts["deleted"] > 0:
-                            metrics.dest_rows_deleted_total.labels(destination=dest_id).inc(counts["deleted"])
-                        if counts["upserted"] > 0:
-                            metrics.dest_rows_upserted_total.labels(destination=dest_id).inc(counts["upserted"])
-                        if counts["upsert_matched"] > 0:
-                            metrics.dest_upsert_matched_total.labels(destination=dest_id).inc(counts["upsert_matched"])
-                        ops_count = counts["deleted"] + counts["upserted"]
-                    else:
-                        ops_count = 0
+                    raw_data = source.read_cdc_changes(
+                        src_table, start_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
+                    )
                 else:
-                    _write_with_retry(dest_pool, dest_id, lambda cat, tbl, b=batch: tbl.append(b))
-                    metrics.dest_rows_written_total.labels(destination=dest_id).inc(batch.num_rows)
-                    ops_count = batch.num_rows
+                    raw_data = source.read_cdc(
+                        src_table, start_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
+                    )
 
-                duration = time.monotonic() - t0
-                metrics.dest_write_seconds.labels(destination=dest_id).observe(duration)
-                state_mgr.advance_cursor(dest_id, current_id, cumulative_rows=prev_rows + ops_count)
-                metrics.dest_last_snapshot_id.labels(destination=dest_id).set(current_id)
-                health.record_replication()
-                cycle_rows_written += ops_count
-            except Exception:
-                log.exception("Failed to write to destination %s", dest_id)
-                metrics.errors_total.labels(type="dest_write", destination=dest_id).inc()
-                state_mgr.record_error(dest_id, f"Write failed after {_WRITE_MAX_RETRIES} retries")
-                dest_pool.evict(dest_id)
+                try:
+                    metrics.cdc_batch_rows.observe(raw_data.num_rows)
+                except Exception:
+                    log.warning("Failed to record CDC batch size metric")
 
-        # Advance cursors for destinations that had no matching rows in this group
-        routed_dest_ids = {rv_to_dest[rv] for rv in routed}
-        no_data_ids = [did for did in dest_ids if did not in routed_dest_ids]
-        if no_data_ids:
-            state_mgr.advance_cursors(no_data_ids, current_id)
+                cycle_rows_read += raw_data.num_rows
 
-    # Update lag metrics and status snapshot.
-    # Uses cursor_map loaded at the start of the cycle — status is one cycle stale.
+                if raw_data.num_rows == 0:
+                    for did in dest_ids:
+                        delivery.advance_position(did, current_id)
+                    continue
+
+                # Phase 1: Resolve preimages (full CDC only, before routing)
+                if full_cdc:
+                    try:
+                        raw_data = _resolve_preimages(raw_data, cfg.routing.field, key_columns)
+                    except RoutingError:
+                        log.exception("Preimage resolution failed — key column may be missing from CDC data")
+                        metrics.errors_total.labels(type="routing", destination="").inc()
+                        break
+
+                # Route in a single pass (split + count unrouted)
+                try:
+                    routed, unrouted = router.split_and_count(raw_data, routing_values)
+                except RoutingError:
+                    log.exception("Routing failed — routing field may be missing from source schema")
+                    metrics.errors_total.labels(type="routing", destination="").inc()
+                    break
+
+                if unrouted > 0:
+                    metrics.unrouted_rows_total.inc(unrouted)
+
+                # Buffer routed batches (BufferRead); destinations with no
+                # routed rows just advance their read position in memory.
+                routed_dest_ids = set()
+                for routing_val, batch in routed.items():
+                    dest_id = rv_to_dest[routing_val]
+                    routed_dest_ids.add(dest_id)
+                    if batch.num_rows > 0:
+                        delivery.buffer(dest_id, batch, current_id)
+                for did in dest_ids:
+                    if did not in routed_dest_ids:
+                        delivery.advance_position(did, current_id)
+
+    # Evaluate flush triggers (FlushStart) — also persists position-only
+    # advances for idle destinations on the flush cadence.
+    flushes_submitted = delivery.maybe_flush()
+
+    # Status + lag from the delivery manager's snapshot (authoritative
+    # in-memory view; PG is the durability layer).
+    snap_now = current_id if current_id is not None else 0
     dest_statuses = []
+    delivery_snapshot = delivery.status_snapshot()
     for did in assigned_ids:
-        cursor = cursor_map.get(did)
-        snap = getattr(cursor, "last_snapshot_id", 0) or 0
-        lag = current_id - snap
+        d = delivery_snapshot[did]
+        lag = max(snap_now - d.flushed_snapshot, 0)
         metrics.dest_lag_snapshots.labels(destination=did).set(lag)
 
-        rows = cursor.rows_replicated if cursor else 0
-        last_err = cursor.last_error if cursor else None
-        if last_err:
+        if d.last_error:
             st = "error"
+        elif d.flushing:
+            st = "flushing"
         elif lag > 0:
             st = "lagging"
         else:
@@ -955,17 +681,19 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
             DestStatus(
                 id=did,
                 routing_value=cfg.destination_by_id(did).routing_value,
-                snapshot=snap,
+                snapshot=d.flushed_snapshot,
                 lag=lag,
-                rows_replicated=rows,
+                rows_replicated=d.rows_replicated,
                 status=st,
-                last_error=last_err,
+                last_error=d.last_error,
+                buffer_rows=d.buffer_rows,
+                buffer_age_s=round(d.buffer_age_s, 1),
             )
         )
 
     status.update(
         source_table=f"{cfg.source.name}.{cfg.source.table}",
-        source_snapshot=current_id,
+        source_snapshot=snap_now,
         mode="full_cdc" if full_cdc else "append_only",
         poll_interval=cfg.poll.interval_seconds,
         destinations=dest_statuses,
@@ -976,14 +704,17 @@ def _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, assigned_ids, rv_t
     # Per-cycle summary log. Quiet for empty cycles (no work) so steady-state
     # idleness doesn't flood the log; verbose when there's work to report.
     cycle_secs = time.monotonic() - cycle_t0
-    if cycle_groups_processed > 0 or cycle_rows_read > 0 or cycle_rows_written > 0:
-        max_lag = max((current_id - (getattr(cursor_map.get(did), "last_snapshot_id", 0) or 0)) for did in assigned_ids)
+    if cycle_groups_processed > 0 or cycle_rows_read > 0 or flushes_submitted > 0:
+        max_lag = max((snap_now - delivery_snapshot[did].flushed_snapshot) for did in assigned_ids)
+        buffered_rows = sum(delivery_snapshot[did].buffer_rows for did in assigned_ids)
         log.info(
-            "Poll cycle: snapshot=%d, groups=%d, cdc_rows_read=%d, rows_written=%d, max_lag=%d, duration=%.2fs",
-            current_id,
+            "Poll cycle: snapshot=%d, groups=%d, cdc_rows_read=%d, buffered_rows=%d, "
+            "flushes_submitted=%d, max_lag=%d, duration=%.2fs",
+            snap_now,
             cycle_groups_processed,
             cycle_rows_read,
-            cycle_rows_written,
+            buffered_rows,
+            flushes_submitted,
             max_lag,
             cycle_secs,
         )

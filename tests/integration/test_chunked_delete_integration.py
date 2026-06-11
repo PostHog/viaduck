@@ -17,7 +17,7 @@ from pyducklake import Catalog, Schema
 from pyducklake.types import IntegerType, NestedField, StringType
 
 from viaduck import metrics
-from viaduck.main import _DELETE_CHUNK_ROWS, _apply_changes
+from viaduck.apply import _DELETE_CHUNK_ROWS, _apply_changes
 
 pytestmark = pytest.mark.integration
 

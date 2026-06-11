@@ -202,6 +202,31 @@ class StateConfig:
 
 
 @dataclass(frozen=True)
+class DeliveryConfig:
+    """Buffered-delivery knobs. CDC reads happen at poll cadence; destination
+    writes happen at flush cadence — per-destination buffers accumulate
+    between flushes (see tla/Viaduck.tla for the verified semantics).
+
+    workers=1 + flush_interval_seconds=0 reproduces the pre-buffering
+    behavior (flush every cycle, serial)."""
+
+    workers: int = 8
+    flush_interval_seconds: float = 120.0
+    flush_max_rows: int = 500_000
+    flush_max_bytes: int = 268_435_456  # 256 MiB per destination
+    buffer_total_max_bytes: int = 1_073_741_824  # 1 GiB across all buffers
+
+    def __post_init__(self):
+        if self.workers < 1:
+            raise ConfigError(f"delivery.workers must be >= 1, got {self.workers}")
+        if self.flush_interval_seconds < 0:
+            raise ConfigError(f"delivery.flush_interval_seconds must be >= 0, got {self.flush_interval_seconds}")
+        for name in ("flush_max_rows", "flush_max_bytes", "buffer_total_max_bytes"):
+            if getattr(self, name) < 1:
+                raise ConfigError(f"delivery.{name} must be >= 1, got {getattr(self, name)}")
+
+
+@dataclass(frozen=True)
 class ViaduckConfig:
     source: SourceConfig
     routing: RoutingConfig
@@ -211,6 +236,7 @@ class ViaduckConfig:
     web: WebConfig = field(default_factory=WebConfig)
     instance: InstanceConfig = field(default_factory=InstanceConfig)
     state: StateConfig = field(default_factory=StateConfig)
+    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
 
     def __post_init__(self):
         if not self.destinations:
@@ -344,6 +370,17 @@ def load(path: str | Path) -> ViaduckConfig:
         postgres_uri_env=state_raw.get("postgres_uri_env") or None,
     )
 
+    delivery_raw = raw.get("delivery", {})
+    delivery = DeliveryConfig(
+        workers=_validate_int(delivery_raw.get("workers", 8), "delivery.workers"),
+        flush_interval_seconds=float(delivery_raw.get("flush_interval_seconds", 120.0)),
+        flush_max_rows=_validate_int(delivery_raw.get("flush_max_rows", 500_000), "delivery.flush_max_rows"),
+        flush_max_bytes=_validate_int(delivery_raw.get("flush_max_bytes", 268_435_456), "delivery.flush_max_bytes"),
+        buffer_total_max_bytes=_validate_int(
+            delivery_raw.get("buffer_total_max_bytes", 1_073_741_824), "delivery.buffer_total_max_bytes"
+        ),
+    )
+
     inst_raw = raw.get("instance", {})
     part_raw = inst_raw.get("partition", {})
     partition = PartitionConfig(
@@ -366,4 +403,5 @@ def load(path: str | Path) -> ViaduckConfig:
         web=web,
         instance=instance,
         state=state,
+        delivery=delivery,
     )

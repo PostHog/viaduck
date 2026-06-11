@@ -87,8 +87,10 @@ class DestStatus:
     snapshot: int
     lag: int
     rows_replicated: int
-    status: str  # "healthy", "lagging", "error"
+    status: str  # "healthy", "lagging", "flushing", "error"
     last_error: str | None
+    buffer_rows: int = 0
+    buffer_age_s: float = 0.0
 
 
 class StatusState:

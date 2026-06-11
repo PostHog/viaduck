@@ -23,8 +23,9 @@ import pyarrow as pa
 import pytest
 
 from viaduck import metrics
+from viaduck.apply import _build_delete_filter, _resolve_conflicts
 from viaduck.config import RoutingConfig
-from viaduck.main import _build_delete_filter, _resolve_conflicts, _resolve_preimages
+from viaduck.main import _resolve_preimages
 from viaduck.router import Router
 
 

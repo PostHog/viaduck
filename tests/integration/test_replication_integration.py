@@ -13,8 +13,9 @@ from pyducklake import Catalog, Schema
 from pyducklake.types import IntegerType, NestedField, StringType
 
 from viaduck import metrics
+from viaduck.apply import _apply_changes, _resolve_conflicts
 from viaduck.config import RoutingConfig, StateConfig
-from viaduck.main import _apply_changes, _resolve_conflicts, _resolve_preimages, _seed_new_destinations
+from viaduck.main import _resolve_preimages, _seed_new_destinations
 from viaduck.router import Router
 from viaduck.source import META_COLUMNS, strip_meta
 from viaduck.state import StateManager
