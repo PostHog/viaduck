@@ -5,46 +5,58 @@ source: Source DuckLake {
   catalog: Catalog (Postgres + S3) {
     shape: cylinder
   }
-  state: _viaduck_state {
-    shape: sql_table
-    destination_id: VARCHAR
-    instance_id: VARCHAR
-    last_snapshot_id: BIGINT
-    rows_replicated: BIGINT
-    last_error: VARCHAR
-  }
   events: events table {
     shape: sql_table
     company: VARCHAR
     event_id: BIGINT
     payload: VARCHAR
   }
-  # Force vertical order: state above events
-  state -> events: {style.opacity: 0}
+}
+
+pg: Postgres {
+  style.fill: "#f3e8f8"
+  state: viaduck.viaduck_state {
+    shape: sql_table
+    destination_id: TEXT
+    instance_id: TEXT
+    last_snapshot_id: BIGINT
+    rows_replicated: BIGINT
+    last_error: TEXT
+  }
 }
 
 viaduck: Viaduck {
   style.fill: "#fff3e0"
-  poll: "Poll Loop" {
-    shape: step
+
+  pollthread: Poll thread {
+    cdc: "CDC Read\n(table_changes,\nafter_snapshot exclusive)" {
+      shape: step
+    }
+    resolve: "Phase 1\nPreimage Resolution" {
+      shape: step
+    }
+    route: "Router\n(Arrow split)" {
+      shape: step
+    }
+    buffer: "Per-destination\nbuffers" {
+      shape: queue
+    }
+    cdc -> resolve: "inserts + deletes\n+ updates"
+    resolve -> route
+    route -> buffer: "advance in-memory\nposition"
   }
-  cdc: "CDC Read\n(table_changes)" {
-    shape: step
+
+  workers: "Flush workers (delivery.workers)" {
+    conflict: "Phase 2\nConflict Resolution\n(rowid, unioned reads)" {
+      shape: step
+    }
+    apply: "Phase 3\nWinner(k) dedup,\ndelete → upsert (txn)" {
+      shape: step
+    }
+    conflict -> apply
   }
-  resolve: "Preimage Resolution\n+ Conflict Resolution" {
-    shape: step
-  }
-  route: "Router\n(Arrow split)" {
-    shape: step
-  }
-  apply: "Apply\ndelete → upsert\n(in transaction)" {
-    shape: step
-  }
-  # Force vertical order
-  poll -> cdc: "current_snapshot()"
-  cdc -> resolve: "inserts + deletes\n+ updates"
-  resolve -> route: "filter_expr pushdown"
-  route -> apply
+
+  pollthread.buffer -> workers.conflict: "flush triggers:\ninterval / rows / bytes\n/ memory / shutdown"
 }
 
 dest: Destination DuckLakes {
@@ -67,8 +79,8 @@ dest: Destination DuckLakes {
   }
 }
 
-viaduck.poll -> source.state: "load/advance cursors"
-source.events -> viaduck.cdc: "CDC changes\n(snapshot range)"
-viaduck.apply -> dest.quacksworth: "delete + upsert"
-viaduck.apply -> dest.mallardine: "delete + upsert"
-viaduck.apply -> dest.tealford: "delete + upsert"
+source.events -> viaduck.pollthread.cdc: "CDC changes\n(position, current]"
+viaduck.workers.apply -> dest.quacksworth: "delete + upsert"
+viaduck.workers.apply -> dest.mallardine: "delete + upsert"
+viaduck.workers.apply -> dest.tealford: "delete + upsert"
+viaduck.workers.apply -> pg.state: "advance cursor\n(after dest commit,\nmonotonicity-guarded)"

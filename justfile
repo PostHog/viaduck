@@ -150,6 +150,10 @@ docs:
     for f in docs/*.d2; do
         out="${f%.d2}.svg"
         d2 "$f" "$out" --theme 0
+        # Normalize the build-dependent version stamp (brew: "0.7.1",
+        # official tarball: "v0.7.1") so re-renders are byte-identical
+        # across builds — CI's stale-diagram diff depends on it.
+        sed -e 's/data-d2-version="[^"]*"/data-d2-version="0.7.1"/' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
     done
 
 # Verify all relative links in README.md point to existing files

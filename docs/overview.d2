@@ -1,0 +1,63 @@
+vars: {
+  d2-config: {
+    sketch: true
+    theme-id: 0
+  }
+}
+
+direction: right
+
+source: "Source DuckLake" {
+  shape: cylinder
+  style.fill: "#e8f4f8"
+  style.stroke: "#5b9bb5"
+  style.font-size: 20
+}
+
+viaduck: "viaduck 🦆" {
+  style.fill: "#fff3e0"
+  style.stroke: "#e69138"
+  style.border-radius: 12
+  style.font-size: 22
+  style.bold: true
+}
+
+quacksworth: "Quacksworth\nDuckLake" {
+  shape: cylinder
+  style.fill: "#e8f5e9"
+  style.stroke: "#6aa84f"
+  style.font-size: 18
+}
+
+mallardine: "Mallardine\nDuckLake" {
+  shape: cylinder
+  style.fill: "#e8f5e9"
+  style.stroke: "#6aa84f"
+  style.font-size: 18
+}
+
+tealford: "Tealford\nDuckLake" {
+  shape: cylinder
+  style.fill: "#e8f5e9"
+  style.stroke: "#6aa84f"
+  style.font-size: 18
+}
+
+source -> viaduck: "CDC feed" {
+  style.stroke: "#5b9bb5"
+  style.stroke-width: 3
+  style.font-size: 16
+}
+
+viaduck -> quacksworth: "company = quacksworth" {
+  style.stroke: "#6aa84f"
+  style.font-size: 14
+}
+viaduck -> mallardine: "company = mallardine" {
+  style.stroke: "#6aa84f"
+  style.font-size: 14
+}
+viaduck -> tealford: "company = tealford" {
+  style.stroke: "#6aa84f"
+  style.font-size: 14
+}
