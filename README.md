@@ -19,34 +19,40 @@ Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* an
 - Routes rows by a configurable field (e.g. `company`) to per-tenant destinations
 - Full CDC: inserts, deletes, and updates (not just append-only)
 - 3-phase algorithm: preimage resolution, conflict resolution, atomic transactional apply
+- Buffered delivery: CDC reads at poll cadence, destination writes at flush cadence (1–5 min latency), flushed by a concurrent worker pool
 - Scan-based seeding for new destinations (no full history replay)
 - YAML config with env var indirection for credentials
 - Per-destination error isolation — one broken destination doesn't block others
-- LRU connection pool for high fanout (100s-1000s of destinations)
-- Persistent cursor tracking on the source catalog
+- LRU connection pool for high fanout (local bench: ~43 destinations/s flat through 1000 destinations)
+- Persistent cursor tracking on plain Postgres
 - Horizontal scaling via hash or explicit destination partitioning
-- 19 Prometheus metrics, health checks (`/healthz`, `/readyz`)
+- 26 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
 - At-least-once delivery with documented failure modes
-- [TLA+ formally verified](tla/Viaduck.tla): 5 safety invariants checked across 730K states
+- [TLA+ formally verified](tla/Viaduck.tla): 9 safety invariants checked across 31.4M states (incl. buffered delivery, concurrent flushes, and crash recovery; no-data-loss and partition correctness hold even through crash windows)
 
 ## Why
 
 Multi-tenant DuckLake architectures need per-tenant table isolation — separate catalogs, separate S3 paths, separate Postgres metadata stores. Viaduck reads CDC changes from a shared source table, routes rows by a configurable field (e.g. `company`), and writes each partition to the correct tenant's DuckLake. Think of it as a data viaduct with N exits.
 
 ```
-loop:
+poll thread (every interval_seconds):
   current_snapshot() on source
-  group destinations by cursor position
+  group destinations by read position
   for each group:
-    table_changes(start, end, filter_expr)  → CDC read (inserts + deletes + updates)
-    resolve preimages                        → handle cross-tenant migration
-    split by routing field                   → Arrow routing
-    resolve conflicts                        → cancel insert+delete pairs
-    delete + upsert (in transaction)         → atomic apply
-    advance_cursor() in transaction          → state update
+    table_changes(after, current, filter_expr)  → CDC read (inserts + deletes + updates)
+    resolve preimages                            → handle cross-tenant migration
+    split by routing field                       → Arrow routing
+    buffer per destination                       → advance in-memory position
+  evaluate flush triggers                        → submit eligible flushes to workers
+
+flush worker (per destination, concurrent):
+  resolve conflicts                              → cancel insert+delete pairs across buffered reads
+  dedupe upserts per key (last write wins)       → Winner(k)
+  delete + upsert (in transaction)               → atomic apply
+  advance_cursor()                               → persist to Postgres
 ```
 
-Single thread, single loop. DuckLake snapshots are the cursor. State is tracked on the source catalog. Designed for high fanout (100s-1000s of destinations).
+One poll thread reads and buffers; `delivery.workers` threads flush. DuckLake snapshots are the cursor. State lives on plain Postgres. Designed for high fanout (100s-1000s of destinations).
 
 ## Architecture
 
@@ -60,14 +66,17 @@ Core modules:
 
 | Module | Responsibility | Source |
 |--------|---------------|--------|
-| [`main.py`](viaduck/main.py) | Poll loop, 3-phase CDC apply, signal handling, retry logic | Entry point |
+| [`main.py`](viaduck/main.py) | Poll loop, Phase 1 preimage resolution, seeding, signal handling | Entry point |
+| [`delivery.py`](viaduck/delivery.py) | Per-destination buffers, flush triggers, flush worker pool | Buffered delivery |
+| [`apply.py`](viaduck/apply.py) | Phase 2 conflict resolution, Phase 3 atomic delete/upsert, write retry | Destination apply |
 | [`config.py`](viaduck/config.py) | YAML parsing, env var resolution, validation | Configuration |
 | [`source.py`](viaduck/source.py) | Source catalog connection, CDC reading (`table_changes` / `table_insertions`) | CDC |
 | [`router.py`](viaduck/router.py) | Arrow splitting by routing field | Routing |
-| [`destination.py`](viaduck/destination.py) | LRU connection pool for destination catalogs | Connections |
-| [`state.py`](viaduck/state.py) | `_viaduck_state` table CRUD on source | State tracking |
+| [`destination.py`](viaduck/destination.py) | LRU connection pool for destination catalogs, lease pinning | Connections |
+| [`state.py`](viaduck/state.py) | Per-destination cursors on plain Postgres | State tracking |
+| [`arrowutil.py`](viaduck/arrowutil.py) | Shared Arrow kernel helpers | Vectorization |
 | [`metrics.py`](viaduck/metrics.py) | Prometheus metric definitions | Observability |
-| [`server.py`](viaduck/server.py) | HTTP `/metrics`, `/healthz`, `/readyz` | Health checks |
+| [`server.py`](viaduck/server.py) | HTTP `/metrics`, `/healthz`, `/readyz`, status web UI | Health checks |
 
 ## Two Modes
 
@@ -84,18 +93,27 @@ Viaduck operates in one of two modes based on the `key_columns` configuration:
 
 Source: [`docs/poll-cycle.d2`](docs/poll-cycle.d2)
 
+CDC **reads** happen at poll cadence; destination **writes** happen at flush cadence. The poll thread reads and buffers; a worker pool flushes. The decoupling is the buffered-delivery design verified in [`tla/Viaduck.tla`](tla/Viaduck.tla).
+
 Each poll cycle ([`main.py:_poll_cycle`](viaduck/main.py)):
 
 1. **Snapshot check** — `current_snapshot()` on the source table. If no snapshots exist, sleep and retry.
-2. **Load cursors** — read `_viaduck_state` to get each destination's `last_snapshot_id`. Uses filter pushdown with `In` + `EqualTo` expressions ([`state.py:load_cursors`](viaduck/state.py)).
-3. **Group by cursor** — destinations at the same snapshot share a single CDC read ([`main.py:_group_by_cursor`](viaduck/main.py)). This avoids re-reading data for caught-up destinations.
-4. **CDC read** — In full CDC mode: `table_changes(start, end, filter_expr)` reads inserts, deletes, and update pre/post images. In append-only mode: `table_insertions(start, end, filter_expr)` reads inserts only. Both use SQL `IN` pushdown ([`source.py`](viaduck/source.py)).
-5. **Phase 1: Preimage Resolution** *(full CDC only)* — pair `update_preimage` with `update_postimage` rows by `rowid`. If routing values differ (cross-tenant migration), convert preimage to a delete on the old destination. Drop same-tenant preimages (upsert handles them). Convert orphaned preimages to deletes ([`main.py:_resolve_preimages`](viaduck/main.py)).
-6. **Route** — `split_and_count()` uses PyArrow compute to partition the Arrow table by routing field value in a single pass. Counts unrouted rows ([`router.py:split_and_count`](viaduck/router.py)).
-7. **Phase 2: Conflict Resolution** *(full CDC only)* — within each per-destination batch, cancel `insert + delete` pairs for the same `rowid` (net no-op). Drop `update_postimage` rows shadowed by a delete for the same `rowid` ([`main.py:_resolve_conflicts`](viaduck/main.py)).
-8. **Phase 3: Apply** *(full CDC only)* — within a destination `catalog.begin_transaction()`: delete matching rows first, then upsert inserts + postimages. Atomic — crash during apply triggers rollback ([`main.py:_apply_changes`](viaduck/main.py)). In append-only mode: `append()` only.
-9. **Advance cursor** — `delete` + `insert` within a pyducklake `begin_transaction()` on the source catalog ([`state.py:advance_cursor`](viaduck/state.py)).
-10. **Lag metrics** — update per-destination snapshot lag gauges.
+2. **Read plan** — atomic snapshot of each destination's in-memory read position + epoch from the delivery manager ([`delivery.py:read_plan`](viaduck/delivery.py)). Positions start at the persisted cursors and advance in memory as reads land.
+3. **Group by position** — destinations at the same position share a single CDC read ([`main.py:_group_by_cursor`](viaduck/main.py)).
+4. **CDC read** — full CDC mode: `table_changes` (inserts, deletes, update pre/post images); append-only mode: `table_insertions`. The range is half-open `(position, current]` — the position snapshot was already delivered ([`source.py`](viaduck/source.py)). Routing values are pushed down as a SQL `IN` filter.
+5. **Phase 1: Preimage Resolution** *(full CDC only)* — pair `update_preimage` with `update_postimage` rows by `rowid` (Arrow hash join). Cross-tenant mutations convert the preimage to a delete on the old destination; same-tenant preimages drop; orphaned preimages convert to deletes ([`main.py:_resolve_preimages`](viaduck/main.py)).
+6. **Route** — `split_and_count()` partitions the Arrow table by routing value in a single vectorized pass ([`router.py:split_and_count`](viaduck/router.py)).
+7. **Buffer** — routed batches accumulate in per-destination buffers; the read position advances in memory. Destinations with no routed rows advance position only — zero writes for idle destinations ([`delivery.py:buffer`](viaduck/delivery.py)).
+8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ `flush_max_rows`, bytes ≥ `flush_max_bytes`, global watermark ≥ `buffer_total_max_bytes` (largest-first), or shutdown. Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)).
+9. **Lag metrics + status** — per-destination snapshot lag from the delivery manager's authoritative in-memory view.
+
+Each flush (worker thread, [`delivery.py:_flush`](viaduck/delivery.py)):
+
+1. **Phase 2: Conflict Resolution** *(full CDC only)* — on the concatenation of all buffered reads: cancel `insert + delete` pairs for the same `rowid`, drop `update_postimage` shadowed by a delete, drop `insert` shadowed by a postimage ([`apply.py:_resolve_conflicts`](viaduck/apply.py)). Sound across reads: the union of adjacent half-open ranges behaves exactly like one wide read.
+2. **Phase 3: Apply** *(full CDC only)* — per-key last-write-wins dedup of upsert candidates (`Winner(k)`), then chunked deletes followed by upsert inside a single destination `begin_transaction()` ([`apply.py:_apply_changes`](viaduck/apply.py)). Append-only mode: one `append()`.
+3. **Advance cursor** — upsert the persisted cursor in Postgres, with a short in-process retry since the destination commit already landed ([`state.py:advance_cursor`](viaduck/state.py)).
+
+At most one flush per destination is in flight (the in-flight guard); flushes for different destinations run concurrently on `delivery.workers` threads. A failed flush drops the destination's buffers, resets its read position to the persisted cursor, and lets the next cycle re-read the range — at-least-once, no poison-buffer growth.
 
 ## CDC Operations and Semantics
 
@@ -133,37 +151,37 @@ Each poll cycle ([`main.py:_poll_cycle`](viaduck/main.py)):
 
 **At-least-once.** There is no cross-catalog transaction support in DuckLake. The write-then-advance-cursor pattern means:
 
-- If the process crashes **after writing** to a destination but **before advancing the cursor**, the next poll will re-read the same CDC range and re-write the same rows. Destinations must tolerate duplicates.
-- If the process crashes **during the cursor transaction**, the transaction is rolled back and the cursor stays at its previous value. The same data is re-read and re-written. No data loss.
+- Buffered data is **in-memory only**. A crash loses all buffers and read positions; the next start re-reads everything after the persisted cursors. Nothing buffered is ever the only copy — the source snapshot history is the durable log.
+- If the process crashes **after a destination commit** but **before the cursor persists**, the next start re-reads the same range and re-applies it. Full CDC mode re-applies idempotently (delete + upsert); append-only mode duplicates rows.
 - In full CDC mode, deletes + upserts on each destination are applied within a **single transaction**. A crash mid-apply rolls back both — no partial state.
-- If a destination write fails, the cursor is not advanced for that destination. Other destinations are unaffected.
+- A failed flush drops the destination's buffers and leaves its cursor untouched; the range is re-read next cycle. Other destinations are unaffected.
+- **Known phantom window** (precisely stated in [`tla/Viaduck.tla`](tla/Viaduck.tla)): if a row is committed to a destination, the cursor fails to persist (crash, or a PG outage outlasting the in-process retry), and the source *deletes* that row before the re-read — the re-read insert and the delete cancel in conflict resolution and the committed row remains. Inherent to at-least-once delivery without cross-catalog transactions; requires a full re-seed to repair.
 
-There is **no data loss path**. The source DuckLake's snapshot history is the durable log.
+There is **no data loss path** — this is machine-checked, not just argued: the spec's `NoDataLossEvenAfterCrash` and `PartitionCorrectnessEvenAfterCrash` invariants hold even in executions containing commit/cursor-gap events (the phantom window adds rows; it never loses or misroutes them). The source DuckLake's snapshot history is the durable log.
 
 ## Failure Modes
 
-![Failure Modes](docs/failure-modes.svg)
-
-Source: [`docs/failure-modes.d2`](docs/failure-modes.d2)
-
 | Failure | Impact | Recovery | Isolation |
 |---------|--------|----------|-----------|
-| Source catalog unavailable | CDC read fails | Fatal — crash, K8s restart, resume from last cursor | All destinations blocked |
-| Destination catalog unavailable | Write fails | 3 retries with backoff ([`main.py:_write_with_retry`](viaduck/main.py)), then error recorded, connection evicted. Cursor not advanced — automatic retry next poll. | **Per-destination** — other destinations unaffected ([`test_poll_cycle_handles_write_failure`](tests/unit/test_main.py)) |
-| Crash after write, before state update | Destination has data but cursor not advanced | At-least-once: re-reads and re-writes on restart. Duplicates possible. | Per-destination |
-| State transaction failure | `delete` + `insert` rolled back | Cursor preserved at old value. Same data retried next poll. | Per-destination |
-| Destination apply failure (full CDC) | Delete + upsert transaction rolled back | No partial state on destination. Retried next poll. | Per-destination |
+| Source catalog unavailable | CDC read fails | Poll loop exits, buffered data is drained to destinations, process exits cleanly; K8s (`restartPolicy: Always`) restarts it and it resumes from the persisted cursors | All destinations blocked |
+| Destination catalog unavailable | Flush fails | 3 retries with backoff ([`apply.py:_write_with_retry`](viaduck/apply.py)), then error recorded, connection evicted, buffers dropped, read position reset to the persisted cursor. Range re-read next cycle. | **Per-destination** — other destinations unaffected |
+| Crash with data buffered | Buffers and read positions lost | Re-read from persisted cursors on restart. No data loss. | All destinations re-read |
+| Crash after destination commit, before cursor persist | Destination has data, cursor stale | At-least-once: range re-read and re-applied idempotently (full CDC). See the phantom-window note above. | Per-destination |
+| Cursor persist failure (PG down) | Destination commit already landed | 3 in-process retries ([`delivery.py:_advance_cursor_with_retry`](viaduck/delivery.py)); on exhaustion, same path as flush failure — range re-read, idempotent re-apply. | Per-destination |
+| Destination apply failure (full CDC) | Delete + upsert transaction rolled back | No partial state on destination. Buffer dropped, range re-read. | Per-destination |
+| SIGTERM with data buffered | Shutdown drain | `drain()` flushes everything buffered (trigger=shutdown), bounded by a 60s deadline; anything abandoned is re-read on restart. Note: the 60s deadline exceeds K8s's default 30s `terminationGracePeriodSeconds` — raise the grace period or expect SIGKILL to cut the drain short (safe, just re-read). | — |
+| Global buffer watermark exceeded | Memory pressure | Largest buffers force-flushed first; CDC reads pause if every buffering destination is already in flight. | All destinations |
 | Routing field missing from source | `RoutingError` halts group processing | Error metricked, logged. Requires config or schema fix. | All destinations in group |
-| Connection pool eviction storm | Frequent close/reopen | Automatic via LRU. Increase `max_open` if thrashing. | Performance, not correctness |
+| Connection pool eviction storm | Frequent close/reopen | Automatic via LRU; pinned (in-use) connections are never evicted mid-transaction. Increase `delivery.pool_max_open` if thrashing. | Performance, not correctness |
 
 ## Not Yet Supported
 
 - **Dynamic destination discovery** — destinations are defined statically in YAML. No runtime discovery from a DuckLake table.
 - **Schema evolution propagation** — source schema changes are not automatically applied to existing destination tables. Requires viaduck restart.
+- **Halted destination state** — permanent per-destination failures (e.g. schema mismatch) retry forever with growing re-read ranges; no schema pre-flight check or consecutive-failure circuit breaker yet (see Error states).
 - **Exactly-once delivery** — at-least-once only. No deduplication layer.
-- **Batching / coalescing** — writes are immediate per poll cycle. No local buffering across cycles to reduce small file count.
-- **Web UI** — planned SSE-based status page, not yet implemented.
-- **E2E tests** — automated docker-compose test suite not yet implemented.
+- **PostHog events integration** — operational events (flush failures, seeds, drains, halted destinations) emitted as PostHog events for product-side observability.
+- **E2E tests** — the docker-compose stack supports a manual kill-sequence soak (SIGKILL/SIGTERM + convergence diff); not yet automated in CI.
 
 ## Configuration
 
@@ -211,8 +229,24 @@ defaults:
 poll:
   interval_seconds: 5                       # how often to poll for new snapshots
 
+state:
+  table: "viaduck_state"                    # Postgres cursor table
+  schema: "viaduck"                         # dedicated schema, never pollutes ducklake's namespace
+  # postgres_uri_env: "STATE_POSTGRES_URI"  # defaults to the source catalog's URI
+
+delivery:
+  workers: 8                                # flush worker threads
+  flush_interval_seconds: 120               # per-destination max buffer age
+  flush_max_rows: 500000                    # per-destination row trigger
+  flush_max_bytes: 268435456                # per-destination byte trigger (256 MiB)
+  buffer_total_max_bytes: 1073741824        # global force-flush watermark (1 GiB)
+  pool_max_open: 100                        # destination connection pool size
+
 server:
-  port: 8000                                # Prometheus metrics + health checks
+  port: 8000                                # metrics, health checks, status UI
+
+web:
+  enabled: true                             # live status web UI at /ui (same port as server)
 
 instance:
   id: "viaduck-0"                           # unique per scaling instance
@@ -238,18 +272,20 @@ When using full CDC mode (`key_columns` configured), the source table must not u
 
 ## State Tracking
 
-Viaduck stores per-destination replication cursors in a `_viaduck_state` table on the **source** DuckLake catalog ([`state.py`](viaduck/state.py)):
+Viaduck stores per-destination replication cursors in a **plain Postgres** table (`viaduck.viaduck_state` by default), created with `CREATE SCHEMA / CREATE TABLE IF NOT EXISTS` at startup ([`state.py`](viaduck/state.py)). By default it lives in the same Postgres database that hosts the source DuckLake's metadata, but in a **dedicated `viaduck` schema** so it never cohabits with ducklake's catalog tables — and it is NOT a DuckLake table: a cursor advance must not create catalog snapshots, or idle destinations would generate CDC work forever (the snapshot treadmill).
+
+The default reuses the source catalog's credentials. For production hardening, point `state.postgres_uri_env` at a scoped-down user with `USAGE` on the `viaduck` schema plus table grants only (logged future work).
 
 | Column | Type | Purpose |
 |--------|------|---------|
-| `destination_id` | VARCHAR | Which destination (e.g. "quacksworth-lake") |
-| `instance_id` | VARCHAR | Which viaduck instance owns this cursor |
-| `last_snapshot_id` | BIGINT | Last successfully replicated source snapshot |
+| `destination_id` | TEXT | Which destination (e.g. "quacksworth-lake") |
+| `instance_id` | TEXT | Which viaduck instance owns this cursor |
+| `last_snapshot_id` | BIGINT | Last successfully flushed source snapshot |
 | `rows_replicated` | BIGINT | Cumulative operations applied to this destination |
-| `last_error` | VARCHAR | Last error message (NULL if healthy) |
-| `updated_at` | TIMESTAMPTZ | When this row was last modified |
+| `last_error` | TEXT | Last error message (NULL if healthy) |
+| `last_error_at` / `last_replicated_at` / `updated_at` | TIMESTAMPTZ | Timestamps |
 
-State updates use `begin_transaction()` for atomicity — the delete + insert pair either both commit or both roll back ([`state.py:advance_cursor`](viaduck/state.py), tested: [`test_advance_cursor_uses_transaction`](tests/unit/test_state.py)).
+Cursor advances are single `INSERT ... ON CONFLICT DO UPDATE` upserts with a monotonicity guard (`WHERE last_snapshot_id <= EXCLUDED.last_snapshot_id`) — a stale writer can never move a cursor backwards. The connection is lock-guarded with reconnect-on-failure; cursor writes happen on the flush cadence, so PG write rate is per-flush, not per-poll.
 
 State is keyed by `(destination_id, instance_id)`, enabling multiple viaduck instances to independently track their assigned destinations without conflicts.
 
@@ -266,14 +302,17 @@ With `scan` mode, adding a new tenant is instant regardless of source history de
 
 When `key_columns` is configured, seeding uses `upsert` for idempotency — safe if the process crashes mid-seed and re-seeds on restart. Without `key_columns`, seeding uses `append` (at-least-once semantics apply).
 
+The seed scan also **verifies `key_columns` uniqueness** within the partition (DuckLake has no unique constraints, so the key contract is otherwise unenforceable). Duplicate keys would silently corrupt the destination — delete-by-key over-deletes, duplicate-key upserts duplicate — so a violation fails the seed loudly before the cursor advances. The check piggybacks on the scan the seed already does (zero extra I/O, memory bounded by the partition's distinct-key count). Rows inserted after seeding are not re-verified; the contract still applies.
+
 Verified by TLC: the `SeedDestination` action in the TLA+ spec produces the same invariant-satisfying state as a full CDC replay ([`tla/Viaduck.tla`](tla/Viaduck.tla)).
 
 ## Connection Management
 
 With 1000s of destinations, holding all connections open is not viable (~20-30MB per DuckDB catalog connection). Viaduck uses an LRU pool ([`destination.py:DestinationPool`](viaduck/destination.py)):
 
-- **Lazy initialization** — connections created on first access
-- **LRU eviction** — when at capacity (`max_open`, default 50), the least recently used connection is closed
+- **Lazy initialization** — connections created on first access, outside the pool lock so concurrent workers create in parallel
+- **LRU eviction** — when at capacity (`delivery.pool_max_open`, default 100), the least recently used connection is closed
+- **Lease pinning** — a flush worker's `get()` pins the connection until `release()`; eviction never closes a catalog another worker is mid-transaction on (a pinned entry evicted by error handling is closed at final release)
 - **Error eviction** — failed connections are evicted immediately and recreated on next access
 - **Schema caching** — source table schema fetched once at startup, reused for all destination table creation
 
@@ -295,7 +334,17 @@ Each instance only processes its assigned destinations. State rows are keyed by 
 
 ## Metrics
 
-19 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
+The web UI (`/ui`) and status API (`/status`) report a per-destination operational status. Raw flush lag is NOT the signal — between flushes the cursor always trails the source; that's the buffering design working:
+
+| Status | Meaning |
+|--------|---------|
+| `healthy` | Flushed through the current source snapshot — nothing pending |
+| `buffering` | Reads are current; changes are in the in-memory buffer awaiting the next flush (normal steady state) |
+| `flushing` | A flush is writing this destination right now |
+| `lagging` | CDC reads are behind the source — data exists that viaduck has not yet read |
+| `error` | The last flush failed; the buffered range was dropped and will be re-read (see Error states) |
+
+26 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -314,6 +363,13 @@ Each instance only processes its assigned destinations. State rows are keyed by 
 | `viaduck_unrouted_rows_total` | Counter | — | Rows with no matching destination |
 | `viaduck_pool_open_connections` | Gauge | — | Open destination connections |
 | `viaduck_pool_evictions_total` | Counter | — | LRU evictions |
+| `viaduck_pool_creates_total` | Counter | — | Connections created |
+| `viaduck_delivery_buffer_rows` | Gauge | destination | Rows buffered awaiting flush |
+| `viaduck_delivery_buffer_bytes` | Gauge | destination | Bytes buffered awaiting flush |
+| `viaduck_delivery_buffer_total_bytes` | Gauge | — | Total buffered + in-flight bytes (watermark input) |
+| `viaduck_delivery_flushes_total` | Counter | destination, trigger | Flushes by trigger (interval/rows/bytes/memory/shutdown) |
+| `viaduck_delivery_flush_seconds` | Histogram | destination | Flush duration (data flushes only) |
+| `viaduck_delivery_buffers_dropped_total` | Counter | destination | Buffers dropped on flush failure |
 | `viaduck_cdc_routing_mutations_total` | Counter | — | Cross-tenant routing value changes |
 | `viaduck_cdc_conflicts_resolved_total` | Counter | — | Insert+delete pairs cancelled |
 | `viaduck_cdc_orphaned_preimages_total` | Counter | — | Preimages with no matching postimage |
@@ -351,28 +407,39 @@ just ci                # full CI: lock-check, format, lint, tests, semgrep, Dock
 just docs              # render d2 diagrams to SVG
 just docs-check        # verify all README links are valid
 just up                # start docker-compose stack
+just demo              # stack + live producer traffic, wait for health, open the web UI
 just down              # stop docker-compose stack
 ```
 
 ### Performance benchmarks
 
-7 benchmarks in [`tests/perf/test_fanout_perf.py`](tests/perf/test_fanout_perf.py) exercise the hot path at scale:
+11 benchmarks in [`tests/perf/test_fanout_perf.py`](tests/perf/test_fanout_perf.py) exercise the hot path at scale (M2 MacBook, single run):
 
 | Benchmark | Scale | Budget | Typical |
 |-----------|-------|--------|---------|
-| Router split | 10K rows, 100 dests | <1s | ~4ms |
-| Router split | 100K rows, 1000 dests | <5s | ~160ms |
-| Router split | 1M rows, 10K dests | <60s | ~16s |
-| Preimage resolution | 50K CDC rows | <2s | ~55ms |
-| Conflict resolution | 50K rows, ~5% conflicts | <1s | ~45ms |
-| Delete filter (single key) | 1000 rows | <1s | ~18ms |
+| Router split | 10K rows, 100 dests | <1s | ~16ms |
+| Router split | 100K rows, 1000 dests | <5s | ~8ms |
+| Router split | 1M rows, 10K dests | <60s | ~134ms |
+| Preimage resolution | 50K CDC rows | <2s | ~5ms |
+| Preimage resolution | 50K rows, matched pairs | <2s | ~5ms |
+| Conflict resolution | 50K rows, ~5% conflicts | <1s | ~5ms |
+| Delete filter (single key) | 1000 rows | <1s | ~25ms |
 | Delete filter (composite key) | 500 rows, 3-col key | <2s | ~2ms |
+| Delivery fanout (end-to-end) | 200 dests × 100 rows | <600s | 4.8s (42 dests/s) |
+| Delivery fanout (end-to-end) | 500 dests × 100 rows | <600s | 11.8s (42 dests/s) |
+| Delivery fanout (end-to-end) | 1000 dests × 100 rows | <600s | 24.2s (41 dests/s) |
+
+The fanout benchmark is the honest end-to-end number: full-CDC flushes through the `DeliveryManager` worker pool (workers=8) against real local DuckLake catalogs, with every flush paying catalog creation (fanout exceeds `pool_max_open`, so it measures continuous-eviction worst case). Scaling is flat — ~42 destinations/s at 200, 500, and 1000 — so a 1000-destination deployment drains a full flush cycle in ~25s, comfortably inside the default 120s flush interval. Cursor persistence and object-store latency are excluded (per-flush costs, not per-destination-count costs); see the benchmark docstring.
 
 `just test-perf-json` writes results to `perf-results.json` for CI regression tracking.
 
+#### Worker-thread sizing
+
+`delivery.workers` controls flush parallelism, but two process-global thread pools sit underneath every worker: Arrow's compute pool (Phase 2/3 kernels) and DuckDB's per-connection threads (destination commits). Workers spend most of a flush inside those pools with the GIL released, so worker count is effectively a *concurrency* knob (overlapping I/O and commit latency across destinations), not a CPU multiplier — raising `workers` well past the core count buys queueing, not throughput. The default (8, ≈ core count) is a reasonable starting point; a measured worker-count sweep hasn't been done, so treat per-deployment tuning as empirical.
+
 ### Grafana dashboard
 
-A [Grafana dashboard](grafana/dashboards/viaduck.json) covering all 19 metrics is included. Available at `http://localhost:3000/d/viaduck/viaduck` when running `just up`.
+A [Grafana dashboard](grafana/dashboards/viaduck.json) covering the metrics is included. Available at `http://localhost:3000/d/viaduck/viaduck` when running `just up`.
 
 ## Deployment
 
@@ -388,11 +455,29 @@ Viaduck runs as a K8s Deployment (not StatefulSet — no ordinal-based identity 
 
 | Operation | Attempts | Backoff | On exhaustion |
 |-----------|----------|---------|---------------|
-| Destination write | 3 | 1s, 2s | Error recorded, connection evicted, cursor not advanced. Automatic retry next poll. Other destinations unaffected. |
-| Source CDC read | 1 | — | Fatal — crash, K8s restart, resume from cursors. |
-| State update | 1 (transactional) | — | Transaction rolled back, cursor preserved. Retry next poll. |
+| Destination write (flush) | 3 | 1s, 2s | Error recorded, connection evicted, buffers dropped, read position reset. Range re-read next cycle. Other destinations unaffected. |
+| Cursor persist (after destination commit) | 3 | 0.5s, 1s | Falls back to the flush-failure path: range re-read, idempotent re-apply. |
+| Source CDC read | 1 | — | Poll loop exits; buffered data drains, process exits cleanly, K8s restarts, resume from cursors. |
 
-Why crash on source failure? The source catalog is the single point of truth. If it's unreachable, there's nothing to do. Let K8s handle the restart. DuckLake snapshot history ensures no data loss.
+### Error states
+
+Every error state and how it resolves:
+
+| Error | Where | Resolution |
+|-------|-------|------------|
+| Flush failure (`errors_total{type="dest_write"}`) | Destination write fails after retries — catalog down, transaction failure, schema mismatch | Automatic: connection evicted, buffer dropped, read position reset to the persisted cursor, range re-read next cycle. `last_error` durable in PG and shown in the UI (`error` status); cleared on the next successful flush |
+| Cursor persist failure after destination commit | PG outage outlasting the in-process retry | Same path as flush failure; the re-read re-applies idempotently. This is the spec's `FlushCommitNoCursor` phantom window — see Delivery guarantees |
+| Routing error (`errors_total{type="routing"}`) | Key column missing from CDC data (Phase 1) or routing field missing from the source schema | Group processing halts for the cycle, retried every poll. Needs an operator fix (config or source schema); affects all destinations in the read group |
+| Source CDC read failure | Any poll-cycle exception | Poll loop exits, buffered data drains, clean process exit; K8s restarts and resumes from persisted cursors |
+| Seed key-uniqueness violation | `key_columns` not unique in the source partition | Fatal before the cursor advances; fix the source data or `key_columns`, the seed re-runs on restart |
+| Partial seed (error or crash mid-seed) | Seed scan/write interrupted | Cursor stays at 0 → full re-seed on restart (idempotent with `key_columns`) |
+| State-store write failure while recording an error | PG down during failure bookkeeping | Caught and logged; the position/buffer reset has already happened, so recovery is unaffected |
+| Pool connection create/close failure | Destination catalog connect | Evicted and recreated on next access; close failures are log-warnings only |
+| Escaped flush-worker exception | Bug guard | CRITICAL log; in-flight state cleared in `finally` so the destination isn't wedged |
+
+**Permanent failures retry forever.** A destination that can never succeed (e.g. schema mismatch) loops through the flush-failure path at flush cadence, and because its cursor never advances, its re-read range — and the source I/O spent on it — grows every cycle. The failure is fully visible (`error` status, `last_error`, climbing `dest_lag_snapshots`, `delivery_buffers_dropped_total`) but never escalates. A `halted` destination state (schema pre-flight check / consecutive-failure circuit breaker) is logged future work.
+
+Why exit on source failure? The source catalog is the single point of truth. If it's unreachable, there's nothing to do. The exit path runs the normal shutdown drain (already-buffered data still flushes), then lets K8s handle the restart. DuckLake snapshot history ensures no data loss.
 
 ---
 

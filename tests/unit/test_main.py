@@ -8,16 +8,19 @@ import pyarrow as pa
 import pytest
 
 from viaduck import metrics
-from viaduck.main import (
+from viaduck.apply import (
     _apply_changes,
     _build_delete_filter,
+    _resolve_conflicts,
+    _write_with_retry,
+)
+from viaduck.main import (
+    _derive_dest_status,
     _group_by_cursor,
     _poll_cycle,
-    _resolve_conflicts,
     _resolve_preimages,
     _seed_new_destinations,
     _start_progress_heartbeat,
-    _write_with_retry,
 )
 from viaduck.router import RoutingError
 
@@ -88,7 +91,7 @@ def test_write_with_retry_retries_on_failure():
         if attempts["count"] == 1:
             raise Exception("fail")
 
-    with patch("viaduck.main.time.sleep"):
+    with patch("viaduck.apply.time.sleep"):
         _write_with_retry(pool, "dest-1", op)
 
     assert attempts["count"] == 2
@@ -102,7 +105,7 @@ def test_write_with_retry_exhausted():
     def op(catalog, table):
         raise Exception("persistent failure")
 
-    with patch("viaduck.main.time.sleep"):
+    with patch("viaduck.apply.time.sleep"):
         with pytest.raises(Exception, match="persistent failure"):
             _write_with_retry(pool, "dest-1", op)
 
@@ -118,7 +121,7 @@ def test_write_with_retry_logs_exception_message():
         if attempts["count"] == 1:
             raise ConnectionError("connection refused")
 
-    with patch("viaduck.main.time.sleep"), patch("viaduck.main.log") as mock_log:
+    with patch("viaduck.apply.time.sleep"), patch("viaduck.apply.log") as mock_log:
         _write_with_retry(pool, "dest-1", op)
 
     warning_call = mock_log.warning.call_args
@@ -152,243 +155,237 @@ def _make_cfg(dest_ids_and_rvs: list[tuple[str, str]]):
 
 
 # ---------------------------------------------------------------------------
-# _poll_cycle (append-only mode)
+# _poll_cycle (buffered delivery: reads + routing land in the DeliveryManager;
+# writes are worker-side and covered by tests/unit/test_delivery.py)
 # ---------------------------------------------------------------------------
 
 
+def _make_delivery(positions: dict[str, int]):
+    """Mock DeliveryManager: position map + status snapshot for all dests."""
+    from viaduck.delivery import DestDeliveryStatus
+
+    delivery = MagicMock()
+    delivery.positions.return_value = dict(positions)
+    delivery.read_plan.return_value = {d: (snap, 0) for d, snap in positions.items()}
+    delivery.should_pause_reads.return_value = False
+    delivery.maybe_flush.return_value = 0
+    delivery.status_snapshot.return_value = {
+        d: DestDeliveryStatus(
+            flushed_snapshot=snap,
+            position_snapshot=snap,
+            rows_replicated=0,
+            last_error=None,
+            buffer_rows=0,
+            buffer_age_s=0.0,
+            flushing=False,
+        )
+        for d, snap in positions.items()
+    }
+    return delivery
+
+
 def test_poll_cycle_no_snapshots():
-    """If source has no snapshots, poll cycle should be a no-op."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
+    """If source has no snapshots, no reads happen — but triggers are still
+    evaluated (position-only persists may be due)."""
+    delivery = _make_delivery({})
     router = MagicMock()
     cfg = _make_cfg([])
-    rv_to_dest = {}
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=None):
-        _poll_cycle(src_table, state_mgr, dest_pool, router, cfg, [], rv_to_dest, key_columns=[], full_cdc=False)
+        _poll_cycle(MagicMock(), delivery, MagicMock(), router, cfg, [], {}, key_columns=[], full_cdc=False)
 
-    state_mgr.load_cursors.assert_not_called()
+    delivery.read_plan.assert_not_called()
+    delivery.maybe_flush.assert_called_once()
 
 
 def test_poll_cycle_all_caught_up():
-    """If all destinations are at current snapshot, no CDC reads should occur."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
+    """If every position is at the current snapshot, no CDC reads occur."""
+    delivery = _make_delivery({"dest-1": 10})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    rv_to_dest = {"quacksworth": "dest-1"}
-
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 10
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=10):
         _poll_cycle(
-            src_table, state_mgr, dest_pool, router, cfg, ["dest-1"], rv_to_dest, key_columns=[], full_cdc=False
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
         )
 
     router.build_filter_expr.assert_not_called()
+    delivery.buffer.assert_not_called()
+    delivery.maybe_flush.assert_called_once()
 
 
-def test_poll_cycle_routes_and_writes():
-    """Full poll cycle: read CDC, route, write, advance cursor (append-only)."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
+def test_poll_cycle_routes_and_buffers():
+    """Read CDC, route, buffer (BufferRead) — no synchronous writes."""
+    delivery = _make_delivery({"dest-1": 5})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    rv_to_dest = {"quacksworth": "dest-1"}
-
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 100
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
 
     arrow_data = pa.table({"company": ["quacksworth", "quacksworth"], "value": [10, 20]})
     router.build_filter_expr.return_value = "company IN ('quacksworth')"
     router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
 
-    mock_dest_table = MagicMock()
-    dest_pool.get.return_value = (MagicMock(), mock_dest_table)
-
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data),
     ):
         _poll_cycle(
-            src_table, state_mgr, dest_pool, router, cfg, ["dest-1"], rv_to_dest, key_columns=[], full_cdc=False
-        )
-
-    mock_dest_table.append.assert_called_once_with(arrow_data)
-    state_mgr.advance_cursor.assert_called_once_with("dest-1", 10, cumulative_rows=102)
-
-
-def test_poll_cycle_handles_write_failure():
-    """Write failure should record error and evict, not crash (append-only)."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
-    router = MagicMock()
-    cfg = _make_cfg([("dest-1", "quacksworth")])
-    rv_to_dest = {"quacksworth": "dest-1"}
-
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 0
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
-
-    arrow_data = pa.table({"company": ["quacksworth"], "value": [10]})
-    router.build_filter_expr.return_value = "company IN ('quacksworth')"
-    router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
-
-    mock_dest_table = MagicMock()
-    mock_dest_table.append.side_effect = Exception("connection lost")
-    dest_pool.get.return_value = (MagicMock(), mock_dest_table)
-
-    with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
-        patch("viaduck.main.time.sleep"),
-    ):
-        _poll_cycle(
-            src_table, state_mgr, dest_pool, router, cfg, ["dest-1"], rv_to_dest, key_columns=[], full_cdc=False
-        )
-
-    state_mgr.record_error.assert_called_once()
-    dest_pool.evict.assert_called()
-
-
-def test_poll_cycle_empty_changeset_advances_cursors():
-    """Empty CDC changeset should advance all destinations in the group."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
-    router = MagicMock()
-    cfg = _make_cfg([("dest-1", "quacksworth"), ("dest-2", "mallardine")])
-    rv_to_dest = {"quacksworth": "dest-1", "mallardine": "dest-2"}
-
-    cursor1 = MagicMock()
-    cursor1.last_snapshot_id = 5
-    cursor2 = MagicMock()
-    cursor2.last_snapshot_id = 5
-    state_mgr.load_cursors.return_value = {"dest-1": cursor1, "dest-2": cursor2}
-
-    empty_data = pa.table({"company": pa.array([], type=pa.string()), "value": pa.array([], type=pa.int64())})
-    router.build_filter_expr.return_value = "company IN ('quacksworth', 'mallardine')"
-
-    with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
-        patch("viaduck.main.source.read_cdc", return_value=empty_data),
-    ):
-        _poll_cycle(
-            src_table,
-            state_mgr,
-            dest_pool,
+            MagicMock(),
+            delivery,
+            MagicMock(),
             router,
             cfg,
-            ["dest-1", "dest-2"],
-            rv_to_dest,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
             key_columns=[],
             full_cdc=False,
         )
 
-    state_mgr.advance_cursors.assert_called_once_with(["dest-1", "dest-2"], 10)
+    delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
+    delivery.advance_position.assert_not_called()
+    delivery.maybe_flush.assert_called_once()
 
 
-def test_poll_cycle_routing_error_breaks_gracefully():
-    """RoutingError should break out of group processing, not crash."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
+def test_poll_cycle_empty_changeset_advances_positions():
+    """An empty CDC range advances in-memory positions (no PG write)."""
+    delivery = _make_delivery({"dest-1": 5, "dest-2": 5})
     router = MagicMock()
-    cfg = _make_cfg([("dest-1", "quacksworth")])
-    rv_to_dest = {"quacksworth": "dest-1"}
-
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
-
-    arrow_data = pa.table({"other_col": [1]})
-    router.build_filter_expr.return_value = "company IN ('quacksworth')"
-    router.split_and_count.side_effect = RoutingError("field 'company' not found")
-
-    with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
-    ):
-        _poll_cycle(
-            src_table, state_mgr, dest_pool, router, cfg, ["dest-1"], rv_to_dest, key_columns=[], full_cdc=False
-        )
-
-
-def test_poll_cycle_advances_no_data_destinations():
-    """Destinations with no matching rows should still advance their cursor."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
-    router = MagicMock()
-    cfg = _make_cfg([("dest-1", "quacksworth"), ("dest-2", "mallardine")])
-    rv_to_dest = {"quacksworth": "dest-1", "mallardine": "dest-2"}
-
-    cursor1 = MagicMock()
-    cursor1.last_snapshot_id = 5
-    cursor1.rows_replicated = 10
-    cursor2 = MagicMock()
-    cursor2.last_snapshot_id = 5
-    cursor2.rows_replicated = 0
-    state_mgr.load_cursors.return_value = {"dest-1": cursor1, "dest-2": cursor2}
-
-    arrow_data = pa.table({"company": ["quacksworth"], "value": [10]})
-    router.build_filter_expr.return_value = "company IN ('quacksworth', 'mallardine')"
-    router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
-
-    mock_dest_table = MagicMock()
-    dest_pool.get.return_value = (MagicMock(), mock_dest_table)
-
-    with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
-    ):
-        _poll_cycle(
-            src_table,
-            state_mgr,
-            dest_pool,
-            router,
-            cfg,
-            ["dest-1", "dest-2"],
-            rv_to_dest,
-            key_columns=[],
-            full_cdc=False,
-        )
-
-    state_mgr.advance_cursors.assert_called_once_with(["dest-2"], 10)
-
-
-def test_poll_cycle_snapshot_at_zero():
-    """First snapshot on source: destinations start at 0, current is also small."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
-    router = MagicMock()
-    cfg = _make_cfg([("dest-1", "quacksworth")])
-    rv_to_dest = {"quacksworth": "dest-1"}
-
-    state_mgr.load_cursors.return_value = {}
+    cfg = _make_cfg([("dest-1", "a"), ("dest-2", "b")])
 
     empty = pa.table({"company": pa.array([], type=pa.string())})
-    router.build_filter_expr.return_value = "company IN ('quacksworth')"
-
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=1),
+        patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc", return_value=empty),
     ):
         _poll_cycle(
-            src_table, state_mgr, dest_pool, router, cfg, ["dest-1"], rv_to_dest, key_columns=[], full_cdc=False
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1", "dest-2"],
+            {"a": "dest-1", "b": "dest-2"},
+            key_columns=[],
+            full_cdc=False,
         )
 
-    state_mgr.advance_cursors.assert_called_once()
+    assert delivery.advance_position.call_count == 2
+    delivery.advance_position.assert_any_call("dest-1", 10, epoch=0)
+    delivery.advance_position.assert_any_call("dest-2", 10, epoch=0)
+    delivery.buffer.assert_not_called()
+
+
+def test_poll_cycle_routing_error_breaks_gracefully():
+    """A routing failure stops reads for the cycle without buffering."""
+    delivery = _make_delivery({"dest-1": 5})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    arrow_data = pa.table({"other": ["x"]})
+    router.split_and_count.side_effect = RoutingError("routing field missing")
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
+        )
+
+    delivery.buffer.assert_not_called()
+    delivery.maybe_flush.assert_called_once()
+
+
+def test_poll_cycle_advances_no_data_destinations():
+    """Destinations in the group with no routed rows advance positions."""
+    delivery = _make_delivery({"dest-1": 5, "dest-2": 5})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "a"), ("dest-2", "b")])
+
+    arrow_data = pa.table({"company": ["a"], "value": [1]})
+    router.split_and_count.return_value = ({"a": arrow_data}, 0)
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1", "dest-2"],
+            {"a": "dest-1", "b": "dest-2"},
+            key_columns=[],
+            full_cdc=False,
+        )
+
+    delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
+    delivery.advance_position.assert_called_once_with("dest-2", 10, epoch=0)
+
+
+def test_poll_cycle_pauses_reads_at_watermark():
+    """When the global buffer watermark is hit with all flushes in flight,
+    the cycle skips reads but still evaluates triggers."""
+    delivery = _make_delivery({"dest-1": 5})
+    delivery.should_pause_reads.return_value = True
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=10):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
+        )
+
+    delivery.read_plan.assert_not_called()
+    delivery.maybe_flush.assert_called_once()
+
+
+def test_poll_cycle_snapshot_at_zero():
+    """Source snapshot 0 with positions at 0: nothing to read, triggers run."""
+    delivery = _make_delivery({"dest-1": 0})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=0):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
+        )
+
+    router.build_filter_expr.assert_not_called()
+    delivery.maybe_flush.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -795,7 +792,12 @@ def _mock_catalog_and_table():
 
 
 def test_apply_changes_inserts_only():
-    """Only inserts: upsert called, no delete."""
+    """Only inserts: upsert called, no delete.
+
+    These _apply_changes tests key on "value" (unique per fixture row), not
+    "company" (constant): with a realistic key, duplicate-key rows collapse
+    via Winner(k) and the pass-through counts asserted here would change.
+    Same-key behavior is covered by the Winner(k) tests below."""
     catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
     batch = _cdc_table(
         [
@@ -803,11 +805,11 @@ def test_apply_changes_inserts_only():
             {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
         ]
     )
-    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    counts = _apply_changes(catalog, dest_table, batch, ["value"])
     assert counts["upserted"] == 2
     assert counts["deleted"] == 0
     txn_table.upsert.assert_called_once()
-    assert txn_table.upsert.call_args.kwargs["join_cols"] == ["company"]
+    assert txn_table.upsert.call_args.kwargs["join_cols"] == ["value"]
     txn_table.delete.assert_not_called()
 
 
@@ -851,12 +853,12 @@ def test_apply_changes_mixed():
             {"company": "acme", "value": 3, "change_type": "update_postimage", "snapshot_id": 1, "rowid": 300},
         ]
     )
-    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    counts = _apply_changes(catalog, dest_table, batch, ["value"])
     assert counts["deleted"] == 1
     assert counts["upserted"] == 2
     txn_table.delete.assert_called_once()
     txn_table.upsert.assert_called_once()
-    assert txn_table.upsert.call_args.kwargs["join_cols"] == ["company"]
+    assert txn_table.upsert.call_args.kwargs["join_cols"] == ["value"]
 
 
 def test_apply_changes_empty():
@@ -916,20 +918,49 @@ def test_apply_changes_strips_metadata():
 # ---------------------------------------------------------------------------
 
 
+def _make_real_delivery(state_mgr, dest_pool, key_columns, assigned_ids):
+    """Real DeliveryManager in flush-every-cycle mode so end-to-end poll
+    tests keep their write coverage. wait_idle() joins the single worker."""
+    from viaduck.config import DeliveryConfig
+    from viaduck.delivery import DeliveryManager
+
+    dcfg = DeliveryConfig(workers=1, flush_interval_seconds=0.0)
+    return DeliveryManager(dcfg, state_mgr, dest_pool, key_columns, assigned_ids)
+
+
+def _txn_catalog():
+    """Mock catalog whose begin_transaction context yields a txn table."""
+    mock_catalog = MagicMock()
+    txn = MagicMock()
+    txn_table = MagicMock()
+    upsert_result = MagicMock()
+    upsert_result.rows_updated = 0
+    upsert_result.rows_inserted = 0
+    txn_table.upsert.return_value = upsert_result
+    txn.load_table.return_value = txn_table
+    mock_catalog.begin_transaction.return_value.__enter__ = MagicMock(return_value=txn)
+    mock_catalog.begin_transaction.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_catalog, txn_table
+
+
+def _cursor(snapshot=5, rows=0):
+    c = MagicMock()
+    c.last_snapshot_id = snapshot
+    c.rows_replicated = rows
+    c.last_error = None
+    return c
+
+
 def test_poll_cycle_full_cdc_routes_and_writes():
-    """Full CDC mode end-to-end: read, resolve preimages, route, resolve conflicts, apply."""
-    src_table = MagicMock()
+    """Full CDC end-to-end: read, resolve preimages, route, buffer, flush
+    (conflict resolution + apply on the worker), advance cursor."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
     cfg.routing.field = "company"
-    rv_to_dest = {"quacksworth": "dest-1"}
 
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 100
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
+    state_mgr.load_cursors.return_value = {"dest-1": _cursor(5, 100)}
 
     arrow_data = _cdc_table(
         [
@@ -940,55 +971,41 @@ def test_poll_cycle_full_cdc_routes_and_writes():
     router.build_filter_expr.return_value = "company IN ('quacksworth')"
     router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
 
-    mock_catalog = MagicMock()
+    mock_catalog, txn_table = _txn_catalog()
     mock_dest_table = MagicMock()
     mock_dest_table.identifier = "dest_table"
-    txn = MagicMock()
-    txn_table = MagicMock()
-    _upsert_result = MagicMock()
-    _upsert_result.rows_updated = 0
-    _upsert_result.rows_inserted = 0
-    txn_table.upsert.return_value = _upsert_result
-    txn.load_table.return_value = txn_table
-    mock_catalog.begin_transaction.return_value.__enter__ = MagicMock(return_value=txn)
-    mock_catalog.begin_transaction.return_value.__exit__ = MagicMock(return_value=False)
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["value"], ["dest-1"])
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
     ):
         _poll_cycle(
-            src_table,
-            state_mgr,
+            MagicMock(),
+            delivery,
             dest_pool,
             router,
             cfg,
             ["dest-1"],
-            rv_to_dest,
-            key_columns=["company"],
+            {"quacksworth": "dest-1"},
+            key_columns=["value"],
             full_cdc=True,
         )
+    assert delivery.wait_idle()
 
-    state_mgr.advance_cursor.assert_called_once()
-    call_args = state_mgr.advance_cursor.call_args
-    assert call_args[0][0] == "dest-1"
-    assert call_args[0][1] == 10
+    txn_table.upsert.assert_called_once()
+    state_mgr.advance_cursor.assert_called_once_with("dest-1", 10, cumulative_rows=102)
 
 
 def test_poll_cycle_append_only_unchanged():
-    """Backward compat: append-only mode uses read_cdc and table.append."""
-    src_table = MagicMock()
+    """Append-only mode uses read_cdc and table.append (on the worker)."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    rv_to_dest = {"quacksworth": "dest-1"}
 
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 0
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
+    state_mgr.load_cursors.return_value = {"dest-1": _cursor(5, 0)}
 
     arrow_data = pa.table({"company": ["quacksworth"], "value": [10]})
     router.build_filter_expr.return_value = "company IN ('quacksworth')"
@@ -997,34 +1014,40 @@ def test_poll_cycle_append_only_unchanged():
     mock_dest_table = MagicMock()
     dest_pool.get.return_value = (MagicMock(), mock_dest_table)
 
+    delivery = _make_real_delivery(state_mgr, dest_pool, [], ["dest-1"])
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data) as mock_read_cdc,
         patch("viaduck.main.source.read_cdc_changes") as mock_read_changes,
     ):
         _poll_cycle(
-            src_table, state_mgr, dest_pool, router, cfg, ["dest-1"], rv_to_dest, key_columns=[], full_cdc=False
+            MagicMock(),
+            delivery,
+            dest_pool,
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
         )
+    assert delivery.wait_idle()
 
     mock_read_cdc.assert_called_once()
     mock_read_changes.assert_not_called()
     mock_dest_table.append.assert_called_once()
+    state_mgr.advance_cursor.assert_called_once_with("dest-1", 10, cumulative_rows=1)
 
 
 def test_poll_cycle_cdc_delete_only_changeset():
-    """CDC mode with only deletes."""
-    src_table = MagicMock()
+    """CDC mode with only deletes flows through the flush worker."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
     cfg.routing.field = "company"
-    rv_to_dest = {"quacksworth": "dest-1"}
 
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 50
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
+    state_mgr.load_cursors.return_value = {"dest-1": _cursor(5, 50)}
 
     arrow_data = _cdc_table(
         [
@@ -1034,53 +1057,44 @@ def test_poll_cycle_cdc_delete_only_changeset():
     router.build_filter_expr.return_value = "company IN ('quacksworth')"
     router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
 
-    mock_catalog = MagicMock()
+    mock_catalog, txn_table = _txn_catalog()
     mock_dest_table = MagicMock()
     mock_dest_table.identifier = "dest_table"
-    txn = MagicMock()
-    txn_table = MagicMock()
-    _upsert_result = MagicMock()
-    _upsert_result.rows_updated = 0
-    _upsert_result.rows_inserted = 0
-    txn_table.upsert.return_value = _upsert_result
-    txn.load_table.return_value = txn_table
-    mock_catalog.begin_transaction.return_value.__enter__ = MagicMock(return_value=txn)
-    mock_catalog.begin_transaction.return_value.__exit__ = MagicMock(return_value=False)
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"])
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
     ):
         _poll_cycle(
-            src_table,
-            state_mgr,
+            MagicMock(),
+            delivery,
             dest_pool,
             router,
             cfg,
             ["dest-1"],
-            rv_to_dest,
+            {"quacksworth": "dest-1"},
             key_columns=["company"],
             full_cdc=True,
         )
+    assert delivery.wait_idle()
 
-    state_mgr.advance_cursor.assert_called_once()
+    txn_table.delete.assert_called_once()
+    txn_table.upsert.assert_not_called()
+    state_mgr.advance_cursor.assert_called_once_with("dest-1", 10, cumulative_rows=51)
 
 
 def test_poll_cycle_cdc_write_failure_isolation():
-    """Error isolation in CDC mode: write failure doesn't crash."""
-    src_table = MagicMock()
+    """Flush failure: error recorded, connection evicted, buffer dropped,
+    position reset to the persisted cursor — and the process survives."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
     cfg.routing.field = "company"
-    rv_to_dest = {"quacksworth": "dest-1"}
 
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 0
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
+    state_mgr.load_cursors.return_value = {"dest-1": _cursor(5, 0)}
 
     arrow_data = _cdc_table(
         [
@@ -1096,44 +1110,42 @@ def test_poll_cycle_cdc_write_failure_isolation():
     mock_catalog.begin_transaction.side_effect = Exception("catalog down")
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"])
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
-        patch("viaduck.main.time.sleep"),
+        patch("viaduck.apply.time.sleep"),
     ):
         _poll_cycle(
-            src_table,
-            state_mgr,
+            MagicMock(),
+            delivery,
             dest_pool,
             router,
             cfg,
             ["dest-1"],
-            rv_to_dest,
+            {"quacksworth": "dest-1"},
             key_columns=["company"],
             full_cdc=True,
         )
+    assert delivery.wait_idle()
 
     state_mgr.record_error.assert_called_once()
     dest_pool.evict.assert_called()
+    state_mgr.advance_cursor.assert_not_called()
+    # FlushFail semantics: position reset to the persisted cursor.
+    assert delivery.positions()["dest-1"] == 5
 
 
 def test_poll_cycle_cdc_routing_value_mutation():
-    """Cross-tenant update: preimage converted to delete for old destination."""
-    src_table = MagicMock()
+    """Cross-tenant update: preimage converted to delete for old destination;
+    both destinations flush and advance."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth"), ("dest-2", "mallardine")])
     cfg.routing.field = "company"
-    rv_to_dest = {"quacksworth": "dest-1", "mallardine": "dest-2"}
 
-    cursor1 = MagicMock()
-    cursor1.last_snapshot_id = 5
-    cursor1.rows_replicated = 10
-    cursor2 = MagicMock()
-    cursor2.last_snapshot_id = 5
-    cursor2.rows_replicated = 20
-    state_mgr.load_cursors.return_value = {"dest-1": cursor1, "dest-2": cursor2}
+    state_mgr.load_cursors.return_value = {"dest-1": _cursor(5, 10), "dest-2": _cursor(5, 20)}
 
     # Row moves from quacksworth to mallardine
     raw_data = _cdc_table(
@@ -1142,8 +1154,6 @@ def test_poll_cycle_cdc_routing_value_mutation():
             {"company": "mallardine", "value": 1, "change_type": "update_postimage", "snapshot_id": 6, "rowid": 100},
         ]
     )
-
-    # After preimage resolution, preimage becomes delete. Router splits accordingly.
     quacks_batch = _cdc_table(
         [
             {"company": "quacksworth", "value": 1, "change_type": "delete", "snapshot_id": 6, "rowid": 100},
@@ -1158,35 +1168,28 @@ def test_poll_cycle_cdc_routing_value_mutation():
     router.build_filter_expr.return_value = "company IN ('quacksworth', 'mallardine')"
     router.split_and_count.return_value = ({"quacksworth": quacks_batch, "mallardine": mallard_batch}, 0)
 
-    mock_catalog = MagicMock()
+    mock_catalog, _txn_table = _txn_catalog()
     mock_dest_table = MagicMock()
     mock_dest_table.identifier = "dest_table"
-    txn = MagicMock()
-    txn_table = MagicMock()
-    _upsert_result = MagicMock()
-    _upsert_result.rows_updated = 0
-    _upsert_result.rows_inserted = 0
-    txn_table.upsert.return_value = _upsert_result
-    txn.load_table.return_value = txn_table
-    mock_catalog.begin_transaction.return_value.__enter__ = MagicMock(return_value=txn)
-    mock_catalog.begin_transaction.return_value.__exit__ = MagicMock(return_value=False)
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1", "dest-2"])
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=raw_data),
     ):
         _poll_cycle(
-            src_table,
-            state_mgr,
+            MagicMock(),
+            delivery,
             dest_pool,
             router,
             cfg,
             ["dest-1", "dest-2"],
-            rv_to_dest,
+            {"quacksworth": "dest-1", "mallardine": "dest-2"},
             key_columns=["company"],
             full_cdc=True,
         )
+    assert delivery.wait_idle()
 
     # Both destinations should have their cursors advanced
     assert state_mgr.advance_cursor.call_count == 2
@@ -1194,42 +1197,33 @@ def test_poll_cycle_cdc_routing_value_mutation():
 
 def test_poll_cycle_branches_on_key_columns():
     """key_columns presence determines CDC mode: non-empty -> full_cdc, empty -> append."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    rv_to_dest = {"quacksworth": "dest-1"}
-
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 0
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
+    cfg.routing.field = "company"
 
     arrow_data = pa.table({"company": ["quacksworth"], "value": [10]})
     router.build_filter_expr.return_value = "company IN ('quacksworth')"
     router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
 
-    mock_dest_table = MagicMock()
-    dest_pool.get.return_value = (MagicMock(), mock_dest_table)
-
+    delivery = _make_delivery({"dest-1": 5})
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data) as mock_read_cdc,
         patch("viaduck.main.source.read_cdc_changes") as mock_read_changes,
     ):
-        # Empty key_columns -> append-only
         _poll_cycle(
-            src_table, state_mgr, dest_pool, router, cfg, ["dest-1"], rv_to_dest, key_columns=[], full_cdc=False
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
         )
         mock_read_cdc.assert_called_once()
         mock_read_changes.assert_not_called()
-
-    # Reset mocks
-    state_mgr.reset_mock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 0
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
 
     cdc_data = _cdc_table(
         [
@@ -1237,31 +1231,20 @@ def test_poll_cycle_branches_on_key_columns():
         ]
     )
     router.split_and_count.return_value = ({"quacksworth": cdc_data}, 0)
-
-    mock_catalog = MagicMock()
-    mock_dest_table2 = MagicMock()
-    mock_dest_table2.identifier = "dest_table"
-    txn = MagicMock()
-    txn_table = MagicMock()
-    txn.load_table.return_value = txn_table
-    mock_catalog.begin_transaction.return_value.__enter__ = MagicMock(return_value=txn)
-    mock_catalog.begin_transaction.return_value.__exit__ = MagicMock(return_value=False)
-    dest_pool.get.return_value = (mock_catalog, mock_dest_table2)
-
+    delivery = _make_delivery({"dest-1": 5})
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc") as mock_read_cdc2,
         patch("viaduck.main.source.read_cdc_changes", return_value=cdc_data) as mock_read_changes2,
     ):
-        cfg.routing.field = "company"
         _poll_cycle(
-            src_table,
-            state_mgr,
-            dest_pool,
+            MagicMock(),
+            delivery,
+            MagicMock(),
             router,
             cfg,
             ["dest-1"],
-            rv_to_dest,
+            {"quacksworth": "dest-1"},
             key_columns=["company"],
             full_cdc=True,
         )
@@ -1469,39 +1452,36 @@ def test_apply_changes_upsert_matched_nonzero():
             {"company": "acme", "value": 4, "change_type": "update_postimage", "snapshot_id": 1, "rowid": 400},
         ]
     )
-    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    counts = _apply_changes(catalog, dest_table, batch, ["value"])
     assert counts["upserted"] == 4
     assert counts["upsert_matched"] == 3
 
 
 def test_cdc_batch_rows_metric_observed():
     """cdc_batch_rows histogram should be observed with raw CDC row count."""
-    src_table = MagicMock()
-    state_mgr = MagicMock()
-    dest_pool = MagicMock()
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    rv_to_dest = {"quacksworth": "dest-1"}
-
-    cursor = MagicMock()
-    cursor.last_snapshot_id = 5
-    cursor.rows_replicated = 0
-    state_mgr.load_cursors.return_value = {"dest-1": cursor}
 
     arrow_data = pa.table({"company": ["quacksworth", "quacksworth", "quacksworth"], "value": [1, 2, 3]})
     router.build_filter_expr.return_value = "company IN ('quacksworth')"
     router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
 
-    mock_dest_table = MagicMock()
-    dest_pool.get.return_value = (MagicMock(), mock_dest_table)
-
+    delivery = _make_delivery({"dest-1": 5})
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data),
         patch("viaduck.main.metrics.cdc_batch_rows") as mock_batch_metric,
     ):
         _poll_cycle(
-            src_table, state_mgr, dest_pool, router, cfg, ["dest-1"], rv_to_dest, key_columns=[], full_cdc=False
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
         )
 
     mock_batch_metric.observe.assert_called_once_with(3)
@@ -2072,3 +2052,154 @@ def test_seed_new_destinations_logs_first_batch_milestone(caplog):
     assert milestone, f"No first-batch milestone line; got: {msgs}"
     assert "DuckDB pre-execution complete" in milestone[0]
     assert "streaming started" in milestone[0]
+
+
+# ---------------------------------------------------------------------------
+# Winner(k): per-key last-write-wins on upsert candidates (spec Phase3Apply)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_changes_dedupes_upsert_candidates_per_key():
+    """Multiple upsert candidates for one key (an insert + later postimages
+    across a buffered window) collapse to the highest-snapshot candidate
+    BEFORE the upsert — the spec's Winner(k). Found by the M3 soak:
+    without this, pyducklake upsert receives duplicate join keys and the
+    destination grows duplicate rows."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 3, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "update_postimage", "snapshot_id": 5, "rowid": 100},
+            {"company": "acme", "value": 3, "change_type": "update_postimage", "snapshot_id": 9, "rowid": 100},
+            {"company": "other", "value": 7, "change_type": "insert", "snapshot_id": 4, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    assert counts["upserted"] == 2  # one winner per key
+    sent = txn_table.upsert.call_args[0][0]
+    by_company = dict(zip(sent.column("company").to_pylist(), sent.column("value").to_pylist()))
+    assert by_company == {"acme": 3, "other": 7}  # highest snapshot wins
+
+
+def test_apply_changes_winner_tiebreak_by_rowid():
+    """Same snapshot for two candidates of one key (out-of-contract but
+    possible in a replayed union): rowid breaks the tie deterministically."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 5, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 5, "rowid": 300},
+        ]
+    )
+    _apply_changes(catalog, dest_table, batch, ["company"])
+    sent = txn_table.upsert.call_args[0][0]
+    assert sent.column("value").to_pylist() == [2]  # rowid 300 wins
+
+
+def test_apply_changes_winner_preserves_null_keys():
+    """NULL key values must survive Winner(k): Acero hash joins silently
+    drop null keys, which is why winner selection is take()-based. Null
+    keys form their own group and dedupe last-write-wins like any other."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": None, "value": 1, "change_type": "insert", "snapshot_id": 3, "rowid": 100},
+            {"company": None, "value": 2, "change_type": "update_postimage", "snapshot_id": 6, "rowid": 100},
+            {"company": "acme", "value": 7, "change_type": "insert", "snapshot_id": 4, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    assert counts["upserted"] == 2
+    sent = txn_table.upsert.call_args[0][0]
+    by_company = dict(zip(sent.column("company").to_pylist(), sent.column("value").to_pylist()))
+    assert by_company == {None: 2, "acme": 7}
+
+
+def test_apply_changes_winner_composite_key_null_component():
+    """A NULL in one component of a composite key must also survive."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "region": None, "value": 1, "change_type": "insert", "snapshot_id": 3, "rowid": 100},
+            {
+                "company": "acme",
+                "region": None,
+                "value": 2,
+                "change_type": "update_postimage",
+                "snapshot_id": 5,
+                "rowid": 100,
+            },
+            {"company": "acme", "region": "us", "value": 9, "change_type": "insert", "snapshot_id": 4, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["company", "region"])
+    assert counts["upserted"] == 2
+    sent = txn_table.upsert.call_args[0][0]
+    got = set(zip(sent.column("region").to_pylist(), sent.column("value").to_pylist()))
+    assert got == {(None, 2), ("us", 9)}
+
+
+def test_apply_changes_key_reuse_delete_before_upsert():
+    """Key takeover within one window: delete of rowid r1 (key k) plus a
+    surviving insert of rowid r2 (same k). Phase 2 keys on rowid so both
+    survive to Phase 3, which must apply the delete BEFORE the upsert or
+    the reinserted row is eaten (spec afterDelete/afterUpsert order)."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    order = MagicMock()
+    order.attach_mock(txn_table.delete, "delete")
+    order.attach_mock(txn_table.upsert, "upsert")
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "delete", "snapshot_id": 4, "rowid": 100},
+            {"company": "acme", "value": 5, "change_type": "insert", "snapshot_id": 6, "rowid": 300},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    assert counts["deleted"] == 1
+    assert counts["upserted"] == 1
+    calls = [name for name, _, _ in order.mock_calls if name in ("delete", "upsert")]
+    assert calls == ["delete", "upsert"]
+    sent = txn_table.upsert.call_args[0][0]
+    assert sent.column("value").to_pylist() == [5]
+
+
+# ---------------------------------------------------------------------------
+# Destination status derivation (web UI / status API)
+# ---------------------------------------------------------------------------
+
+
+def _delivery_status(**kw):
+    from viaduck.delivery import DestDeliveryStatus
+
+    base = dict(
+        flushed_snapshot=10,
+        position_snapshot=10,
+        rows_replicated=0,
+        last_error=None,
+        buffer_rows=0,
+        buffer_age_s=0.0,
+        flushing=False,
+    )
+    base.update(kw)
+    return DestDeliveryStatus(**base)
+
+
+@pytest.mark.parametrize(
+    ("snap_now", "kw", "expected"),
+    [
+        # error beats everything
+        (12, {"last_error": "boom", "buffer_rows": 5}, "error"),
+        (10, {"flushing": True}, "flushing"),
+        # reads behind the source: genuinely lagging
+        (12, {"position_snapshot": 10}, "lagging"),
+        # read-current, data awaiting flush: the buffering design working
+        (12, {"position_snapshot": 12, "buffer_rows": 5}, "buffering"),
+        # read-current, empty buffer but unpersisted position advance
+        (12, {"position_snapshot": 12, "flushed_snapshot": 10}, "buffering"),
+        (10, {}, "healthy"),
+    ],
+)
+def test_derive_dest_status(snap_now, kw, expected):
+    """Between flushes the cursor always trails the source; that must NOT
+    display as 'lagging' — only reads being behind is operationally lag."""
+    assert _derive_dest_status(_delivery_status(**kw), snap_now) == expected

@@ -40,3 +40,7 @@ poll:
 
 server:
   port: 8000
+
+delivery:
+  workers: 4
+  flush_interval_seconds: 15

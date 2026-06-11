@@ -64,12 +64,13 @@ def test_pool_evicts_lru_when_full(pool):
         return cat, tbl
 
     with patch.object(pool, "_create", side_effect=mock_create):
-        pool.get("a")
-        pool.get("b")
-        pool.get("c")
+        for d in ("a", "b", "c"):
+            pool.get(d)
+            pool.release(d)
         assert pool.size == 3
 
         pool.get("d")  # should evict "a"
+        pool.release("d")
         assert pool.size == 3
 
     catalogs["a"].close.assert_called_once()
@@ -85,11 +86,9 @@ def test_pool_lru_order_updated_on_access(pool):
         return cat, tbl
 
     with patch.object(pool, "_create", side_effect=mock_create):
-        pool.get("a")
-        pool.get("b")
-        pool.get("c")
-        pool.get("a")  # move "a" to end
-        pool.get("d")  # should evict "b" (the actual LRU)
+        for d in ("a", "b", "c", "a", "d"):
+            pool.get(d)  # "a" twice: moves to MRU; "d" evicts "b" (true LRU)
+            pool.release(d)
 
     catalogs["b"].close.assert_called_once()
     catalogs["a"].close.assert_not_called()
@@ -103,6 +102,7 @@ def test_pool_evict_removes_connection(pool):
 
     with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock())):
         pool.get("team-123")
+        pool.release("team-123")
 
     pool.evict("team-123")
     assert pool.size == 0
@@ -153,8 +153,10 @@ def test_pool_max_open_one_works():
 
     with patch.object(pool, "_create", side_effect=mock_create):
         pool.get("a")
+        pool.release("a")
         assert pool.size == 1
         pool.get("b")  # evicts "a"
+        pool.release("b")
         assert pool.size == 1
 
     catalogs["a"].close.assert_called_once()
@@ -181,11 +183,12 @@ def test_pool_eviction_close_failure_continues(pool):
         return cat, MagicMock()
 
     with patch.object(pool, "_create", side_effect=mock_create):
-        pool.get("a")
-        pool.get("b")
-        pool.get("c")
+        for d in ("a", "b", "c"):
+            pool.get(d)
+            pool.release(d)
         # Evicting "a" will fail on close(), but "d" should still be added
         pool.get("d")
+        pool.release("d")
         assert pool.size == 3
 
 
@@ -262,6 +265,7 @@ def test_pool_lru_correctness_at_scale():
     with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock())):
         for i in range(100):
             pool.get(f"dest-{i}")
+            pool.release(f"dest-{i}")
 
     assert pool.size == 10
     for i in range(90, 100):
@@ -269,3 +273,52 @@ def test_pool_lru_correctness_at_scale():
     for i in range(90):
         assert f"dest-{i}" not in pool._pool
     assert mock_catalog.close.call_count == 90
+
+
+# --- Lease/pinning semantics (buffered-delivery worker pool) ---
+
+
+def test_pool_pinned_entry_not_lru_evicted():
+    """A pinned (leased, unreleased) entry must survive LRU pressure."""
+    pool = DestinationPool(MagicMock(), max_open=2)
+    catalogs = {}
+
+    def mock_create(dest_id):
+        cat = MagicMock()
+        catalogs[dest_id] = cat
+        return cat, MagicMock()
+
+    with patch.object(pool, "_create", side_effect=mock_create):
+        pool.get("pinned")  # NOT released — a worker mid-transaction
+        pool.get("b")
+        pool.release("b")
+        pool.get("c")  # at capacity: must evict "b", not the pinned entry
+        pool.release("c")
+
+    catalogs["pinned"].close.assert_not_called()
+    catalogs["b"].close.assert_called_once()
+    pool.release("pinned")
+
+
+def test_pool_evict_while_pinned_defers_close():
+    """Force-evict of a pinned entry defers the close to the final release."""
+    pool = DestinationPool(MagicMock(), max_open=3)
+    cat = MagicMock()
+
+    with patch.object(pool, "_create", return_value=(cat, MagicMock())):
+        pool.get("d1")  # pinned
+
+    pool.evict("d1")
+    cat.close.assert_not_called()  # still leased
+    pool.release("d1")
+    cat.close.assert_called_once()  # closed at final release
+
+
+def test_pool_all_pinned_overshoots_instead_of_deadlock():
+    pool = DestinationPool(MagicMock(), max_open=1)
+    with patch.object(pool, "_create", side_effect=lambda d: (MagicMock(), MagicMock())):
+        pool.get("a")  # pinned
+        pool.get("b")  # capacity exceeded but "a" is pinned -> overshoot
+        assert pool.size == 2
+    pool.release("a")
+    pool.release("b")

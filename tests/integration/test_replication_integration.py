@@ -13,10 +13,11 @@ from pyducklake import Catalog, Schema
 from pyducklake.types import IntegerType, NestedField, StringType
 
 from viaduck import metrics
+from viaduck.apply import _apply_changes, _resolve_conflicts
 from viaduck.config import RoutingConfig, StateConfig
-from viaduck.main import _apply_changes, _resolve_conflicts, _resolve_preimages, _seed_new_destinations
+from viaduck.main import _resolve_preimages, _seed_new_destinations
 from viaduck.router import Router
-from viaduck.source import META_COLUMNS, strip_meta
+from viaduck.source import META_COLUMNS, read_cdc, read_cdc_changes, strip_meta
 from viaduck.state import StateManager
 
 pytestmark = pytest.mark.integration
@@ -300,10 +301,10 @@ def test_full_cdc_insert_then_delete_same_key(source_catalog, source_table, dest
 # ---------------------------------------------------------------------------
 
 
-def test_state_manager_round_trip(source_catalog):
+def test_state_manager_round_trip(pg_uri, state_table_name):
     """Create a real StateManager, initialize destinations, advance cursors, verify persistence."""
-    state_cfg = StateConfig(table="_viaduck_state_test")
-    sm = StateManager(source_catalog, "test-instance", state_cfg)
+    state_cfg = StateConfig(table=state_table_name)
+    sm = StateManager(pg_uri, "test-instance", state_cfg)
 
     dest_ids = ["dest-alpha", "dest-beta"]
     sm.initialize_destinations(dest_ids)
@@ -454,7 +455,7 @@ def test_strip_meta_on_real_cdc_data(source_table):
 # ---------------------------------------------------------------------------
 
 
-def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_table_a):
+def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_table_a, pg_uri, state_table_name):
     """Seed a new destination from a source with 4 rows (2 acme, 2 beta).
 
     Verify destination gets only the 2 matching rows and cursor is at current snapshot.
@@ -474,8 +475,8 @@ def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_tabl
     assert snap is not None
 
     # Set up StateManager
-    state_cfg = StateConfig(table="_viaduck_seed_test")
-    sm = StateManager(source_catalog, "seed-instance", state_cfg)
+    state_cfg = StateConfig(table=state_table_name)
+    sm = StateManager(pg_uri, "seed-instance", state_cfg)
     sm.initialize_destinations(["dest-acme"])
 
     # Build a mock cfg that points at real routing config and destination
@@ -508,3 +509,89 @@ def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_tabl
     # Verify cursor is at the snapshot the seed function observed
     cursors = sm.load_cursors(["dest-acme"])
     assert cursors["dest-acme"].last_snapshot_id == expected_snap
+
+
+def test_seed_rejects_duplicate_keys(source_table, dest_catalog_a, dest_table_a, pg_uri, state_table_name):
+    """DuckLake can't enforce key uniqueness; the seed scan verifies it per
+    partition and refuses to advance the cursor on violation — duplicate
+    source keys would otherwise over-delete (delete-by-key) and duplicate
+    (upsert with duplicate join keys) on the destination."""
+    from unittest.mock import MagicMock
+
+    from viaduck.router import RoutingError
+
+    # event_id 1 appears twice in the acme partition.
+    source_table.append(_arrow_rows([1, 1, 2], ["acme", "acme", "acme"], [10, 11, 20]))
+
+    state_cfg = StateConfig(table=state_table_name)
+    sm = StateManager(pg_uri, "seed-instance", state_cfg)
+    sm.initialize_destinations(["dest-acme"])
+
+    cfg = MagicMock()
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = ["event_id"]
+    cfg.routing.seed_mode = "scan"
+    dest_cfg = MagicMock()
+    dest_cfg.routing_value = "acme"
+    cfg.destination_by_id.return_value = dest_cfg
+    dest_pool = MagicMock()
+    dest_pool.get.return_value = (dest_catalog_a, dest_table_a)
+
+    with pytest.raises(RoutingError, match="not unique"):
+        _seed_new_destinations(source_table, sm, dest_pool, cfg, ["dest-acme"])
+
+    # Cursor untouched: the seed re-runs after the operator fixes the source.
+    assert sm.load_cursors(["dest-acme"])["dest-acme"].last_snapshot_id == 0
+    sm.close()
+
+
+def test_read_cdc_changes_excludes_start_snapshot(source_table):
+    """read_cdc_changes takes start_snapshot = the last delivered snapshot
+    and must read (start, end]: ducklake's table_changes is inclusive on
+    both bounds, so an unadjusted read re-delivers the cursor snapshot."""
+    source_table.append(_arrow_rows([1], ["acme"], [10]))
+    insert_snap = source_table.current_snapshot().snapshot_id
+
+    source_table.delete("event_id = 1")
+    delete_snap = source_table.current_snapshot().snapshot_id
+
+    cdc = read_cdc_changes(source_table, after_snapshot=insert_snap, end_snapshot=delete_snap)
+    assert cdc.column("change_type").to_pylist() == ["delete"]
+    assert cdc.column("snapshot_id").to_pylist() == [delete_snap]
+
+
+def test_read_cdc_excludes_after_snapshot_append_only(source_table):
+    """Append-only path: re-reading the cursor snapshot re-appends its rows
+    verbatim — no Phase 2 to cancel and no upsert idempotence to mask it.
+    read_cdc must read (after_snapshot, end_snapshot]."""
+    source_table.append(_arrow_rows([1], ["acme"], [10]))
+    first_snap = source_table.current_snapshot().snapshot_id
+    source_table.append(_arrow_rows([2], ["acme"], [20]))
+    second_snap = source_table.current_snapshot().snapshot_id
+
+    rows = read_cdc(source_table, after_snapshot=first_snap, end_snapshot=second_snap)
+    assert rows.column("event_id").to_pylist() == [2]
+
+
+def test_seed_boundary_delete_not_cancelled_by_reread(source_table, dest_catalog_a, dest_table_a):
+    """Soak-found phantom regression: a destination seeded at snapshot S has
+    its cursor at S. If the next CDC read re-includes snapshot S, the
+    re-read insert pairs with the row's later delete in Phase 2 — both
+    cancel, the delete is lost, and the seeded copy is a permanent phantom."""
+    source_table.append(_arrow_rows([1, 2], ["acme", "acme"], [10, 20]))
+    seed_snap = source_table.current_snapshot().snapshot_id
+
+    # Seed: full scan at seed_snap, cursor = seed_snap.
+    dest_table_a.append(source_table.scan().to_arrow())
+
+    # Row 1 deleted after the seed.
+    source_table.delete("event_id = 1")
+    current = source_table.current_snapshot().snapshot_id
+
+    cdc_data = read_cdc_changes(source_table, after_snapshot=seed_snap, end_snapshot=current)
+    resolved = _resolve_conflicts(_resolve_preimages(cdc_data, "company", ["event_id"]))
+    counts = _apply_changes(dest_catalog_a, dest_table_a, resolved, ["event_id"])
+    assert counts["deleted"] == 1
+
+    dest_scan = _read_all(dest_table_a)
+    assert dest_scan.column("event_id").to_pylist() == [2]

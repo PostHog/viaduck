@@ -67,10 +67,10 @@ def test_load_defaults_applied(config_file: Path):
     assert cfg.poll.interval_seconds == 5.0
     assert cfg.server.port == 8000
     assert cfg.web.enabled is True
-    assert cfg.web.port == 8001
     assert cfg.instance.id == "viaduck-0"
     assert cfg.instance.partition.mode == "all"
-    assert cfg.state.table == "_viaduck_state"
+    assert cfg.state.table == "viaduck_state"
+    assert cfg.state.postgres_uri_env is None
 
 
 def test_load_missing_file():
@@ -378,7 +378,6 @@ server:
 
 web:
   enabled: false
-  port: 9001
 
 state:
   table: _my_state
@@ -392,7 +391,6 @@ instance:
     assert cfg.poll.interval_seconds == 10.0
     assert cfg.server.port == 9000
     assert cfg.web.enabled is False
-    assert cfg.web.port == 9001
     assert cfg.state.table == "_my_state"
     assert cfg.instance.id == "prod-0"
     assert cfg.source.resolved_properties() == {"s3_access_key_id": "mykey"}
@@ -469,3 +467,44 @@ def test_load_with_seed_mode(tmp_path: Path):
     p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  seed_mode: cdc_replay"))
     cfg = load(p)
     assert cfg.routing.seed_mode == "cdc_replay"
+
+
+def test_state_postgres_uri_defaults_to_source(config_file, monkeypatch):
+    """state.postgres_uri_env unset → the cursor store shares the source
+    catalog's Postgres."""
+    monkeypatch.setenv("SRC_PG", "postgresql://src:5432/meta")
+    cfg = load(config_file)
+    assert cfg.state.resolve_postgres_uri(cfg.source) == "postgresql://src:5432/meta"
+
+
+def test_state_postgres_uri_explicit_override(config_file, monkeypatch, tmp_path):
+    import yaml as _yaml
+
+    raw = _yaml.safe_load(config_file.read_text())
+    raw["state"] = {"postgres_uri_env": "STATE_PG_URI"}
+    override = tmp_path / "viaduck-state-override.yaml"
+    override.write_text(_yaml.dump(raw))
+    monkeypatch.setenv("STATE_PG_URI", "postgresql://state-host:5432/cursors")
+    cfg = load(override)
+    assert cfg.state.resolve_postgres_uri(cfg.source) == "postgresql://state-host:5432/cursors"
+
+
+def test_state_uri_translates_duckdb_attach_format(config_file, monkeypatch):
+    """The source URI uses DuckDB's ATTACH format ('postgres:' + libpq
+    keyword/value). The state store must receive valid libpq conninfo."""
+    monkeypatch.setenv("SRC_PG", "postgres:host=postgres-source port=5432 dbname=meta user=v password=x")
+    cfg = load(config_file)
+    assert cfg.state.resolve_postgres_uri(cfg.source) == (
+        "host=postgres-source port=5432 dbname=meta user=v password=x"
+    )
+
+
+def test_state_uri_passes_through_libpq_forms(config_file, monkeypatch):
+    for raw in (
+        "postgresql://u:p@h:5432/db",
+        "postgres://u:p@h:5432/db",
+        "host=h port=5432 dbname=db",
+    ):
+        monkeypatch.setenv("SRC_PG", raw)
+        cfg = load(config_file)
+        assert cfg.state.resolve_postgres_uri(cfg.source) == raw

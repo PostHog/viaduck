@@ -23,8 +23,9 @@ import pyarrow as pa
 import pytest
 
 from viaduck import metrics
+from viaduck.apply import _build_delete_filter, _resolve_conflicts
 from viaduck.config import RoutingConfig
-from viaduck.main import _build_delete_filter, _resolve_conflicts, _resolve_preimages
+from viaduck.main import _resolve_preimages
 from viaduck.router import Router
 
 
@@ -195,6 +196,33 @@ def test_resolve_preimages_large_batch(perf_timer):
     assert "update_preimage" not in result.column("change_type").to_pylist()
 
 
+@pytest.mark.perf
+def test_resolve_preimages_matched_pairs(perf_timer):
+    """50K rows of MATCHED update pre/postimage pairs — exercises the
+    join-probe-hit and same-tenant-drop paths, which the mixed batch
+    (unique rowids, all orphans) never reaches."""
+    n_pairs = 25_000
+    rowids = list(range(n_pairs)) * 2
+    change_types = ["update_preimage"] * n_pairs + ["update_postimage"] * n_pairs
+    companies = [f"dest_{i % 50}" for i in range(n_pairs)] * 2
+    batch = pa.table(
+        {
+            "change_type": pa.array(change_types, type=pa.string()),
+            "rowid": pa.array(rowids, type=pa.int64()),
+            "company": pa.array(companies, type=pa.string()),
+            "value": pa.array(list(range(n_pairs)) * 2, type=pa.int64()),
+        }
+    )
+
+    with perf_timer("resolve_preimages_matched", "50K rows, all matched pairs") as t:
+        result = _resolve_preimages(batch, "company", ["value"])
+
+    print(f"_resolve_preimages (50K rows, matched pairs): {t.elapsed:.3f}s")
+    assert t.elapsed < 2.0, f"Took {t.elapsed:.3f}s, expected < 2s"
+    # All preimages dropped (same-tenant), all postimages kept.
+    assert result.num_rows == n_pairs
+
+
 # ---------------------------------------------------------------------------
 # _resolve_conflicts performance
 # ---------------------------------------------------------------------------
@@ -258,3 +286,118 @@ def test_build_delete_filter_composite_key_large(perf_timer):
     assert isinstance(sql, str) and len(sql) > 0
     assert "AND" in sql
     assert "OR" in sql
+
+
+# ---------------------------------------------------------------------------
+# End-to-end delivery fanout: DeliveryManager + worker pool + real local
+# DuckLake destination catalogs (DuckDB files, no Postgres). Measures the
+# full buffer -> flush -> Phase 2/3 apply path at high destination counts.
+#
+# Limitations: cursor persistence is mocked (no Postgres in the perf env),
+# so PG round-trips per flush are excluded; destination catalogs are local
+# DuckDB files, so object-store latency is excluded. Both costs are per
+# flush, not per destination-count, so the SCALING shape is honest even
+# though absolute numbers flatter production.
+# ---------------------------------------------------------------------------
+
+
+def _make_fanout_pool(tmp_path, n_dests: int, max_open: int):
+    import os
+    from unittest.mock import MagicMock
+
+    from viaduck.destination import DestinationPool
+
+    dests = {}
+    for i in range(n_dests):
+        dest_id = f"d{i}"
+        base = tmp_path / dest_id
+        os.makedirs(base / "data", exist_ok=True)
+        d = MagicMock()
+        d.id = dest_id
+        d.name = dest_id
+        d.postgres_uri = str(base / "meta.duckdb")
+        d.data_path = str(base / "data")
+        d.table = "events"
+        d.resolved_properties.return_value = {}
+        dests[dest_id] = d
+
+    cfg = MagicMock()
+    cfg.destination_by_id = lambda d: dests[d]
+    pool = DestinationPool(cfg, max_open=max_open)
+
+    from pyducklake import Schema
+    from pyducklake.types import IntegerType, NestedField, StringType
+
+    pool.set_source_schema(
+        Schema(
+            NestedField(field_id=1, name="event_id", field_type=IntegerType(), required=True),
+            NestedField(field_id=2, name="company", field_type=StringType(), required=True),
+            NestedField(field_id=3, name="value", field_type=IntegerType()),
+        )
+    )
+    return pool
+
+
+def _fanout_cdc_batch(dest_id: str, rows_per_dest: int) -> pa.Table:
+    return pa.table(
+        {
+            "event_id": pa.array(list(range(rows_per_dest)), type=pa.int32()),
+            "company": pa.array([dest_id] * rows_per_dest, type=pa.string()),
+            "value": pa.array(list(range(rows_per_dest)), type=pa.int32()),
+            "change_type": pa.array(["insert"] * rows_per_dest, type=pa.string()),
+            "snapshot_id": pa.array([1] * rows_per_dest, type=pa.int64()),
+            "rowid": pa.array(list(range(rows_per_dest)), type=pa.int64()),
+        }
+    )
+
+
+@pytest.mark.perf
+@pytest.mark.parametrize("n_dests", [200, 500, 1000])
+def test_delivery_fanout(perf_timer, tmp_path, n_dests):
+    """Full-CDC flush of 100 rows to each of N destinations through the
+    DeliveryManager worker pool (workers=8, pool max_open=100 — the
+    production default, so LRU eviction is exercised above 100 dests)."""
+    from unittest.mock import MagicMock
+
+    from viaduck.config import DeliveryConfig
+    from viaduck.delivery import DeliveryManager
+
+    rows_per_dest = 100
+    dest_ids = [f"d{i}" for i in range(n_dests)]
+    pool = _make_fanout_pool(tmp_path, n_dests, max_open=100)
+
+    state = MagicMock()
+    state.load_cursors.return_value = {}
+
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=8, flush_interval_seconds=0.0),
+        state,
+        pool,
+        ["event_id"],
+        dest_ids,
+    )
+
+    for d in dest_ids:
+        mgr.buffer(d, _fanout_cdc_batch(d, rows_per_dest), through_snapshot=1)
+
+    with perf_timer("delivery_fanout", f"{n_dests} dests, {rows_per_dest} rows each") as t:
+        submitted = mgr.maybe_flush()
+        assert submitted == n_dests
+        assert mgr.wait_idle(timeout_s=600)
+
+    assert t.elapsed < 600, f"Took {t.elapsed:.1f}s, expected < 600s"
+    statuses = mgr.status_snapshot()
+    failed = [d for d in dest_ids if statuses[d].last_error is not None]
+    assert not failed, f"{len(failed)} destinations failed: {failed[:5]}"
+    assert all(statuses[d].flushed_snapshot == 1 for d in dest_ids)
+    # Every row actually applied — a flush that silently wrote nothing
+    # would otherwise pass on timing alone.
+    assert all(statuses[d].rows_replicated == rows_per_dest for d in dest_ids)
+
+    total_rows = n_dests * rows_per_dest
+    print(
+        f"delivery fanout ({n_dests} dests, {total_rows} rows): {t.elapsed:.2f}s "
+        f"= {n_dests / t.elapsed:.0f} dests/s, {total_rows / t.elapsed:.0f} rows/s"
+    )
+    mgr.drain(timeout_s=30)
+    pool.close_all()

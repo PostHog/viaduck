@@ -25,6 +25,7 @@ dependencies = [
     # which masked the issue under tests but broke prod with
     # `ModuleNotFoundError: No module named 'pytz'` on first snapshot call.
     "pytz>=2026.1",
+    "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]
@@ -34,6 +35,7 @@ viaduck = "viaduck.main:main"
 dev = [
     "pytest>=8.0",
     "ruff>=0.8",
+    "testcontainers>=4.0",
 ]
 
 [tool.ruff]

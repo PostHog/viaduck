@@ -141,7 +141,6 @@ class ServerConfig:
 @dataclass(frozen=True)
 class WebConfig:
     enabled: bool = True
-    port: int = 8001
 
 
 @dataclass(frozen=True)
@@ -169,9 +168,66 @@ class InstanceConfig:
     partition: PartitionConfig = field(default_factory=PartitionConfig)
 
 
+def _to_libpq_conninfo(uri: str) -> str:
+    """Translate the source catalog's URI format into something psycopg accepts.
+
+    The source/destination `postgres_uri_env` values use DuckDB's ATTACH
+    format: ``postgres:host=H port=P dbname=DB ...`` — a ``postgres:``
+    prefix on a libpq keyword/value string. psycopg rejects that verbatim
+    (no ``//``, so libpq parses ``postgres:host`` as an invalid keyword).
+    Stripping the prefix yields a valid libpq conninfo. Real libpq URIs
+    (``postgresql://`` / ``postgres://``) and bare keyword/value strings
+    pass through untouched.
+    """
+    if uri.startswith(("postgresql://", "postgres://")):
+        return uri
+    if uri.startswith("postgres:"):
+        return uri[len("postgres:") :]
+    return uri
+
+
 @dataclass(frozen=True)
 class StateConfig:
-    table: str = "_viaduck_state"
+    table: str = "viaduck_state"
+    # Dedicated schema so viaduck's bookkeeping never pollutes the ducklake
+    # catalog's namespace, and a future scoped-down PG user has a clean
+    # GRANT boundary (USAGE on schema + table grants).
+    schema: str = "viaduck"
+    # Postgres for the cursor store. Defaults to the source catalog's URI
+    # (the same database already hosting the ducklake metadata). Set
+    # explicitly when the source catalog isn't Postgres-backed (e.g. a
+    # local DuckDB file in dev).
+    postgres_uri_env: str | None = None
+
+    def resolve_postgres_uri(self, source: SourceConfig) -> str:
+        env = self.postgres_uri_env or source.postgres_uri_env
+        return _to_libpq_conninfo(_resolve_env_value(env))
+
+
+@dataclass(frozen=True)
+class DeliveryConfig:
+    """Buffered-delivery knobs. CDC reads happen at poll cadence; destination
+    writes happen at flush cadence — per-destination buffers accumulate
+    between flushes (see tla/Viaduck.tla for the verified semantics).
+
+    workers=1 + flush_interval_seconds=0 reproduces the pre-buffering
+    behavior (flush every cycle, serial)."""
+
+    workers: int = 8
+    flush_interval_seconds: float = 120.0
+    flush_max_rows: int = 500_000
+    flush_max_bytes: int = 268_435_456  # 256 MiB per destination
+    buffer_total_max_bytes: int = 1_073_741_824  # 1 GiB across all buffers
+    pool_max_open: int = 100  # destination connection pool size
+
+    def __post_init__(self):
+        if self.workers < 1:
+            raise ConfigError(f"delivery.workers must be >= 1, got {self.workers}")
+        if self.flush_interval_seconds < 0:
+            raise ConfigError(f"delivery.flush_interval_seconds must be >= 0, got {self.flush_interval_seconds}")
+        for name in ("flush_max_rows", "flush_max_bytes", "buffer_total_max_bytes", "pool_max_open"):
+            if getattr(self, name) < 1:
+                raise ConfigError(f"delivery.{name} must be >= 1, got {getattr(self, name)}")
 
 
 @dataclass(frozen=True)
@@ -184,6 +240,7 @@ class ViaduckConfig:
     web: WebConfig = field(default_factory=WebConfig)
     instance: InstanceConfig = field(default_factory=InstanceConfig)
     state: StateConfig = field(default_factory=StateConfig)
+    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
 
     def __post_init__(self):
         if not self.destinations:
@@ -306,13 +363,26 @@ def load(path: str | Path) -> ViaduckConfig:
     server = ServerConfig(port=server_raw.get("port", 8000))
 
     web_raw = raw.get("web", {})
-    web = WebConfig(
-        enabled=web_raw.get("enabled", True),
-        port=web_raw.get("port", 8001),
-    )
+    web = WebConfig(enabled=web_raw.get("enabled", True))
 
     state_raw = raw.get("state", {})
-    state = StateConfig(table=state_raw.get("table", "_viaduck_state"))
+    state = StateConfig(
+        table=state_raw.get("table", "viaduck_state"),
+        schema=state_raw.get("schema", "viaduck"),
+        postgres_uri_env=state_raw.get("postgres_uri_env") or None,
+    )
+
+    delivery_raw = raw.get("delivery", {})
+    delivery = DeliveryConfig(
+        workers=_validate_int(delivery_raw.get("workers", 8), "delivery.workers"),
+        flush_interval_seconds=float(delivery_raw.get("flush_interval_seconds", 120.0)),
+        flush_max_rows=_validate_int(delivery_raw.get("flush_max_rows", 500_000), "delivery.flush_max_rows"),
+        flush_max_bytes=_validate_int(delivery_raw.get("flush_max_bytes", 268_435_456), "delivery.flush_max_bytes"),
+        buffer_total_max_bytes=_validate_int(
+            delivery_raw.get("buffer_total_max_bytes", 1_073_741_824), "delivery.buffer_total_max_bytes"
+        ),
+        pool_max_open=_validate_int(delivery_raw.get("pool_max_open", 100), "delivery.pool_max_open"),
+    )
 
     inst_raw = raw.get("instance", {})
     part_raw = inst_raw.get("partition", {})
@@ -336,4 +406,5 @@ def load(path: str | Path) -> ViaduckConfig:
         web=web,
         instance=instance,
         state=state,
+        delivery=delivery,
     )
