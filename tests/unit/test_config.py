@@ -67,7 +67,6 @@ def test_load_defaults_applied(config_file: Path):
     assert cfg.poll.interval_seconds == 5.0
     assert cfg.server.port == 8000
     assert cfg.web.enabled is True
-    assert cfg.web.port == 8001
     assert cfg.instance.id == "viaduck-0"
     assert cfg.instance.partition.mode == "all"
     assert cfg.state.table == "viaduck_state"
@@ -379,7 +378,6 @@ server:
 
 web:
   enabled: false
-  port: 9001
 
 state:
   table: _my_state
@@ -393,7 +391,6 @@ instance:
     assert cfg.poll.interval_seconds == 10.0
     assert cfg.server.port == 9000
     assert cfg.web.enabled is False
-    assert cfg.web.port == 9001
     assert cfg.state.table == "_my_state"
     assert cfg.instance.id == "prod-0"
     assert cfg.source.resolved_properties() == {"s3_access_key_id": "mykey"}

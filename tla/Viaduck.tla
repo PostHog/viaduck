@@ -44,11 +44,11 @@
 (* eventual consistency is guaranteed for executions with no               *)
 (* commit/cursor-gap crash (see the everCrashed comment below).            *)
 (*                                                                         *)
-(* MODEL SIZE: with Keys={1,2}, Dests={d1,d2}, MaxOps=4, TLC checks all 7  *)
-(* invariants over 26,753,473 distinct states (251.8M generated, depth     *)
-(* 20) in ~3 minutes. The unbuffered predecessor model was 730,153         *)
+(* MODEL SIZE: with Keys={1,2}, Dests={d1,d2}, MaxOps=4, TLC checks all 9  *)
+(* invariants over 31,406,425 distinct states (332.7M generated, depth     *)
+(* 21) in ~5 minutes. The unbuffered predecessor model was 730,153         *)
 (* distinct states — the growth is the BufferRead/FlushStart/FlushCommit  *)
-(* interleavings and the crash actions.                                    *)
+(* interleavings and the crash actions (incl. FlushCommitNoCursor).        *)
 (***************************************************************************)
 
 EXTENDS Integers, FiniteSets, TLC
@@ -284,6 +284,7 @@ FlushFail(d, i) ==
 \* for the same rowid cancel in Phase 2, but the destination already has the
 \* row from the crashed write. This leaves phantom data — inherent to
 \* at-least-once delivery without cross-catalog transactions.
+\* See FlushCommitNoCursor for the non-crash variant of the same window.
 CrashDuringFlush(d, i) ==
     /\ DestOwner[d] = i
     /\ flushing[d]
@@ -293,6 +294,27 @@ CrashDuringFlush(d, i) ==
     /\ flushing' = [e \in Dests |-> FALSE]
     /\ inflight' = [e \in Dests |-> {}]
     /\ inflightThrough' = [e \in Dests |-> 0]
+    /\ everCrashed' = TRUE
+    /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, cursors, opCount>>
+
+\* The commit/cursor gap WITHOUT a process crash: the destination
+\* transaction committed but the cursor persist failed (a PG outage
+\* outlasting the implementation's in-process retry,
+\* delivery.py:_advance_cursor_with_retry). The worker takes the failure
+\* path with the write already landed: only THIS destination's buffers
+\* and read position reset (the process keeps running, other destinations
+\* are untouched — unlike CrashDuringFlush, which loses everything).
+\* Same at-least-once window, same phantom limitation, so it sets
+\* everCrashed.
+FlushCommitNoCursor(d, i) ==
+    /\ DestOwner[d] = i
+    /\ flushing[d]
+    /\ dstRows' = [dstRows EXCEPT ![d] = Phase3Apply(d, Phase2(inflight[d]))]
+    /\ flushing' = [flushing EXCEPT ![d] = FALSE]
+    /\ inflight' = [inflight EXCEPT ![d] = {}]
+    /\ inflightThrough' = [inflightThrough EXCEPT ![d] = 0]
+    /\ buffered' = [buffered EXCEPT ![d] = {}]
+    /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = cursors[d]]
     /\ everCrashed' = TRUE
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, cursors, opCount>>
 
@@ -370,6 +392,13 @@ AllCleanAndCurrent ==
     /\ \A d \in Dests : cursors[d] = srcSnap /\ buffered[d] = {} /\ ~flushing[d]
     /\ ~everCrashed
 
+\* Quiescence WITHOUT the no-crash condition: used by the invariants that
+\* hold even in executions containing commit/cursor-gap events. The
+\* at-least-once window can only ADD rows (phantoms), never lose or
+\* misroute them.
+AllCleanAndCurrentAnyCrash ==
+    \A d \in Dests : cursors[d] = srcSnap /\ buffered[d] = {} /\ ~flushing[d]
+
 \* Eventual consistency: destinations exactly match source partitions.
 EventualConsistency ==
     AllCleanAndCurrent =>
@@ -399,6 +428,26 @@ CursorMonotonicity ==
 \* Rows only in the destination matching their routing value.
 PartitionCorrectness ==
     AllCleanAndCurrent =>
+    (\A d \in Dests :
+        \A r \in dstRows[d] : r.rv = RoutingMap[d])
+
+\* NEW: data loss never happens, even in executions containing
+\* commit/cursor-gap events (crash or cursor-persist failure). This is the
+\* checked form of the README's "there is no data loss path" claim — the
+\* window produces phantoms (extra rows), never missing rows.
+NoDataLossEvenAfterCrash ==
+    AllCleanAndCurrentAnyCrash =>
+    (\A r \in srcRows :
+        \E d \in Dests :
+            RoutingMap[d] = r.rv /\
+            \E dr \in dstRows[d] : dr.key = r.key)
+
+\* NEW: partition correctness also holds through crash windows — a row can
+\* be stale or phantom, but never in the WRONG destination (routing
+\* immutability means every CDC event and seed row carries its final
+\* routing value).
+PartitionCorrectnessEvenAfterCrash ==
+    AllCleanAndCurrentAnyCrash =>
     (\A d \in Dests :
         \A r \in dstRows[d] : r.rv = RoutingMap[d])
 
@@ -453,6 +502,8 @@ Next ==
          FlushFail(d, i)
     \/ \E d \in Dests, i \in Instances :
          CrashDuringFlush(d, i)
+    \/ \E d \in Dests, i \in Instances :
+         FlushCommitNoCursor(d, i)
     \/ ProcessCrash
     \/ \E d \in Dests, i \in Instances :
          SeedDestination(d, i)

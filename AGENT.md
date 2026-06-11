@@ -33,29 +33,43 @@ Prefer fixup commits over amending and force-pushing.
 
 ## What This Is
 
-A standalone Python app that replicates data from a source DuckLake table to N destination DuckLake tables using pyducklake's CDC (Change Data Capture) API. Supports INSERT, DELETE, and UPDATE replication. Single thread, single poll loop, no framework.
+A standalone Python app that replicates data from a source DuckLake table to N destination DuckLake tables using pyducklake's CDC (Change Data Capture) API. Supports INSERT, DELETE, and UPDATE replication. One poll thread reads and buffers; a flush worker pool writes destinations. No framework.
 
-Routes rows by a configurable field (e.g. `company`) to per-destination tables. Designed for high fanout (100s-1000s of destinations).
+Routes rows by a configurable field (e.g. `company`) to per-destination tables. Designed for high fanout (measured flat at ~43 destinations/s through 1000 destinations).
 
 ## Architecture
 
 ```
 Source DuckLake
-  ├── {source_table}         ← CDC source (table_changes / table_insertions)
-  └── _viaduck_state         ← per-destination replication cursors
+  └── {source_table}         ← CDC source (table_changes / table_insertions)
 
-Viaduck (single-threaded poll loop)
-  1. current_snapshot() on source table
-  2. Group destinations by last_snapshot_id → grouped CDC reads
-  3. If key_columns: table_changes() → Phase 1-2-3 apply
-     Else: table_insertions() → append()
-  4. Update _viaduck_state on source
+Postgres (same DB as source ducklake metadata by default)
+  └── viaduck.viaduck_state  ← persisted cursors (plain table in a dedicated schema, NOT ducklake)
+
+Viaduck
+  poll thread (poll cadence):
+    1. current_snapshot() on source table
+    2. Group destinations by in-memory read position → grouped CDC reads,
+       half-open ranges (position, current]
+    3. If key_columns: table_changes() → Phase 1 → route → buffer
+       Else: table_insertions() → route → buffer
+    4. Evaluate flush triggers (interval/rows/bytes/memory/shutdown)
+  flush workers (delivery.workers threads, flush cadence):
+    5. Phase 2 (conflict resolution) on the concatenated buffer
+    6. Phase 3 (Winner(k) dedup, delete+upsert in one txn)
+    7. advance_cursor() → Postgres upsert, monotonicity-guarded
 
 Destination DuckLakes (N independent catalogs)
   └── {dest_table}           ← receives routed rows
 ```
 
-## CDC Algorithm: Three Assumptions
+Position model: `flushed` (persisted cursor) <= `position` (in-memory
+bufferedThrough). Reads issue from `position`; a flush failure drops the
+buffers and resets `position = flushed` (range re-read, at-least-once).
+Read epochs make the slow CDC read atomic against concurrent failure
+resets. See `viaduck/delivery.py` module docstring and `tla/Viaduck.tla`.
+
+## CDC Algorithm: Four Assumptions
 
 The 3-phase CDC algorithm is eventually consistent under these assumptions:
 
@@ -75,6 +89,12 @@ The 3-phase CDC algorithm is eventually consistent under these assumptions:
    at-least-once idempotency — a retried delete could remove a row inserted by
    another writer.
 
+4. **Key uniqueness**: `key_columns` must be unique per row in the source (DuckLake
+   has no unique constraints to enforce this). Violations mean delete-by-key
+   over-deletes and duplicate-key upserts duplicate. Verified at seed time per
+   partition (`main.py:_verify_seed_key_uniqueness`, fails the seed loudly);
+   post-seed inserts are not re-verified.
+
 ## CDC Algorithm: Three Phases
 
 **Phase 1: Preimage Resolution** (before routing) — `_resolve_preimages()`
@@ -84,27 +104,41 @@ The 3-phase CDC algorithm is eventually consistent under these assumptions:
 - Orphaned preimages → convert to delete (defensive)
 - Post-condition assertion: no preimages remain
 
-**Phase 2: Conflict Resolution** (per-destination, after routing) — `_resolve_conflicts()`
+**Phase 2: Conflict Resolution** (per-destination, at flush time) — `apply.py:_resolve_conflicts()`
+- Runs on the concatenation of all buffered reads for the flush
 - insert + delete for same rowid → cancel both (net no-op)
 - update_postimage + delete for same rowid → drop postimage, keep delete
+- insert + update_postimage for same rowid → drop insert, keep postimage
 - Post-condition assertion: no rowid in both insert and delete
 
-**Phase 3: Apply** (per-destination, atomic) — `_apply_changes()`
-- Within `catalog.begin_transaction()`: delete first, then upsert
+**Phase 3: Apply** (per-destination, atomic) — `apply.py:_apply_changes()`
+- Winner(k): per-key last-write-wins dedup of upsert candidates by
+  (snapshot_id, rowid) — a buffered window can carry several upserts per key
+- Within `catalog.begin_transaction()`: chunked deletes first, then upsert
 - Crash mid-apply → transaction rolled back, no partial state
 
-CDC batches are processed as unordered sets. This is sound because each batch
-covers a closed snapshot range, batches are applied in ascending snapshot order,
-and within-batch conflicts are resolved by rowid grouping.
+CDC batches are processed as unordered sets. This is sound because each
+flush covers the union of adjacent half-open snapshot ranges
+`(flushed, position]`, flushes apply in ascending range order, and
+cross-read conflicts resolve by rowid grouping at flush time exactly like
+within-read conflicts.
+
+CDC read ranges are EXCLUSIVE of the cursor snapshot (`after_snapshot` in
+`source.py`): ducklake's `table_changes`/`table_insertions` are inclusive
+on both bounds, and re-reading the cursor snapshot lets a re-read insert
+cancel a genuine later delete in Phase 2 (permanent phantom — found by
+the M3 soak at the seed boundary, locked by integration tests).
 
 ## TLA+ Formal Verification
 
 The CDC algorithm is formally specified in `tla/Viaduck.tla` and verified by
 TLC. Run via `flox activate` then `just tlc`. The spec models source operations,
 buffered CDC reads, two-step flushes (buffer swap → commit/fail), concurrent
-per-destination flush workers, seeding, and crash scenarios (safe buffer-loss
-crashes checked unconditionally; commit/cursor-gap crashes conditioned), checking
-7 invariants across 26.8M distinct states (~3 min). Modify the spec when changing
+per-destination flush workers, seeding, and commit/cursor-gap scenarios both
+with and without process death (safe buffer-loss crashes checked
+unconditionally; phantom-window events conditioned via everCrashed — except
+NoDataLoss and PartitionCorrectness, which are also checked through crash
+windows), checking 9 invariants across 31.4M distinct states (~5 min). Modify the spec when changing
 the CDC algorithm or adding new failure modes — and when designing semantic
 changes, extend the spec FIRST and let TLC pass judgment before implementing.
 Always run `just tlc` after spec changes.
@@ -113,32 +147,37 @@ Always run `just tlc` after spec changes.
 
 - **Config via YAML** with `_env` suffix convention for credential indirection
 - **At-least-once semantics**: no cross-catalog transactions; destinations tolerate duplicates
-- **State on source DuckLake**: `_viaduck_state` table tracks per-destination cursors
-- **LRU connection pool**: bounds memory at high fanout (default 50 open connections)
-- **Per-destination error isolation**: one broken destination doesn't block others
-- **Grouped CDC reads**: destinations at the same cursor share a single CDC call
+- **Buffered delivery**: reads at poll cadence, writes at flush cadence (default 120s) — decouples lag visibility from write amplification; `workers: 1, flush_interval_seconds: 0` reproduces unbuffered behavior
+- **State on plain Postgres**: cursor advances must not create catalog snapshots (the snapshot treadmill); lives in a dedicated `viaduck` schema so it never pollutes the ducklake catalog's namespace; upserts carry a monotonicity guard
+- **LRU connection pool with lease pinning**: bounds memory at high fanout (default 100 open connections); eviction never closes a connection mid-transaction
+- **Per-destination error isolation**: one broken destination doesn't block others; a failed flush drops only that destination's buffers
+- **Grouped CDC reads**: destinations at the same read position share a single CDC call
 - **Scan-based seeding**: new destinations bulk-load from a filtered source scan instead of replaying CDC history. Configurable via `seed_mode` (default: `scan`)
+- **Worker threads are a concurrency knob, not a CPU multiplier**: Arrow's compute pool and DuckDB's threads are process-global underneath every flush worker — see README "Worker-thread sizing"
 
 ## Module Layout
 
 | Module | Responsibility |
 |--------|---------------|
-| `main.py` | Entry point, poll loop, 3-phase CDC algorithm, signal handling |
+| `main.py` | Entry point, poll loop, Phase 1 preimage resolution, seeding, signal handling |
+| `delivery.py` | DeliveryManager: per-destination buffers, flush triggers, worker pool, position model |
+| `apply.py` | Phase 2 conflict resolution, Phase 3 delete/upsert + Winner(k), write retry |
 | `config.py` | YAML parsing, env var resolution, frozen dataclass |
-| `source.py` | Source catalog connection, CDC reading (table_changes / table_insertions) |
+| `source.py` | Source catalog connection, CDC reading (table_changes / table_insertions, exclusive start) |
 | `router.py` | Arrow splitting by routing field |
-| `destination.py` | LRU connection pool for destination catalogs |
-| `state.py` | `_viaduck_state` table CRUD |
-| `metrics.py` | Prometheus metric definitions (19 metrics) |
+| `destination.py` | LRU connection pool for destination catalogs, lease pinning |
+| `state.py` | Per-destination cursors on plain Postgres (psycopg) |
+| `arrowutil.py` | Shared Arrow kernel helpers (row_indices, full_bool) |
+| `metrics.py` | Prometheus metric definitions (26 metrics) |
 | `server.py` | HTTP /metrics, /healthz, /readyz, /status, /ui, /ui/sse |
 | `logging_config.py` | Structured logging setup |
 
 ## Testing
 
-- Unit tests: `tests/unit/` — mocked pyducklake, fast (200 tests)
-- Integration tests: `tests/integration/` — real pyducklake with local DuckDB (8 tests)
-- Performance tests: `tests/perf/` — fanout, preimage, conflict, delete filter benchmarks (6 tests)
-- E2E tests: `tests/e2e/` — full docker-compose stack (planned)
+- Unit tests: `tests/unit/` — mocked pyducklake, fast (356 tests)
+- Integration tests: `tests/integration/` — real pyducklake with local DuckDB; Postgres-backed state tests via testcontainers (45 tests)
+- Performance tests: `tests/perf/` — router, phases, delete filter, end-to-end delivery fanout at 200/500/1000 destinations (11 benchmarks)
+- Soak: manual docker-compose kill sequence (SIGKILL + SIGTERM + convergence diff) — run for delivery-semantics changes
 
 Run all: `just ci` (lock-check + format + lint + unit + integration + docs-check + Docker build). Perf: `just test-perf`.
 Perf with JSON output: `just test-perf-json` → writes `perf-results.json`.

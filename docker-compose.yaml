@@ -154,8 +154,32 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    configs:
+      - source: grafana-datasource
+        target: /etc/grafana/provisioning/datasources/prometheus.yaml
+      - source: grafana-dashboard-provider
+        target: /etc/grafana/provisioning/dashboards/viaduck.yaml
 
 configs:
+  grafana-datasource:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+  grafana-dashboard-provider:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: viaduck
+          type: file
+          options:
+            path: /var/lib/grafana/dashboards
   prometheus-config:
     content: |
       global:

@@ -97,7 +97,7 @@ up:
     docker compose build
     docker compose up -d
 
-# Stop the docker-compose dev environment
+# Stop the dev/demo environment (wipes volumes — next start is a fresh source)
 [group('docker')]
 down:
     docker compose down -v
@@ -115,6 +115,29 @@ minio:
 # Open the Viaduck web UI (requires `just up` first)
 [group('docker')]
 webui:
+    open http://localhost:8000/ui
+
+# Stand up the full stack with live producer traffic, wait for health, open the web UI
+[group('docker')]
+demo: up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Waiting for viaduck to become healthy..."
+    for _ in $(seq 1 60); do
+        curl -fs http://localhost:8000/healthz >/dev/null 2>&1 && break
+        sleep 2
+    done
+    if ! curl -fs http://localhost:8000/healthz >/dev/null 2>&1; then
+        echo "viaduck did not become healthy — check: docker compose logs viaduck" >&2
+        exit 1
+    fi
+    echo ""
+    echo "Stack is up. The producer writes a batch every 2s; flushes land every 15s."
+    echo "  Web UI:     http://localhost:8000/ui"
+    echo "  Grafana:    http://localhost:3000/d/viaduck/viaduck"
+    echo "  Prometheus: http://localhost:9091"
+    echo "  MinIO:      http://localhost:9001  (minioadmin/minioadmin)"
+    echo "Stop with: just down"
     open http://localhost:8000/ui
 
 # === Docs ===

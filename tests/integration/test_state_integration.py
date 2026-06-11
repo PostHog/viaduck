@@ -148,12 +148,14 @@ def test_concurrent_advances_no_lost_updates(sm, pg_uri, state_table_name):
 
 
 def test_state_rows_visible_via_plain_sql(sm, pg_uri, state_table_name):
-    """The store is intentionally inspectable with psql — lock the shape."""
+    """The store is intentionally inspectable with psql — lock the shape,
+    including its home in the dedicated `viaduck` schema (never the
+    ducklake catalog's namespace)."""
     sm.initialize_destinations(["d1"])
     sm.advance_cursor("d1", snapshot_id=12, cumulative_rows=3)
     with psycopg.connect(pg_uri) as conn:
         row = conn.execute(
-            f"SELECT last_snapshot_id, rows_replicated, last_error FROM {state_table_name} "
+            f"SELECT last_snapshot_id, rows_replicated, last_error FROM viaduck.{state_table_name} "
             "WHERE destination_id = 'd1' AND instance_id = 'i1'"
         ).fetchone()
     assert row == (12, 3, None)

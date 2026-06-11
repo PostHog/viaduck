@@ -66,9 +66,19 @@ class StateManager:
         self._uri = postgres_uri
         self._instance_id = instance_id
         table = state_config.table
-        if not _SAFE_TABLE_NAME.match(table):
-            raise ValueError(f"state.table {table!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)")
+        schema = state_config.schema
+        for name, value in (("state.table", table), ("state.schema", schema)):
+            if not _SAFE_TABLE_NAME.match(value):
+                raise ValueError(f"{name} {value!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)")
         self._table = table
+        self._schema = schema
+        # Dedicated schema keeps viaduck's bookkeeping out of the ducklake
+        # catalog's namespace (the default URI is the source catalog's
+        # database), and gives a future scoped-down user a clean GRANT
+        # boundary. Unqualified `{self._table}.col` references below are
+        # intentional: the bare table name is the implicit alias of the
+        # schema-qualified INSERT/UPDATE target.
+        self._qualified = f"{schema}.{table}"
         self._lock = threading.Lock()
         self._conn: psycopg.Connection | None = None
         self._table_ensured = False
@@ -89,9 +99,13 @@ class StateManager:
 
     def _ensure_table(self, conn: psycopg.Connection) -> None:
         try:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
+        except (psycopg.errors.DuplicateSchema, psycopg.errors.UniqueViolation):
+            log.info("State schema '%s' created concurrently by another instance", self._schema)
+        try:
             conn.execute(
                 f"""
-                CREATE TABLE IF NOT EXISTS {self._table} (
+                CREATE TABLE IF NOT EXISTS {self._qualified} (
                     destination_id     text        NOT NULL,
                     instance_id        text        NOT NULL,
                     last_snapshot_id   bigint      NOT NULL,
@@ -139,7 +153,7 @@ class StateManager:
             rows = conn.execute(
                 f"""
                 SELECT destination_id, instance_id, last_snapshot_id, rows_replicated, last_error
-                FROM {self._table}
+                FROM {self._qualified}
                 WHERE instance_id = %s AND destination_id = ANY(%s)
                 """,
                 (self._instance_id, destination_ids),
@@ -166,7 +180,7 @@ class StateManager:
         def _op(conn: psycopg.Connection):
             cur = conn.execute(
                 f"""
-                INSERT INTO {self._table}
+                INSERT INTO {self._qualified}
                     (destination_id, instance_id, last_snapshot_id, rows_replicated, updated_at)
                 SELECT unnest(%s::text[]), %s, 0, 0, %s
                 ON CONFLICT (destination_id, instance_id) DO NOTHING
@@ -200,7 +214,7 @@ class StateManager:
         def _op(conn: psycopg.Connection):
             conn.execute(
                 f"""
-                INSERT INTO {self._table}
+                INSERT INTO {self._qualified}
                     (destination_id, instance_id, last_snapshot_id, last_replicated_at,
                      rows_replicated, last_error, last_error_at, updated_at)
                 VALUES (%s, %s, %s, %s, COALESCE(%s, 0), NULL, NULL, %s)
@@ -232,7 +246,7 @@ class StateManager:
         def _op(conn: psycopg.Connection):
             conn.execute(
                 f"""
-                INSERT INTO {self._table}
+                INSERT INTO {self._qualified}
                     (destination_id, instance_id, last_snapshot_id, last_replicated_at,
                      rows_replicated, last_error, last_error_at, updated_at)
                 SELECT unnest(%s::text[]), %s, %s, %s, 0, NULL, NULL, %s
@@ -261,7 +275,7 @@ class StateManager:
         def _op(conn: psycopg.Connection):
             cur = conn.execute(
                 f"""
-                UPDATE {self._table} SET
+                UPDATE {self._qualified} SET
                     last_replicated_at = NULL,
                     last_error         = %s,
                     last_error_at      = %s,

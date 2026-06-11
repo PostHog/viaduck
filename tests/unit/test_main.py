@@ -15,6 +15,7 @@ from viaduck.apply import (
     _write_with_retry,
 )
 from viaduck.main import (
+    _derive_dest_status,
     _group_by_cursor,
     _poll_cycle,
     _resolve_preimages,
@@ -2160,3 +2161,45 @@ def test_apply_changes_key_reuse_delete_before_upsert():
     assert calls == ["delete", "upsert"]
     sent = txn_table.upsert.call_args[0][0]
     assert sent.column("value").to_pylist() == [5]
+
+
+# ---------------------------------------------------------------------------
+# Destination status derivation (web UI / status API)
+# ---------------------------------------------------------------------------
+
+
+def _delivery_status(**kw):
+    from viaduck.delivery import DestDeliveryStatus
+
+    base = dict(
+        flushed_snapshot=10,
+        position_snapshot=10,
+        rows_replicated=0,
+        last_error=None,
+        buffer_rows=0,
+        buffer_age_s=0.0,
+        flushing=False,
+    )
+    base.update(kw)
+    return DestDeliveryStatus(**base)
+
+
+@pytest.mark.parametrize(
+    ("snap_now", "kw", "expected"),
+    [
+        # error beats everything
+        (12, {"last_error": "boom", "buffer_rows": 5}, "error"),
+        (10, {"flushing": True}, "flushing"),
+        # reads behind the source: genuinely lagging
+        (12, {"position_snapshot": 10}, "lagging"),
+        # read-current, data awaiting flush: the buffering design working
+        (12, {"position_snapshot": 12, "buffer_rows": 5}, "buffering"),
+        # read-current, empty buffer but unpersisted position advance
+        (12, {"position_snapshot": 12, "flushed_snapshot": 10}, "buffering"),
+        (10, {}, "healthy"),
+    ],
+)
+def test_derive_dest_status(snap_now, kw, expected):
+    """Between flushes the cursor always trails the source; that must NOT
+    display as 'lagging' — only reads being behind is operationally lag."""
+    assert _derive_dest_status(_delivery_status(**kw), snap_now) == expected

@@ -75,6 +75,7 @@ class DestinationPool:
         same destination can't happen: the delivery layer's in-flight
         guard gives each destination at most one worker at a time.)
         """
+        to_close: list[tuple[str, Catalog]] = []
         with self._lock:
             if destination_id in self._pool:
                 self._pool.move_to_end(destination_id)
@@ -82,6 +83,9 @@ class DestinationPool:
                 return self._pool[destination_id]
 
             # Evict LRU unpinned entries if at capacity (reserved slots count).
+            # Pop under the lock; close OUTSIDE it — catalog.close() can take
+            # tens of ms, and holding the lock serializes every concurrent
+            # worker through this pool's hottest path under eviction pressure.
             while len(self._pool) + len(self._creating) >= self._max_open:
                 evict_id = next(
                     (d for d in self._pool if self._pins.get(d, 0) == 0),
@@ -96,14 +100,17 @@ class DestinationPool:
                     )
                     break
                 evict_cat, _ = self._pool.pop(evict_id)
-                try:
-                    evict_cat.close()
-                except Exception:
-                    log.warning("Error closing evicted connection for %s", evict_id)
+                to_close.append((evict_id, evict_cat))
                 metrics.pool_evictions_total.inc()
                 log.debug("Evicted connection for destination %s", evict_id)
 
             self._creating.add(destination_id)
+
+        for evict_id, evict_cat in to_close:
+            try:
+                evict_cat.close()
+            except Exception:
+                log.warning("Error closing evicted connection for %s", evict_id)
 
         try:
             catalog, table = self._create(destination_id)

@@ -141,7 +141,6 @@ class ServerConfig:
 @dataclass(frozen=True)
 class WebConfig:
     enabled: bool = True
-    port: int = 8001
 
 
 @dataclass(frozen=True)
@@ -190,6 +189,10 @@ def _to_libpq_conninfo(uri: str) -> str:
 @dataclass(frozen=True)
 class StateConfig:
     table: str = "viaduck_state"
+    # Dedicated schema so viaduck's bookkeeping never pollutes the ducklake
+    # catalog's namespace, and a future scoped-down PG user has a clean
+    # GRANT boundary (USAGE on schema + table grants).
+    schema: str = "viaduck"
     # Postgres for the cursor store. Defaults to the source catalog's URI
     # (the same database already hosting the ducklake metadata). Set
     # explicitly when the source catalog isn't Postgres-backed (e.g. a
@@ -360,14 +363,12 @@ def load(path: str | Path) -> ViaduckConfig:
     server = ServerConfig(port=server_raw.get("port", 8000))
 
     web_raw = raw.get("web", {})
-    web = WebConfig(
-        enabled=web_raw.get("enabled", True),
-        port=web_raw.get("port", 8001),
-    )
+    web = WebConfig(enabled=web_raw.get("enabled", True))
 
     state_raw = raw.get("state", {})
     state = StateConfig(
         table=state_raw.get("table", "viaduck_state"),
+        schema=state_raw.get("schema", "viaduck"),
         postgres_uri_env=state_raw.get("postgres_uri_env") or None,
     )
 

@@ -133,7 +133,7 @@ _delivery_buffer_bytes = Gauge(
 )
 _delivery_buffer_total_bytes = Gauge(
     "viaduck_delivery_buffer_total_bytes",
-    "Bytes buffered across all destinations",
+    "Bytes buffered or in flight to flush workers, across all destinations",
     ["pipeline"],
 )
 _delivery_flushes_total = Counter(

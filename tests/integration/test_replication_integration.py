@@ -511,6 +511,40 @@ def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_tabl
     assert cursors["dest-acme"].last_snapshot_id == expected_snap
 
 
+def test_seed_rejects_duplicate_keys(source_table, dest_catalog_a, dest_table_a, pg_uri, state_table_name):
+    """DuckLake can't enforce key uniqueness; the seed scan verifies it per
+    partition and refuses to advance the cursor on violation — duplicate
+    source keys would otherwise over-delete (delete-by-key) and duplicate
+    (upsert with duplicate join keys) on the destination."""
+    from unittest.mock import MagicMock
+
+    from viaduck.router import RoutingError
+
+    # event_id 1 appears twice in the acme partition.
+    source_table.append(_arrow_rows([1, 1, 2], ["acme", "acme", "acme"], [10, 11, 20]))
+
+    state_cfg = StateConfig(table=state_table_name)
+    sm = StateManager(pg_uri, "seed-instance", state_cfg)
+    sm.initialize_destinations(["dest-acme"])
+
+    cfg = MagicMock()
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = ["event_id"]
+    cfg.routing.seed_mode = "scan"
+    dest_cfg = MagicMock()
+    dest_cfg.routing_value = "acme"
+    cfg.destination_by_id.return_value = dest_cfg
+    dest_pool = MagicMock()
+    dest_pool.get.return_value = (dest_catalog_a, dest_table_a)
+
+    with pytest.raises(RoutingError, match="not unique"):
+        _seed_new_destinations(source_table, sm, dest_pool, cfg, ["dest-acme"])
+
+    # Cursor untouched: the seed re-runs after the operator fixes the source.
+    assert sm.load_cursors(["dest-acme"])["dest-acme"].last_snapshot_id == 0
+    sm.close()
+
+
 def test_read_cdc_changes_excludes_start_snapshot(source_table):
     """read_cdc_changes takes start_snapshot = the last delivered snapshot
     and must read (start, end]: ducklake's table_changes is inclusive on

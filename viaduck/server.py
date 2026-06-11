@@ -87,7 +87,7 @@ class DestStatus:
     snapshot: int
     lag: int
     rows_replicated: int
-    status: str  # "healthy", "lagging", "flushing", "error"
+    status: str  # "healthy", "buffering", "flushing", "lagging", "error"
     last_error: str | None
     buffer_rows: int = 0
     buffer_age_s: float = 0.0
@@ -108,6 +108,7 @@ class StatusState:
         source_snapshot: int | None,
         mode: str,
         poll_interval: float,
+        flush_interval: float = 0.0,
         destinations: list[DestStatus],
         pool_open: int,
         pool_max: int,
@@ -118,6 +119,7 @@ class StatusState:
                 "source_snapshot": source_snapshot,
                 "mode": mode,
                 "poll_interval": poll_interval,
+                "flush_interval": flush_interval,
                 "uptime_s": round(time.monotonic() - self._started_at, 1),
                 "destinations": [asdict(d) for d in destinations],
                 "pool": {"open": pool_open, "max": pool_max},
@@ -131,6 +133,7 @@ class StatusState:
                     "source_snapshot": None,
                     "mode": None,
                     "poll_interval": None,
+                    "flush_interval": None,
                     "uptime_s": round(time.monotonic() - self._started_at, 1),
                     "destinations": [],
                     "pool": {"open": 0, "max": 0},
@@ -162,16 +165,26 @@ _UI_HTML = """\
          margin: 2em; background: #fafafa; color: #333; }
   h1 { font-size: 1.4em; margin-bottom: 0.2em; }
   .meta { color: #666; font-size: 0.9em; margin-bottom: 1.5em; }
-  table { border-collapse: collapse; width: 100%; max-width: 900px; }
+  table { border-collapse: collapse; width: 100%; max-width: 1100px; }
   th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #ddd; }
-  th { background: #f0f0f0; font-weight: 600; }
+  th { background: #f0f0f0; font-weight: 600; cursor: help;
+       white-space: nowrap; vertical-align: bottom; }
+  .unit { display: block; font-weight: 400; font-size: 0.75em; color: #888; }
+  /* numeric columns: Snapshot, Lag, Rows Processed, Buffered */
+  th:nth-child(n+3):nth-child(-n+6), td:nth-child(n+3):nth-child(-n+6) { text-align: right; }
+  td:nth-child(7) { cursor: help; }
+  .tip { cursor: help; border-bottom: 1px dotted #999; }
   .healthy { color: #2e7d32; }
+  .buffering { color: #1565c0; }
+  .flushing { color: #00838f; }
   .lagging { color: #f57f17; }
   .error { color: #c62828; font-weight: bold; }
   .pool { margin-top: 1.5em; font-size: 0.9em; color: #666; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
          margin-right: 6px; vertical-align: middle; }
   .dot-healthy { background: #4caf50; }
+  .dot-buffering { background: #42a5f5; }
+  .dot-flushing { background: #26c6da; }
   .dot-lagging { background: #ffb300; }
   .dot-error { background: #e53935; }
   #disconnected { display: none; color: #c62828; font-size: 0.9em; margin-top: 1em; }
@@ -182,8 +195,22 @@ _UI_HTML = """\
 <div class="meta" id="meta">Connecting...</div>
 <table>
   <thead>
-    <tr><th>Destination</th><th>Routing Value</th><th>Snapshot</th><th>Lag</th>
-        <th>Rows</th><th>Status</th><th>Last Error</th></tr>
+    <tr>
+      <th title="Destination id from the config">Destination</th>
+      <th title="Source rows whose routing field equals this value are delivered here">Routing Value</th>
+      <th title="Last source snapshot durably flushed to this destination (the persisted cursor)">Snapshot</th>
+      <th title="Snapshots behind the source (source snapshot minus flushed snapshot).
+With buffered delivery a nonzero value between flushes is normal — see Status">Lag<span
+class="unit">snapshots behind</span></th>
+      <th title="Cumulative operations applied since seeding (upserts + deletes),
+not the destination's current row count">Rows Processed<span class="unit">ops applied</span></th>
+      <th title="Rows read from the source and awaiting flush (buffer age in seconds)">Buffered<span
+class="unit">rows (age)</span></th>
+      <th title="healthy: flushed through the current snapshot. buffering: read-current,
+data awaiting flush (normal). flushing: a flush is in progress. lagging: reads are
+behind the source. error: last flush failed; the range will be re-read">Status</th>
+      <th title="Most recent flush error; cleared on the next successful flush">Last Error</th>
+    </tr>
   </thead>
   <tbody id="tbody"></tbody>
 </table>
@@ -197,11 +224,32 @@ const disc = document.getElementById('disconnected');
 
 function fmt(n) { return n != null ? n.toLocaleString() : '-'; }
 
+const modeTips = {
+  full_cdc: 'key_columns configured: inserts, updates, and deletes replicate via atomic delete+upsert.',
+  append_only: 'No key_columns: inserts only, replicated via append. Deletes and updates are not captured.',
+};
+
+const statusTips = {
+  healthy: 'Flushed through the current source snapshot — nothing pending.',
+  buffering: 'Reads are current; changes are sitting in the in-memory buffer awaiting the next flush. ' +
+    'Normal operation between flushes.',
+  flushing: 'A flush is writing this destination right now.',
+  lagging: 'CDC reads are behind the source — there are changes viaduck has not yet read.',
+  error: 'The last flush failed; the buffered range was dropped and will be re-read from the persisted cursor. ' +
+    'See Last Error.',
+};
+
+function esc(x) {
+  return String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function update(d) {
-  meta.textContent = 'Source: ' + (d.source_table || '?') +
+  meta.innerHTML = 'Source: ' + esc(d.source_table || '?') +
     ' @ snapshot ' + fmt(d.source_snapshot) +
-    '  |  Mode: ' + (d.mode || '?') +
-    '  |  Poll: ' + (d.poll_interval || '?') + 's' +
+    '  |  Mode: <span class="tip" title="' + esc(modeTips[d.mode] || '') + '">' + esc(d.mode || '?') + '</span>' +
+    '  |  Poll: every ' + esc(d.poll_interval || '?') + 's' +
+    '  |  <span class="tip" title="Changes buffer in memory up to this long before flushing to the destination;' +
+    ' row/byte/memory triggers can flush sooner">Flush: every ' + esc(d.flush_interval || '?') + 's</span>' +
     '  |  Uptime: ' + Math.round((d.uptime_s || 0) / 60) + 'm';
 
   let html = '';
@@ -213,7 +261,9 @@ function update(d) {
       '<td>' + fmt(dest.snapshot) + '</td>' +
       '<td>' + fmt(dest.lag) + '</td>' +
       '<td>' + fmt(dest.rows_replicated) + '</td>' +
-      '<td class="' + cls + '">' + cls + '</td>' +
+      '<td>' + (dest.buffer_rows
+        ? fmt(dest.buffer_rows) + ' (' + Math.round(dest.buffer_age_s) + 's)' : '-') + '</td>' +
+      '<td class="' + cls + '" title="' + (statusTips[cls] || '') + '">' + cls + '</td>' +
       '<td>' + (dest.last_error || '') + '</td></tr>';
   });
   tbody.innerHTML = html;

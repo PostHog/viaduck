@@ -5,7 +5,7 @@ CDC Replication Algorithm
 
 Viaduck replicates changes from a source DuckLake table to N destination
 DuckLake tables using a 3-phase CDC algorithm. The algorithm is eventually
-consistent under three assumptions:
+consistent under four assumptions:
 
 1. **Routing column immutability**: The routing field (e.g. ``company``) must
    not be updated on the source. The CDC read uses ``filter_expr`` pushdown
@@ -24,6 +24,12 @@ consistent under three assumptions:
    to by viaduck from the configured source. Concurrent writes from other
    sources would break at-least-once idempotency — a retried delete could
    remove a row inserted by another writer.
+
+4. **Key uniqueness**: ``key_columns`` values are unique per row in the source.
+   DuckLake has no unique constraints, so this cannot be enforced declaratively;
+   violations mean delete-by-key over-deletes and duplicate-key upserts
+   duplicate. Verified per partition at seed time
+   (``_verify_seed_key_uniqueness``); post-seed inserts are not re-verified.
 
 The algorithm processes CDC batches as unordered sets (not sequences). This is
 sound because: (a) each batch covers a closed snapshot range, (b) batches are
@@ -59,10 +65,6 @@ from viaduck.server import DestStatus, health, status
 from viaduck.state import StateManager
 
 log = logging.getLogger(__name__)
-
-_WRITE_MAX_RETRIES = 3
-_WRITE_BASE_DELAY_S = 1.0
-_DELETE_CHUNK_ROWS = 1000
 
 
 def _start_progress_heartbeat(
@@ -296,6 +298,55 @@ def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[st
 # ---------------------------------------------------------------------------
 
 
+def _verify_seed_key_uniqueness(
+    dest_id: str, seen_key_batches: list[pa.Table], key_columns: list[str], total_rows: int
+):
+    """Verify key_columns are unique within the seeded partition.
+
+    DuckLake has no unique constraints, so key uniqueness is an unenforced
+    contract — and a violated contract is silent data corruption: the
+    delete path removes every destination row matching a key, so duplicate
+    source keys cause over-deletes, and upserting duplicate-key batches
+    writes duplicate rows. The seed scan already streams every row of the
+    partition, so this check is free of extra I/O. Raises before the
+    cursor advances; the partial seed re-runs after the operator fixes
+    the source (or the key_columns config).
+
+    Scope: per destination partition at seed time. Rows inserted AFTER the
+    seed are not re-verified — the contract still applies, this just
+    catches pre-existing violations at the cheapest possible moment.
+    """
+    distinct = pa.concat_tables(seen_key_batches).group_by(key_columns).aggregate([]).num_rows
+    if distinct != total_rows:
+        raise RoutingError(
+            f"Destination {dest_id}: key_columns {key_columns} are not unique in the "
+            f"source partition ({total_rows} rows, {distinct} distinct keys). "
+            "DuckLake cannot enforce uniqueness; viaduck's delete-by-key would "
+            "over-delete and upserts would duplicate. Fix the source data or the "
+            "key_columns config before seeding."
+        )
+
+
+def _derive_dest_status(d, snap_now: int) -> str:
+    """Operational status for a destination, from its delivery snapshot.
+
+    Raw flush lag is the wrong signal here: between flushes the persisted
+    cursor is always behind the source — that's the buffering design
+    working, not a problem. "lagging" means READS are behind (the data
+    hasn't even been seen); read-current with data awaiting flush is
+    "buffering".
+    """
+    if d.last_error:
+        return "error"
+    if d.flushing:
+        return "flushing"
+    if snap_now > d.position_snapshot:
+        return "lagging"
+    if d.buffer_rows > 0 or d.position_snapshot > d.flushed_snapshot:
+        return "buffering"
+    return "healthy"
+
+
 def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
     """Seed newly added destinations from a source table scan.
 
@@ -401,6 +452,11 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
             # surfaces via the heartbeat thread reading `progress`.
             reader = scan.to_arrow_batch_reader()
             first_batch_logged = False
+            # Key-uniqueness probe data: per-batch DISTINCT keys (key
+            # columns only), verified after the stream. Duplicates collapse
+            # within each batch, so memory is bounded by the destination's
+            # distinct-key count, not its row count.
+            seen_key_batches: list[pa.Table] = []
             for batch in reader:
                 if not first_batch_logged:
                     pre_exec_secs = time.monotonic() - seed_t0
@@ -414,6 +470,8 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
                 if batch.num_rows == 0:
                     continue
                 batch_table = pa.Table.from_batches([batch])
+                if key_columns:
+                    seen_key_batches.append(batch_table.select(key_columns).group_by(key_columns).aggregate([]))
                 catalog, table = dest_pool.get(dest_id)
                 write_t0 = time.monotonic()
                 if key_columns:
@@ -427,6 +485,9 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
             seed_secs = time.monotonic() - seed_t0
             total_rows = progress["rows"]
             batch_count = progress["batches"]
+
+            if key_columns and total_rows > 0:
+                _verify_seed_key_uniqueness(dest_id, seen_key_batches, key_columns, total_rows)
 
             if total_rows > 0:
                 log.info(
@@ -670,14 +731,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
         lag = max(snap_now - d.flushed_snapshot, 0)
         metrics.dest_lag_snapshots.labels(destination=did).set(lag)
 
-        if d.last_error:
-            st = "error"
-        elif d.flushing:
-            st = "flushing"
-        elif lag > 0:
-            st = "lagging"
-        else:
-            st = "healthy"
+        st = _derive_dest_status(d, snap_now)
 
         dest_statuses.append(
             DestStatus(
@@ -698,6 +752,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
         source_snapshot=snap_now,
         mode="full_cdc" if full_cdc else "append_only",
         poll_interval=cfg.poll.interval_seconds,
+        flush_interval=cfg.delivery.flush_interval_seconds,
         destinations=dest_statuses,
         pool_open=dest_pool.size,
         pool_max=dest_pool.max_open,
