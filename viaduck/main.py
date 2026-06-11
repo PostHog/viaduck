@@ -479,7 +479,7 @@ def run(cfg: config.ViaduckConfig) -> None:
     # Postgres (NOT a DuckLake table): a cursor advance must not create
     # catalog snapshots, or idle destinations generate CDC work forever.
     state_mgr = StateManager(cfg.state.resolve_postgres_uri(cfg.source), cfg.instance.id, cfg.state)
-    dest_pool = DestinationPool(cfg, max_open=50)
+    dest_pool = DestinationPool(cfg, max_open=cfg.delivery.pool_max_open)
     router = Router(cfg.routing)
 
     # Cache source schema for destination table creation.
@@ -588,7 +588,9 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
             # memory. Skip reads; flushes in flight will relieve it.
             log.warning("Buffer watermark exceeded with all flushes in flight; pausing CDC reads this cycle")
         else:
-            positions = delivery.positions()
+            plan = delivery.read_plan()
+            positions = {d: pos for d, (pos, _epoch) in plan.items()}
+            epochs = {d: epoch for d, (_pos, epoch) in plan.items()}
             groups = _group_by_cursor(positions, assigned_ids)
 
             for start_snap, dest_ids in groups.items():
@@ -619,7 +621,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
 
                 if raw_data.num_rows == 0:
                     for did in dest_ids:
-                        delivery.advance_position(did, current_id)
+                        delivery.advance_position(did, current_id, epoch=epochs[did])
                     continue
 
                 # Phase 1: Resolve preimages (full CDC only, before routing)
@@ -649,10 +651,10 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                     dest_id = rv_to_dest[routing_val]
                     routed_dest_ids.add(dest_id)
                     if batch.num_rows > 0:
-                        delivery.buffer(dest_id, batch, current_id)
+                        delivery.buffer(dest_id, batch, current_id, epoch=epochs[dest_id])
                 for did in dest_ids:
                     if did not in routed_dest_ids:
-                        delivery.advance_position(did, current_id)
+                        delivery.advance_position(did, current_id, epoch=epochs[did])
 
     # Evaluate flush triggers (FlushStart) — also persists position-only
     # advances for idle destinations on the flush cadence.

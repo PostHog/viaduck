@@ -165,6 +165,7 @@ def _make_delivery(positions: dict[str, int]):
 
     delivery = MagicMock()
     delivery.positions.return_value = dict(positions)
+    delivery.read_plan.return_value = {d: (snap, 0) for d, snap in positions.items()}
     delivery.should_pause_reads.return_value = False
     delivery.maybe_flush.return_value = 0
     delivery.status_snapshot.return_value = {
@@ -192,7 +193,7 @@ def test_poll_cycle_no_snapshots():
     with patch("viaduck.main.source.current_snapshot_id", return_value=None):
         _poll_cycle(MagicMock(), delivery, MagicMock(), router, cfg, [], {}, key_columns=[], full_cdc=False)
 
-    delivery.positions.assert_not_called()
+    delivery.read_plan.assert_not_called()
     delivery.maybe_flush.assert_called_once()
 
 
@@ -246,7 +247,7 @@ def test_poll_cycle_routes_and_buffers():
             full_cdc=False,
         )
 
-    delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10)
+    delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
     delivery.advance_position.assert_not_called()
     delivery.maybe_flush.assert_called_once()
 
@@ -275,8 +276,8 @@ def test_poll_cycle_empty_changeset_advances_positions():
         )
 
     assert delivery.advance_position.call_count == 2
-    delivery.advance_position.assert_any_call("dest-1", 10)
-    delivery.advance_position.assert_any_call("dest-2", 10)
+    delivery.advance_position.assert_any_call("dest-1", 10, epoch=0)
+    delivery.advance_position.assert_any_call("dest-2", 10, epoch=0)
     delivery.buffer.assert_not_called()
 
 
@@ -334,8 +335,8 @@ def test_poll_cycle_advances_no_data_destinations():
             full_cdc=False,
         )
 
-    delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10)
-    delivery.advance_position.assert_called_once_with("dest-2", 10)
+    delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
+    delivery.advance_position.assert_called_once_with("dest-2", 10, epoch=0)
 
 
 def test_poll_cycle_pauses_reads_at_watermark():
@@ -359,7 +360,7 @@ def test_poll_cycle_pauses_reads_at_watermark():
             full_cdc=False,
         )
 
-    delivery.positions.assert_not_called()
+    delivery.read_plan.assert_not_called()
     delivery.maybe_flush.assert_called_once()
 
 

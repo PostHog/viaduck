@@ -45,6 +45,7 @@ class DestinationPool:
         self._lock = threading.Lock()
         self._pool: OrderedDict[str, tuple[Catalog, Table]] = OrderedDict()
         self._pins: dict[str, int] = {}
+        self._creating: set[str] = set()  # reserved slots; created outside the lock
         self._zombies: dict[str, list[Catalog]] = {}  # evicted-while-pinned, closed on release
         self._source_schema: Schema | None = None
 
@@ -67,9 +68,12 @@ class DestinationPool:
 
         Returns the cached connection if available, otherwise creates a new
         one. Evicts the LRU unpinned entry if at capacity. Connection
-        creation happens under the pool lock — at most `workers` creations
-        can queue behind it; acceptable at current scale (creation is a
-        catalog connect, ~100ms).
+        creation (a catalog connect, ~100ms) happens OUTSIDE the pool lock
+        — a slot is reserved under the lock first, so capacity accounting
+        stays correct while concurrent workers create connections for
+        DIFFERENT destinations in parallel. (Concurrent creates for the
+        same destination can't happen: the delivery layer's in-flight
+        guard gives each destination at most one worker at a time.)
         """
         with self._lock:
             if destination_id in self._pool:
@@ -77,8 +81,8 @@ class DestinationPool:
                 self._pins[destination_id] = self._pins.get(destination_id, 0) + 1
                 return self._pool[destination_id]
 
-            # Evict LRU unpinned entries if at capacity.
-            while len(self._pool) >= self._max_open:
+            # Evict LRU unpinned entries if at capacity (reserved slots count).
+            while len(self._pool) + len(self._creating) >= self._max_open:
                 evict_id = next(
                     (d for d in self._pool if self._pins.get(d, 0) == 0),
                     None,
@@ -99,7 +103,17 @@ class DestinationPool:
                 metrics.pool_evictions_total.inc()
                 log.debug("Evicted connection for destination %s", evict_id)
 
+            self._creating.add(destination_id)
+
+        try:
             catalog, table = self._create(destination_id)
+        except Exception:
+            with self._lock:
+                self._creating.discard(destination_id)
+            raise
+
+        with self._lock:
+            self._creating.discard(destination_id)
             self._pool[destination_id] = (catalog, table)
             self._pins[destination_id] = self._pins.get(destination_id, 0) + 1
             metrics.pool_creates_total.inc()

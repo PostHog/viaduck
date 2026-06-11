@@ -111,6 +111,19 @@ class DeliveryManager:
         # data sitting in the buffer) age toward the flush interval from
         # the first un-persisted advance.
         self._position_dirty_since: dict[str, float | None] = {d: None for d in assigned_ids}
+        # Read epochs make BufferRead effectively atomic against FlushFail:
+        # the poll thread captures the epoch BEFORE its (slow) CDC read and
+        # presents it with buffer()/advance_position(); _on_flush_failure
+        # bumps the epoch when it resets the position, so a read that
+        # overlapped the reset is discarded instead of stamping a stale
+        # position over it (which would leave the dropped range unread —
+        # the spec's BufferRead is a single atomic action; this restores
+        # that atomicity).
+        self._epoch: dict[str, int] = {d: 0 for d in assigned_ids}
+        # Bytes held by in-flight (swapped-out) tables — counted toward the
+        # watermark and the total-bytes gauge so memory backpressure sees
+        # the worker-owned data too, not just live buffers.
+        self._inflight_bytes: dict[str, int] = {d: 0 for d in assigned_ids}
 
     # ------------------------------------------------------------------ #
     # Poll-thread API
@@ -121,10 +134,30 @@ class DeliveryManager:
         with self._lock:
             return dict(self._position)
 
-    def buffer(self, dest_id: str, table: pa.Table, through_snapshot: int) -> None:
-        """Accumulate a routed, Phase-1-resolved batch (BufferRead)."""
+    def read_plan(self) -> dict[str, tuple[int, int]]:
+        """Atomic snapshot of (position, epoch) per destination. The epoch
+        must be passed back to buffer()/advance_position() so reads that
+        overlapped a failure reset are discarded."""
+        with self._lock:
+            return {d: (self._position[d], self._epoch[d]) for d in self._position}
+
+    def buffer(self, dest_id: str, table: pa.Table, through_snapshot: int, epoch: int | None = None) -> None:
+        """Accumulate a routed, Phase-1-resolved batch (BufferRead).
+
+        `epoch` is the value captured by read_plan() before the CDC read;
+        a mismatch means a flush failure reset this destination while the
+        read was in flight — the batch is discarded (safe: the failure
+        path rewound the position, so the range will be re-read)."""
         now = time.monotonic()
         with self._lock:
+            if epoch is not None and epoch != self._epoch[dest_id]:
+                log.info(
+                    "Discarding stale read for %s (epoch %d != %d): flush failure reset the position mid-read",
+                    dest_id,
+                    epoch,
+                    self._epoch[dest_id],
+                )
+                return
             buf = self._buffers[dest_id]
             buf.tables.append(table)
             buf.rows += table.num_rows
@@ -138,10 +171,13 @@ class DeliveryManager:
             metrics.delivery_buffer_bytes.labels(destination=dest_id).set(buf.bytes)
             metrics.delivery_buffer_total_bytes.set(self._total_bytes_locked())
 
-    def advance_position(self, dest_id: str, through_snapshot: int) -> None:
+    def advance_position(self, dest_id: str, through_snapshot: int, epoch: int | None = None) -> None:
         """Advance the read position with no data (empty range for this
-        destination). Persisted lazily on the flush cadence."""
+        destination). Persisted lazily on the flush cadence. Epoch-guarded
+        like buffer()."""
         with self._lock:
+            if epoch is not None and epoch != self._epoch[dest_id]:
+                return
             if through_snapshot > self._position[dest_id]:
                 self._position[dest_id] = through_snapshot
                 if self._position_dirty_since[dest_id] is None:
@@ -182,25 +218,50 @@ class DeliveryManager:
                 # in the fresh one while the worker owns the snapshot.
                 self._buffers[dest_id] = _Buffer()
                 self._inflight.add(dest_id)
+                self._inflight_bytes[dest_id] = buf.bytes
                 self._position_dirty_since[dest_id] = None
                 metrics.delivery_buffer_rows.labels(destination=dest_id).set(0)
                 metrics.delivery_buffer_bytes.labels(destination=dest_id).set(0)
-                self._executor.submit(self._flush, dest_id, tables, through, trigger)
+                future = self._executor.submit(self._flush, dest_id, tables, through, trigger)
+                # _flush catches everything it expects; anything escaping
+                # (a bug) must not vanish into an unobserved Future.
+                future.add_done_callback(self._log_escaped_exception)
                 submitted += 1
             metrics.delivery_buffer_total_bytes.set(self._total_bytes_locked())
         return submitted
 
     def drain(self, timeout_s: float = 60.0) -> None:
-        """Shutdown: flush everything buffered, wait for workers, stop."""
-        self.maybe_flush(shutdown=True)
-        # Wait for in-flight flushes (including the ones just submitted).
+        """Shutdown: flush everything buffered, wait for workers, stop.
+
+        Loops trigger evaluation so destinations whose flush was already in
+        flight at shutdown get a second pass for rows buffered during it.
+        Bounded by timeout_s; anything still unflushed at the deadline is
+        abandoned with a warning (safe: persisted cursors make the ranges
+        re-readable on restart — the spec's ProcessCrash path).
+        """
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            self.maybe_flush(shutdown=True)
             with self._lock:
-                if not self._inflight:
-                    break
+                quiet = not self._inflight and all(
+                    b.rows == 0 and self._position[d] <= self._flushed[d] for d, b in self._buffers.items()
+                )
+            if quiet:
+                break
             time.sleep(0.05)
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        with self._lock:
+            leftover = {d: b.rows for d, b in self._buffers.items() if b.rows} or None
+            still_inflight = set(self._inflight) or None
+        if leftover or still_inflight:
+            log.warning(
+                "Drain deadline reached; abandoning buffers=%s inflight=%s "
+                "(ranges re-read from persisted cursors on restart)",
+                leftover,
+                still_inflight,
+            )
+        # Don't block on stragglers past the deadline — kubelet's grace
+        # period is the real bound and SIGKILL is coming either way.
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def status_snapshot(self) -> dict[str, DestDeliveryStatus]:
         now = time.monotonic()
@@ -224,8 +285,14 @@ class DeliveryManager:
     # Internals
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _log_escaped_exception(future) -> None:
+        exc = future.exception()
+        if exc is not None:  # pragma: no cover - bug guard
+            log.critical("Flush worker raised outside its handler (bug): %r", exc, exc_info=exc)
+
     def _total_bytes_locked(self) -> int:
-        return sum(b.bytes for b in self._buffers.values())
+        return sum(b.bytes for b in self._buffers.values()) + sum(self._inflight_bytes.values())
 
     def _trigger_for_locked(self, dest_id: str, now: float, shutdown: bool, over_watermark: bool) -> str | None:
         buf = self._buffers[dest_id]
@@ -259,24 +326,29 @@ class DeliveryManager:
                 else:
                     ops_count = append_only(self._pool, dest_id, batch)
             # Cursor persist AFTER the destination commit (the gap is the
-            # spec's CrashDuringFlush window).
+            # spec's CrashDuringFlush window). A short retry here avoids
+            # invoking the full failure path (buffer drop + healthy-catalog
+            # evict + range re-read) for a transient PG blip when the
+            # destination write already landed.
             with self._lock:
                 cumulative = self._rows_replicated[dest_id] + ops_count
-            self._state.advance_cursor(dest_id, through, cumulative_rows=cumulative)
+            self._advance_cursor_with_retry(dest_id, through, cumulative)
             duration = time.monotonic() - t0
             with self._lock:
                 self._flushed[dest_id] = max(self._flushed[dest_id], through)
                 self._rows_replicated[dest_id] = cumulative
                 self._last_error[dest_id] = None
             metrics.delivery_flushes_total.labels(destination=dest_id, trigger=trigger).inc()
-            metrics.delivery_flush_seconds.labels(destination=dest_id).observe(duration)
-            # dest_write_seconds continuity: pre-buffering dashboards
-            # observe per-destination write latency under this name.
-            metrics.dest_write_seconds.labels(destination=dest_id).observe(duration)
             metrics.dest_last_snapshot_id.labels(destination=dest_id).set(through)
-            if self._on_flush_success is not None:
-                self._on_flush_success()
             if tables:
+                # Data flushes only: empty position-only persists must not
+                # report write latency or readiness "replication" signals.
+                metrics.delivery_flush_seconds.labels(destination=dest_id).observe(duration)
+                # dest_write_seconds continuity: pre-buffering dashboards
+                # observe per-destination write latency under this name.
+                metrics.dest_write_seconds.labels(destination=dest_id).observe(duration)
+                if self._on_flush_success is not None:
+                    self._on_flush_success()
                 log.info(
                     "Flushed %s: %d ops through snapshot %d (trigger=%s, %.2fs)",
                     dest_id,
@@ -287,14 +359,44 @@ class DeliveryManager:
                 )
         except Exception:
             log.exception("Flush failed for destination %s", dest_id)
+            # Invariant-restoring reset FIRST: if the bookkeeping below
+            # (PG write, pool close) also fails, the position/buffer state
+            # must already be consistent — otherwise the dropped range
+            # would never be re-read.
+            self._on_flush_failure(dest_id)
             metrics.errors_total.labels(type="dest_write", destination=dest_id).inc()
             metrics.delivery_buffers_dropped_total.labels(destination=dest_id).inc()
-            self._state.record_error(dest_id, f"Flush failed (trigger={trigger})")
-            self._pool.evict(dest_id)
-            self._on_flush_failure(dest_id)
+            try:
+                self._state.record_error(dest_id, f"Flush failed (trigger={trigger})")
+            except Exception:
+                log.exception("Could not record flush error for %s", dest_id)
+            try:
+                self._pool.evict(dest_id)
+            except Exception:
+                log.exception("Could not evict connection for %s", dest_id)
         finally:
             with self._lock:
                 self._inflight.discard(dest_id)
+                self._inflight_bytes[dest_id] = 0
+                metrics.delivery_buffer_total_bytes.set(self._total_bytes_locked())
+
+    def _advance_cursor_with_retry(self, dest_id: str, through: int, cumulative: int, attempts: int = 3) -> None:
+        for attempt in range(attempts):
+            try:
+                self._state.advance_cursor(dest_id, through, cumulative_rows=cumulative)
+                return
+            except Exception:
+                if attempt == attempts - 1:
+                    raise
+                log.warning(
+                    "Cursor persist for %s failed (attempt %d/%d); destination write already "
+                    "committed — retrying before falling back to the re-read path",
+                    dest_id,
+                    attempt + 1,
+                    attempts,
+                    exc_info=True,
+                )
+                time.sleep(0.5 * (attempt + 1))
 
     def _on_flush_failure(self, dest_id: str) -> None:
         """FlushFail: discard the in-flight tables (already owned by this
@@ -306,6 +408,7 @@ class DeliveryManager:
             dropped = self._buffers[dest_id]
             self._buffers[dest_id] = _Buffer()
             self._position[dest_id] = self._flushed[dest_id]
+            self._epoch[dest_id] += 1  # invalidate reads that overlapped the reset
             self._position_dirty_since[dest_id] = None
             self._last_error[dest_id] = "Flush failed; range will be re-read"
             metrics.delivery_buffer_rows.labels(destination=dest_id).set(0)

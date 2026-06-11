@@ -321,3 +321,144 @@ def test_drain_flushes_and_stops():
     sm.advance_cursor.assert_called_once_with("d1", 5, cumulative_rows=2)
     with pytest.raises(RuntimeError):
         mgr._executor.submit(lambda: None)  # executor is shut down
+
+
+# ---------------------------------------------------------------------------
+# M3 review findings: epoch guard, hardened failure path, drain, watermark
+# ---------------------------------------------------------------------------
+
+
+def test_stale_epoch_read_discarded_after_flush_failure():
+    """THE race (QE H1 / architect #1): poll thread snapshots its read plan,
+    a flush fails and resets the position mid-read, then the poll thread
+    delivers the (now stale) batch. The epoch guard must discard it —
+    accepting it would stamp the position past the dropped range, which
+    would then never be re-read."""
+    mgr, _, _ = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+
+    # Poll thread captures its plan BEFORE the failure.
+    plan = mgr.read_plan()
+    pos, epoch = plan["d1"]
+    assert (pos, epoch) == (2, 0)
+
+    # In-flight flush fails -> reset + epoch bump.
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("down")):
+        mgr.buffer("d1", _table(1), 5)  # pre-failure buffered data
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+    assert mgr.positions() == {"d1": 2}
+
+    # The overlapped read arrives with the stale epoch: discarded entirely.
+    mgr.buffer("d1", _table(3), 9, epoch=epoch)
+    mgr.advance_position("d1", 9, epoch=epoch)
+    assert mgr.positions() == {"d1": 2}  # NOT 9
+    assert mgr.status_snapshot()["d1"].buffer_rows == 0
+
+    # The next cycle's plan sees the fresh epoch and re-reads the range.
+    new_pos, new_epoch = mgr.read_plan()["d1"]
+    assert (new_pos, new_epoch) == (2, 1)
+    with patch("viaduck.delivery.append_only", return_value=3):
+        mgr.buffer("d1", _table(3), 9, epoch=new_epoch)
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+    assert mgr.status_snapshot()["d1"].flushed_snapshot == 9
+
+
+def test_failure_path_survives_record_error_raising():
+    """QE H2: the invariant-restoring reset must happen even when the PG
+    error write or pool evict ALSO fail (plausibly correlated outages)."""
+    mgr, sm, pool = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+    sm.record_error.side_effect = RuntimeError("pg also down")
+    pool.evict.side_effect = RuntimeError("pool sad")
+
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("dest down")):
+        mgr.buffer("d1", _table(1), 5)
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+
+    # Reset happened despite the secondary failures; nothing escaped.
+    assert mgr.positions() == {"d1": 2}
+    assert mgr.status_snapshot()["d1"].buffer_rows == 0
+    assert "d1" not in mgr._inflight
+
+
+def test_cursor_persist_retry_avoids_failure_path():
+    """Architect #4: a transient cursor-persist failure after a successful
+    destination commit retries instead of dropping the buffer."""
+    mgr, sm, pool = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+    sm.advance_cursor.side_effect = [RuntimeError("pg blip"), None]
+
+    with patch("viaduck.delivery.append_only", return_value=1), patch("viaduck.delivery.time.sleep"):
+        mgr.buffer("d1", _table(1), 5)
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+
+    assert sm.advance_cursor.call_count == 2
+    assert mgr.status_snapshot()["d1"].flushed_snapshot == 5
+    sm.record_error.assert_not_called()
+    pool.evict.assert_not_called()
+
+
+def test_drain_second_pass_flushes_rows_buffered_during_inflight_flush():
+    """QE M1: rows buffered while a flush is in flight at shutdown get a
+    second trigger pass — drain loops until quiet."""
+    mgr, sm, _ = _manager(flush_interval_seconds=0.0)
+    release = threading.Event()
+    flushed_batches = []
+
+    def slow_apply(pool, dest, batch):
+        flushed_batches.append(batch.num_rows)
+        if len(flushed_batches) == 1:
+            release.wait(5)
+        return batch.num_rows
+
+    with patch("viaduck.delivery.append_only", side_effect=slow_apply):
+        mgr.buffer("d1", _table(2), 5)
+        mgr.maybe_flush()  # first flush in flight
+        mgr.buffer("d1", _table(3), 8)  # lands during the in-flight flush
+        release.set()
+        mgr.drain(timeout_s=30)
+
+    assert flushed_batches == [2, 3]
+    assert sm.advance_cursor.call_count == 2
+    assert mgr.status_snapshot()["d1"].flushed_snapshot == 8
+
+
+def test_watermark_counts_inflight_bytes():
+    """QE M2: swapped-out (in-flight) tables count toward the watermark."""
+    mgr, _, _ = _manager(buffer_total_max_bytes=1, flush_interval_seconds=3600.0)
+    release = threading.Event()
+
+    def slow_apply(pool, dest, batch):
+        release.wait(5)
+        return batch.num_rows
+
+    with patch("viaduck.delivery.append_only", side_effect=slow_apply):
+        mgr.buffer("d1", _table(50), 5)
+        assert mgr.maybe_flush(shutdown=True) == 1  # swap to in-flight
+        # Live buffer empty, but in-flight bytes keep us over the watermark
+        # and d1 is in flight -> reads must pause.
+        assert mgr.should_pause_reads()
+        release.set()
+        assert mgr.wait_idle()
+    assert not mgr.should_pause_reads()
+
+
+def test_on_flush_success_fires_for_data_not_for_idle_persists():
+    hits = []
+    cfg = DeliveryConfig(workers=1, flush_interval_seconds=0.0)
+    sm = _state_mgr({"d1": 0})
+    mgr = DeliveryManager(cfg, sm, MagicMock(), [], ["d1"], on_flush_success=lambda: hits.append(1))
+
+    # Idle position-only persist: no success signal.
+    mgr.advance_position("d1", 3)
+    mgr.maybe_flush()
+    assert mgr.wait_idle()
+    assert hits == []
+
+    # Data flush: success signal fires.
+    with patch("viaduck.delivery.append_only", return_value=1):
+        mgr.buffer("d1", _table(1), 5)
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+    assert hits == [1]

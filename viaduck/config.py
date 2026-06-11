@@ -215,13 +215,14 @@ class DeliveryConfig:
     flush_max_rows: int = 500_000
     flush_max_bytes: int = 268_435_456  # 256 MiB per destination
     buffer_total_max_bytes: int = 1_073_741_824  # 1 GiB across all buffers
+    pool_max_open: int = 100  # destination connection pool size
 
     def __post_init__(self):
         if self.workers < 1:
             raise ConfigError(f"delivery.workers must be >= 1, got {self.workers}")
         if self.flush_interval_seconds < 0:
             raise ConfigError(f"delivery.flush_interval_seconds must be >= 0, got {self.flush_interval_seconds}")
-        for name in ("flush_max_rows", "flush_max_bytes", "buffer_total_max_bytes"):
+        for name in ("flush_max_rows", "flush_max_bytes", "buffer_total_max_bytes", "pool_max_open"):
             if getattr(self, name) < 1:
                 raise ConfigError(f"delivery.{name} must be >= 1, got {getattr(self, name)}")
 
@@ -379,6 +380,7 @@ def load(path: str | Path) -> ViaduckConfig:
         buffer_total_max_bytes=_validate_int(
             delivery_raw.get("buffer_total_max_bytes", 1_073_741_824), "delivery.buffer_total_max_bytes"
         ),
+        pool_max_open=_validate_int(delivery_raw.get("pool_max_open", 100), "delivery.pool_max_open"),
     )
 
     inst_raw = raw.get("instance", {})
