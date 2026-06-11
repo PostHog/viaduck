@@ -34,6 +34,10 @@ Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* an
 
 Multi-tenant DuckLake architectures need per-tenant table isolation — separate catalogs, separate S3 paths, separate Postgres metadata stores. Viaduck reads CDC changes from a shared source table, routes rows by a configurable field (e.g. `company`), and writes each partition to the correct tenant's DuckLake. Think of it as a data viaduct with N exits.
 
+![Overview](docs/overview.svg)
+
+Source: [`docs/overview.d2`](docs/overview.d2)
+
 ```
 poll thread (every interval_seconds):
   current_snapshot() on source
