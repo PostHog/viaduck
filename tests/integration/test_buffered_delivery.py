@@ -187,3 +187,37 @@ def test_drain_flushes_buffered_data_on_shutdown(tmp_path, state):
     assert _read_dest(pool, "d1").num_rows == 2
     assert state.load_cursors(["d1"])["d1"].last_snapshot_id == 4
     pool.close_all()
+
+
+def test_multi_update_window_no_duplicate_keys(tmp_path, state):
+    """Soak-found bug lock: several updates to the same key inside one
+    buffered window must collapse to one destination row (Winner(k)),
+    not duplicate rows from a duplicate-join-key upsert."""
+    pool = _make_pool(tmp_path, ["d1"])
+    state.initialize_destinations(["d1"])
+    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+
+    insert = _cdc_batch("acme", [1])
+    update1 = pa.table(
+        {
+            "event_id": pa.array([1], type=pa.int32()),
+            "company": pa.array(["acme"], type=pa.string()),
+            "value": pa.array([111], type=pa.int32()),
+            "change_type": pa.array(["update_postimage"], type=pa.string()),
+            "snapshot_id": pa.array([8], type=pa.int64()),
+            "rowid": pa.array([1], type=pa.int64()),
+        }
+    )
+    update2 = update1.set_column(2, "value", pa.array([222], type=pa.int32())).set_column(
+        4, "snapshot_id", pa.array([9], type=pa.int64())
+    )
+    mgr.buffer("d1", insert, 7)
+    mgr.buffer("d1", update1, 8)
+    mgr.buffer("d1", update2, 9)
+    mgr.maybe_flush()
+    assert mgr.wait_idle()
+
+    rows = _read_dest(pool, "d1")
+    assert rows.num_rows == 1
+    assert rows.column("value").to_pylist() == [222]  # last write wins
+    pool.close_all()

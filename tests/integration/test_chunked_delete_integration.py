@@ -58,7 +58,12 @@ def _seed_rows(n: int, *, null_region_every: int | None = None) -> pa.Table:
 
 
 def _delete_batch(rows: pa.Table) -> pa.Table:
-    return rows.append_column("change_type", pa.array(["delete"] * rows.num_rows, type=pa.string()))
+    n = rows.num_rows
+    return (
+        rows.append_column("change_type", pa.array(["delete"] * n, type=pa.string()))
+        .append_column("snapshot_id", pa.array([1] * n, type=pa.int64()))
+        .append_column("rowid", pa.array(range(n), type=pa.int64()))
+    )
 
 
 @pytest.fixture()
@@ -144,6 +149,8 @@ def test_delete_plus_upsert_same_transaction_across_chunks(dest):
             "region": pa.array(["new", "new"], type=pa.string()),
             "value": pa.array([1, 2], type=pa.int32()),
             "change_type": pa.array(["insert", "insert"], type=pa.string()),
+            "snapshot_id": pa.array([2, 2], type=pa.int64()),
+            "rowid": pa.array([20_000, 20_001], type=pa.int64()),
         }
     )
     batch = pa.concat_tables([deletes, upserts], promote_options="default")

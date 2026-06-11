@@ -67,12 +67,17 @@ def current_snapshot_id(table: Table) -> int | None:
 
 def read_cdc(
     table: Table,
-    start_snapshot: int,
+    after_snapshot: int,
     end_snapshot: int,
     *,
     filter_expr: str | None = None,
 ) -> pa.Table:
-    """Read CDC insertions between two snapshots, returning an Arrow table.
+    """Read CDC insertions in the range (after_snapshot, end_snapshot].
+
+    after_snapshot is the last already-delivered snapshot and is EXCLUDED:
+    ducklake's table_insertions is inclusive on both bounds, and re-reading
+    the cursor snapshot pairs a re-read insert with its later delete in
+    conflict resolution — both cancel and the delete is lost (phantom row).
 
     Uses table_insertions with optional filter pushdown for efficiency.
     For append-only mode (no key_columns).
@@ -80,7 +85,7 @@ def read_cdc(
     t0 = time.monotonic()
 
     kwargs: dict = {
-        "start_snapshot": start_snapshot,
+        "start_snapshot": after_snapshot + 1,
         "end_snapshot": end_snapshot,
     }
     if filter_expr is not None:
@@ -94,8 +99,8 @@ def read_cdc(
     metrics.cdc_rows_read_total.inc(result.num_rows)
 
     log.debug(
-        "CDC read (insertions): snapshots %d→%d, %d rows in %.3fs%s",
-        start_snapshot,
+        "CDC read (insertions): snapshots (%d, %d], %d rows in %.3fs%s",
+        after_snapshot,
         end_snapshot,
         result.num_rows,
         duration,
@@ -107,12 +112,15 @@ def read_cdc(
 
 def read_cdc_changes(
     table: Table,
-    start_snapshot: int,
+    after_snapshot: int,
     end_snapshot: int,
     *,
     filter_expr: str | None = None,
 ) -> pa.Table:
-    """Read all CDC changes between two snapshots, returning an Arrow table.
+    """Read all CDC changes in the range (after_snapshot, end_snapshot].
+
+    after_snapshot is the last already-delivered snapshot and is EXCLUDED
+    (see read_cdc for the phantom-row failure mode of an inclusive read).
 
     Uses table_changes which includes inserts, deletes, and update pre/post images.
     The result contains metadata columns: change_type, snapshot_id, rowid.
@@ -121,7 +129,7 @@ def read_cdc_changes(
     t0 = time.monotonic()
 
     kwargs: dict = {
-        "start_snapshot": start_snapshot,
+        "start_snapshot": after_snapshot + 1,
         "end_snapshot": end_snapshot,
     }
     if filter_expr is not None:
@@ -135,8 +143,8 @@ def read_cdc_changes(
     metrics.cdc_rows_read_total.inc(result.num_rows)
 
     log.debug(
-        "CDC read (changes): snapshots %d→%d, %d rows in %.3fs%s",
-        start_snapshot,
+        "CDC read (changes): snapshots (%d, %d], %d rows in %.3fs%s",
+        after_snapshot,
         end_snapshot,
         result.num_rows,
         duration,

@@ -791,7 +791,12 @@ def _mock_catalog_and_table():
 
 
 def test_apply_changes_inserts_only():
-    """Only inserts: upsert called, no delete."""
+    """Only inserts: upsert called, no delete.
+
+    These _apply_changes tests key on "value" (unique per fixture row), not
+    "company" (constant): with a realistic key, duplicate-key rows collapse
+    via Winner(k) and the pass-through counts asserted here would change.
+    Same-key behavior is covered by the Winner(k) tests below."""
     catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
     batch = _cdc_table(
         [
@@ -799,11 +804,11 @@ def test_apply_changes_inserts_only():
             {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
         ]
     )
-    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    counts = _apply_changes(catalog, dest_table, batch, ["value"])
     assert counts["upserted"] == 2
     assert counts["deleted"] == 0
     txn_table.upsert.assert_called_once()
-    assert txn_table.upsert.call_args.kwargs["join_cols"] == ["company"]
+    assert txn_table.upsert.call_args.kwargs["join_cols"] == ["value"]
     txn_table.delete.assert_not_called()
 
 
@@ -847,12 +852,12 @@ def test_apply_changes_mixed():
             {"company": "acme", "value": 3, "change_type": "update_postimage", "snapshot_id": 1, "rowid": 300},
         ]
     )
-    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    counts = _apply_changes(catalog, dest_table, batch, ["value"])
     assert counts["deleted"] == 1
     assert counts["upserted"] == 2
     txn_table.delete.assert_called_once()
     txn_table.upsert.assert_called_once()
-    assert txn_table.upsert.call_args.kwargs["join_cols"] == ["company"]
+    assert txn_table.upsert.call_args.kwargs["join_cols"] == ["value"]
 
 
 def test_apply_changes_empty():
@@ -970,7 +975,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
     mock_dest_table.identifier = "dest_table"
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
-    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"])
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["value"], ["dest-1"])
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
@@ -983,7 +988,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
             cfg,
             ["dest-1"],
             {"quacksworth": "dest-1"},
-            key_columns=["company"],
+            key_columns=["value"],
             full_cdc=True,
         )
     assert delivery.wait_idle()
@@ -1446,7 +1451,7 @@ def test_apply_changes_upsert_matched_nonzero():
             {"company": "acme", "value": 4, "change_type": "update_postimage", "snapshot_id": 1, "rowid": 400},
         ]
     )
-    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    counts = _apply_changes(catalog, dest_table, batch, ["value"])
     assert counts["upserted"] == 4
     assert counts["upsert_matched"] == 3
 
@@ -2046,3 +2051,112 @@ def test_seed_new_destinations_logs_first_batch_milestone(caplog):
     assert milestone, f"No first-batch milestone line; got: {msgs}"
     assert "DuckDB pre-execution complete" in milestone[0]
     assert "streaming started" in milestone[0]
+
+
+# ---------------------------------------------------------------------------
+# Winner(k): per-key last-write-wins on upsert candidates (spec Phase3Apply)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_changes_dedupes_upsert_candidates_per_key():
+    """Multiple upsert candidates for one key (an insert + later postimages
+    across a buffered window) collapse to the highest-snapshot candidate
+    BEFORE the upsert — the spec's Winner(k). Found by the M3 soak:
+    without this, pyducklake upsert receives duplicate join keys and the
+    destination grows duplicate rows."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 3, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "update_postimage", "snapshot_id": 5, "rowid": 100},
+            {"company": "acme", "value": 3, "change_type": "update_postimage", "snapshot_id": 9, "rowid": 100},
+            {"company": "other", "value": 7, "change_type": "insert", "snapshot_id": 4, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    assert counts["upserted"] == 2  # one winner per key
+    sent = txn_table.upsert.call_args[0][0]
+    by_company = dict(zip(sent.column("company").to_pylist(), sent.column("value").to_pylist()))
+    assert by_company == {"acme": 3, "other": 7}  # highest snapshot wins
+
+
+def test_apply_changes_winner_tiebreak_by_rowid():
+    """Same snapshot for two candidates of one key (out-of-contract but
+    possible in a replayed union): rowid breaks the tie deterministically."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 5, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 5, "rowid": 300},
+        ]
+    )
+    _apply_changes(catalog, dest_table, batch, ["company"])
+    sent = txn_table.upsert.call_args[0][0]
+    assert sent.column("value").to_pylist() == [2]  # rowid 300 wins
+
+
+def test_apply_changes_winner_preserves_null_keys():
+    """NULL key values must survive Winner(k): Acero hash joins silently
+    drop null keys, which is why winner selection is take()-based. Null
+    keys form their own group and dedupe last-write-wins like any other."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": None, "value": 1, "change_type": "insert", "snapshot_id": 3, "rowid": 100},
+            {"company": None, "value": 2, "change_type": "update_postimage", "snapshot_id": 6, "rowid": 100},
+            {"company": "acme", "value": 7, "change_type": "insert", "snapshot_id": 4, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    assert counts["upserted"] == 2
+    sent = txn_table.upsert.call_args[0][0]
+    by_company = dict(zip(sent.column("company").to_pylist(), sent.column("value").to_pylist()))
+    assert by_company == {None: 2, "acme": 7}
+
+
+def test_apply_changes_winner_composite_key_null_component():
+    """A NULL in one component of a composite key must also survive."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "region": None, "value": 1, "change_type": "insert", "snapshot_id": 3, "rowid": 100},
+            {
+                "company": "acme",
+                "region": None,
+                "value": 2,
+                "change_type": "update_postimage",
+                "snapshot_id": 5,
+                "rowid": 100,
+            },
+            {"company": "acme", "region": "us", "value": 9, "change_type": "insert", "snapshot_id": 4, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["company", "region"])
+    assert counts["upserted"] == 2
+    sent = txn_table.upsert.call_args[0][0]
+    got = set(zip(sent.column("region").to_pylist(), sent.column("value").to_pylist()))
+    assert got == {(None, 2), ("us", 9)}
+
+
+def test_apply_changes_key_reuse_delete_before_upsert():
+    """Key takeover within one window: delete of rowid r1 (key k) plus a
+    surviving insert of rowid r2 (same k). Phase 2 keys on rowid so both
+    survive to Phase 3, which must apply the delete BEFORE the upsert or
+    the reinserted row is eaten (spec afterDelete/afterUpsert order)."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    order = MagicMock()
+    order.attach_mock(txn_table.delete, "delete")
+    order.attach_mock(txn_table.upsert, "upsert")
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "delete", "snapshot_id": 4, "rowid": 100},
+            {"company": "acme", "value": 5, "change_type": "insert", "snapshot_id": 6, "rowid": 300},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["company"])
+    assert counts["deleted"] == 1
+    assert counts["upserted"] == 1
+    calls = [name for name, _, _ in order.mock_calls if name in ("delete", "upsert")]
+    assert calls == ["delete", "upsert"]
+    sent = txn_table.upsert.call_args[0][0]
+    assert sent.column("value").to_pylist() == [5]

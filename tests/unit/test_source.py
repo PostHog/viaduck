@@ -35,9 +35,10 @@ def test_read_cdc_calls_table_insertions():
     changeset.to_arrow.return_value = arrow_table
     table.table_insertions.return_value = changeset
 
-    result = read_cdc(table, start_snapshot=0, end_snapshot=5)
+    result = read_cdc(table, after_snapshot=0, end_snapshot=5)
 
-    table.table_insertions.assert_called_once_with(start_snapshot=0, end_snapshot=5)
+    # after_snapshot is exclusive (last delivered): reads (0, 5] -> pyducklake start 1
+    table.table_insertions.assert_called_once_with(start_snapshot=1, end_snapshot=5)
     assert result.num_rows == 2
 
 
@@ -48,10 +49,10 @@ def test_read_cdc_with_filter():
     changeset.to_arrow.return_value = arrow_table
     table.table_insertions.return_value = changeset
 
-    result = read_cdc(table, start_snapshot=0, end_snapshot=5, filter_expr="team_id IN (123)")
+    result = read_cdc(table, after_snapshot=0, end_snapshot=5, filter_expr="team_id IN (123)")
 
     table.table_insertions.assert_called_once_with(
-        start_snapshot=0,
+        start_snapshot=1,
         end_snapshot=5,
         filter_expr="team_id IN (123)",
     )
@@ -65,7 +66,7 @@ def test_read_cdc_empty_result():
     changeset.to_arrow.return_value = arrow_table
     table.table_insertions.return_value = changeset
 
-    result = read_cdc(table, start_snapshot=5, end_snapshot=5)
+    result = read_cdc(table, after_snapshot=5, end_snapshot=5)
     assert result.num_rows == 0
 
 
@@ -104,9 +105,9 @@ def test_read_cdc_changes_calls_table_changes():
     changeset.to_arrow.return_value = arrow_table
     table.table_changes.return_value = changeset
 
-    result = read_cdc_changes(table, start_snapshot=0, end_snapshot=5)
+    result = read_cdc_changes(table, after_snapshot=0, end_snapshot=5)
 
-    table.table_changes.assert_called_once_with(start_snapshot=0, end_snapshot=5)
+    table.table_changes.assert_called_once_with(start_snapshot=1, end_snapshot=5)
     table.table_insertions.assert_not_called()
     assert result.num_rows == 2
 
@@ -119,10 +120,10 @@ def test_read_cdc_changes_with_filter():
     changeset.to_arrow.return_value = arrow_table
     table.table_changes.return_value = changeset
 
-    result = read_cdc_changes(table, start_snapshot=0, end_snapshot=5, filter_expr="team_id IN (123)")
+    result = read_cdc_changes(table, after_snapshot=0, end_snapshot=5, filter_expr="team_id IN (123)")
 
     table.table_changes.assert_called_once_with(
-        start_snapshot=0,
+        start_snapshot=1,
         end_snapshot=5,
         filter_expr="team_id IN (123)",
     )
@@ -142,7 +143,7 @@ def test_read_cdc_changes_empty():
     changeset.to_arrow.return_value = arrow_table
     table.table_changes.return_value = changeset
 
-    result = read_cdc_changes(table, start_snapshot=5, end_snapshot=5)
+    result = read_cdc_changes(table, after_snapshot=5, end_snapshot=5)
     assert result.num_rows == 0
 
 
@@ -161,7 +162,7 @@ def test_read_cdc_changes_with_all_change_types():
     changeset.to_arrow.return_value = arrow_table
     table.table_changes.return_value = changeset
 
-    result = read_cdc_changes(table, start_snapshot=0, end_snapshot=10)
+    result = read_cdc_changes(table, after_snapshot=0, end_snapshot=10)
 
     assert result.num_rows == 4
     assert result.column("change_type").to_pylist() == ["INSERT", "DELETE", "UPDATE_PREIMAGE", "UPDATE_POSTIMAGE"]
@@ -182,7 +183,7 @@ def test_read_cdc_changes_rowid_preservation():
     changeset.to_arrow.return_value = arrow_table
     table.table_changes.return_value = changeset
 
-    result = read_cdc_changes(table, start_snapshot=0, end_snapshot=10)
+    result = read_cdc_changes(table, after_snapshot=0, end_snapshot=10)
 
     assert "rowid" in result.column_names
     assert result.column("rowid").to_pylist() == [100, 101]
@@ -196,9 +197,9 @@ def test_read_cdc_unchanged():
     changeset.to_arrow.return_value = arrow_table
     table.table_insertions.return_value = changeset
 
-    result = read_cdc(table, start_snapshot=0, end_snapshot=5)
+    result = read_cdc(table, after_snapshot=0, end_snapshot=5)
 
-    table.table_insertions.assert_called_once_with(start_snapshot=0, end_snapshot=5)
+    table.table_insertions.assert_called_once_with(start_snapshot=1, end_snapshot=5)
     table.table_changes.assert_not_called()
     assert result.num_rows == 3
 

@@ -605,11 +605,11 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                 # Read CDC — full changes or insertions only
                 if full_cdc:
                     raw_data = source.read_cdc_changes(
-                        src_table, start_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
+                        src_table, after_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
                     )
                 else:
                     raw_data = source.read_cdc(
-                        src_table, start_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
+                        src_table, after_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
                     )
 
                 try:

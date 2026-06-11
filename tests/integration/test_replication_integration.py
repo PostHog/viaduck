@@ -17,7 +17,7 @@ from viaduck.apply import _apply_changes, _resolve_conflicts
 from viaduck.config import RoutingConfig, StateConfig
 from viaduck.main import _resolve_preimages, _seed_new_destinations
 from viaduck.router import Router
-from viaduck.source import META_COLUMNS, strip_meta
+from viaduck.source import META_COLUMNS, read_cdc, read_cdc_changes, strip_meta
 from viaduck.state import StateManager
 
 pytestmark = pytest.mark.integration
@@ -509,3 +509,55 @@ def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_tabl
     # Verify cursor is at the snapshot the seed function observed
     cursors = sm.load_cursors(["dest-acme"])
     assert cursors["dest-acme"].last_snapshot_id == expected_snap
+
+
+def test_read_cdc_changes_excludes_start_snapshot(source_table):
+    """read_cdc_changes takes start_snapshot = the last delivered snapshot
+    and must read (start, end]: ducklake's table_changes is inclusive on
+    both bounds, so an unadjusted read re-delivers the cursor snapshot."""
+    source_table.append(_arrow_rows([1], ["acme"], [10]))
+    insert_snap = source_table.current_snapshot().snapshot_id
+
+    source_table.delete("event_id = 1")
+    delete_snap = source_table.current_snapshot().snapshot_id
+
+    cdc = read_cdc_changes(source_table, after_snapshot=insert_snap, end_snapshot=delete_snap)
+    assert cdc.column("change_type").to_pylist() == ["delete"]
+    assert cdc.column("snapshot_id").to_pylist() == [delete_snap]
+
+
+def test_read_cdc_excludes_after_snapshot_append_only(source_table):
+    """Append-only path: re-reading the cursor snapshot re-appends its rows
+    verbatim — no Phase 2 to cancel and no upsert idempotence to mask it.
+    read_cdc must read (after_snapshot, end_snapshot]."""
+    source_table.append(_arrow_rows([1], ["acme"], [10]))
+    first_snap = source_table.current_snapshot().snapshot_id
+    source_table.append(_arrow_rows([2], ["acme"], [20]))
+    second_snap = source_table.current_snapshot().snapshot_id
+
+    rows = read_cdc(source_table, after_snapshot=first_snap, end_snapshot=second_snap)
+    assert rows.column("event_id").to_pylist() == [2]
+
+
+def test_seed_boundary_delete_not_cancelled_by_reread(source_table, dest_catalog_a, dest_table_a):
+    """Soak-found phantom regression: a destination seeded at snapshot S has
+    its cursor at S. If the next CDC read re-includes snapshot S, the
+    re-read insert pairs with the row's later delete in Phase 2 — both
+    cancel, the delete is lost, and the seeded copy is a permanent phantom."""
+    source_table.append(_arrow_rows([1, 2], ["acme", "acme"], [10, 20]))
+    seed_snap = source_table.current_snapshot().snapshot_id
+
+    # Seed: full scan at seed_snap, cursor = seed_snap.
+    dest_table_a.append(source_table.scan().to_arrow())
+
+    # Row 1 deleted after the seed.
+    source_table.delete("event_id = 1")
+    current = source_table.current_snapshot().snapshot_id
+
+    cdc_data = read_cdc_changes(source_table, after_snapshot=seed_snap, end_snapshot=current)
+    resolved = _resolve_conflicts(_resolve_preimages(cdc_data, "company", ["event_id"]))
+    counts = _apply_changes(dest_catalog_a, dest_table_a, resolved, ["event_id"])
+    assert counts["deleted"] == 1
+
+    dest_scan = _read_all(dest_table_a)
+    assert dest_scan.column("event_id").to_pylist() == [2]

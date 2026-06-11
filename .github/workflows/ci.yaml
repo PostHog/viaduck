@@ -57,10 +57,14 @@ jobs:
         #   - psycopg, psycopg-binary  LGPL-3.0-or-later: we link, don't
         #     modify; LGPL terms are satisfied — accepted as a
         #     PostHog-cloud-infra precedent (see millpond's ci.yaml).
+        #   - certifi  MPL-2.0: file-level copyleft satisfied by using the
+        #     unmodified CA bundle; dev-only transitive of
+        #     testcontainers -> requests.
         allow-dependencies-licenses: >-
           pkg:pypi/typing-extensions,
           pkg:pypi/psycopg,
-          pkg:pypi/psycopg-binary
+          pkg:pypi/psycopg-binary,
+          pkg:pypi/certifi
 
   build:
     runs-on: ubuntu-latest

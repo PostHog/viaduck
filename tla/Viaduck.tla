@@ -193,7 +193,10 @@ Phase2(changes) ==
 \* Phase 3: Apply — delete then upsert.
 \* Modeled as an atomic operation (ASSUMPTION 4: destination transactions).
 \* For each key with multiple upsert candidates, the one with the highest
-\* snapshot_id wins (last-write-wins within the batch).
+\* snapshot_id wins (last-write-wins within the batch). On equal
+\* snapshot_id, CHOOSE picks an arbitrary-but-fixed candidate; the
+\* implementation refines this with a deterministic rowid tiebreaker
+\* (viaduck/apply.py _dedupe_upserts_last_write_wins).
 Phase3Apply(d, resolved) ==
     LET keysToDelete == {c.key : c \in {r \in resolved : r.type = "delete"}}
         upsertChanges == {r \in resolved : r.type \in {"insert", "update_postimage"}}

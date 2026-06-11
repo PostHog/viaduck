@@ -236,6 +236,31 @@ def _build_delete_filter(delete_rows: pa.Table, key_columns: list[str]) -> str:
     return row_filters[0].to_sql()
 
 
+def _dedupe_upserts_last_write_wins(upsert_rows: pa.Table, key_columns: list[str]) -> pa.Table:
+    """Per-key last-write-wins over the upsert candidates — the spec's
+    Phase3Apply Winner(k) (tla/Viaduck.tla).
+
+    A buffered flush batch unions multiple CDC reads, so the same key can
+    legitimately carry several upsert candidates (an insert + later
+    postimages, or successive postimages). Passing duplicate-key rows to
+    pyducklake's upsert produces duplicate rows in the destination (found
+    by the M3 soak: multi-update windows at 15s buffering). Keep the
+    candidate with the highest snapshot_id, rowid as a deterministic
+    tiebreaker. Requires the CDC meta columns — call BEFORE strip_meta.
+
+    Selection is take()-on-winner-indices, not a join back: Acero hash
+    joins don't match NULL keys, which would silently drop null-keyed
+    candidates. group_by treats NULLs as a regular group, so they
+    round-trip through take.
+    """
+    if upsert_rows.num_rows <= 1:
+        return upsert_rows
+    ordered = upsert_rows.combine_chunks().sort_by([("snapshot_id", "ascending"), ("rowid", "ascending")])
+    ordered = ordered.append_column("__idx", row_indices(ordered.num_rows))
+    winners = ordered.group_by(key_columns).aggregate([("__idx", "max")])
+    return ordered.take(winners.column("__idx_max")).drop(["__idx"])
+
+
 def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str]) -> dict[str, int]:
     """Apply CDC changes to a destination table atomically.
 
@@ -264,7 +289,8 @@ def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str])
         pc.equal(ct_col, pa.scalar("insert")),
         pc.equal(ct_col, pa.scalar("update_postimage")),
     )
-    upsert_rows = strip_meta(batch.filter(upsert_mask))
+    # Winner(k) BEFORE stripping meta — the dedup orders by snapshot_id/rowid.
+    upsert_rows = strip_meta(_dedupe_upserts_last_write_wins(batch.filter(upsert_mask), key_columns))
 
     counts = {"deleted": 0, "upserted": 0, "upsert_matched": 0}
 
