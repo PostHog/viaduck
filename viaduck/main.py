@@ -791,6 +791,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                 applied_updates=d.applied_updates,
                 applied_deletes=d.applied_deletes,
                 buffered_rows_total=d.buffered_rows_total,
+                lag_seconds=round(d.lag_seconds, 1),
             )
         )
 
@@ -800,6 +801,13 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
         mode="full_cdc" if full_cdc else "append_only",
         poll_interval=cfg.poll.interval_seconds,
         flush_interval=cfg.delivery.flush_interval_seconds,
+        delivery_config={
+            "workers": cfg.delivery.workers,
+            "flush_max_rows": cfg.delivery.flush_max_rows,
+            "flush_max_bytes": cfg.delivery.flush_max_bytes,
+            "buffer_total_max_bytes": cfg.delivery.buffer_total_max_bytes,
+            "pool_max_open": cfg.delivery.pool_max_open,
+        },
         destinations=dest_statuses,
         pool_open=dest_pool.size,
         pool_max=dest_pool.max_open,

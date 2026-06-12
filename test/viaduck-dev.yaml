@@ -22,18 +22,149 @@ defaults:
     s3_use_ssl: "false"
     s3_url_style: path
 
+# 20 destinations sharing one Postgres catalog DB and bucket — one
+# DuckLake table per tenant. Producer volume is power-law distributed
+# across them (see producer.py).
 destinations:
   - id: quacksworth-lake
     routing_value: quacksworth
     name: quacksworth
     postgres_uri_env: DEST_1_POSTGRES_URI
     data_path: s3://dest-1/
+    table: events_quacksworth
 
   - id: mallardine-lake
     routing_value: mallardine
     name: mallardine
-    postgres_uri_env: DEST_2_POSTGRES_URI
-    data_path: s3://dest-2/
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_mallardine
+
+  - id: drakeford-lake
+    routing_value: drakeford
+    name: drakeford
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_drakeford
+
+  - id: gosswick-lake
+    routing_value: gosswick
+    name: gosswick
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_gosswick
+
+  - id: eiderdown-lake
+    routing_value: eiderdown
+    name: eiderdown
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_eiderdown
+
+  - id: pintailor-lake
+    routing_value: pintailor
+    name: pintailor
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_pintailor
+
+  - id: scaupson-lake
+    routing_value: scaupson
+    name: scaupson
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_scaupson
+
+  - id: wigeonton-lake
+    routing_value: wigeonton
+    name: wigeonton
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_wigeonton
+
+  - id: gadwallace-lake
+    routing_value: gadwallace
+    name: gadwallace
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_gadwallace
+
+  - id: smewbury-lake
+    routing_value: smewbury
+    name: smewbury
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_smewbury
+
+  - id: pochardly-lake
+    routing_value: pochardly
+    name: pochardly
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_pochardly
+
+  - id: canvasbeck-lake
+    routing_value: canvasbeck
+    name: canvasbeck
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_canvasbeck
+
+  - id: redheadly-lake
+    routing_value: redheadly
+    name: redheadly
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_redheadly
+
+  - id: buffleton-lake
+    routing_value: buffleton
+    name: buffleton
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_buffleton
+
+  - id: goldeneye-lake
+    routing_value: goldeneye
+    name: goldeneye
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_goldeneye
+
+  - id: merganser-lake
+    routing_value: merganser
+    name: merganser
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_merganser
+
+  - id: ruddyshore-lake
+    routing_value: ruddyshore
+    name: ruddyshore
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_ruddyshore
+
+  - id: shovelnook-lake
+    routing_value: shovelnook
+    name: shovelnook
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_shovelnook
+
+  - id: woodington-lake
+    routing_value: woodington
+    name: woodington
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_woodington
+
+  - id: brantley-lake
+    routing_value: brantley
+    name: brantley
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_brantley
 
 poll:
   interval_seconds: 3
