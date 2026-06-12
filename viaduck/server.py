@@ -169,44 +169,139 @@ _UI_HTML = """\
 <html>
 <head>
 <meta charset="utf-8">
-<title>Viaduck Status</title>
+<title>VIADUCK // DUCK DECK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600;700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap"
+rel="stylesheet">
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
-         margin: 2em; background: #fafafa; color: #333; }
-  h1 { font-size: 1.4em; margin-bottom: 0.2em; }
-  .meta { color: #666; font-size: 0.9em; margin-bottom: 1.5em; }
-  table { border-collapse: collapse; width: 100%; max-width: 1100px; }
-  th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #ddd; }
-  th { background: #f0f0f0; font-weight: 600; cursor: help;
-       white-space: nowrap; vertical-align: bottom; }
-  .unit { display: block; font-weight: 400; font-size: 0.75em; color: #888; }
-  .sort-ind { font-size: 0.75em; color: #555; margin-left: 4px; }
-  .lag-warn { color: #f57f17; font-weight: 600; }
-  .lag-bad { color: #c62828; font-weight: 600; }
+  /* Design language borrowed from PostHog/peepernetes (duckgres node deck). */
+  :root {
+    --bg: #07090d;
+    --panel: #0d1117;
+    --panel2: #11161d;
+    --line: #1d2630;
+    --line-bright: #2c3a48;
+    --text: #c9d6e2;
+    --dim: #5a6b7c;
+    --cyan: #38e1ff;
+    --amber: #ffb224;
+    --purple: #c08bff;
+    --green: #4ade80;
+    --bad: #ff4d5e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "IBM Plex Mono", monospace; font-size: 13px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(ellipse at 50% -10%, rgba(56,225,255,.05), transparent 60%),
+      repeating-linear-gradient(0deg, transparent 0 39px, rgba(56,225,255,.025) 39px 40px),
+      repeating-linear-gradient(90deg, transparent 0 39px, rgba(56,225,255,.025) 39px 40px);
+  }
+  header {
+    position: relative; z-index: 2; display: flex; align-items: flex-start; gap: 28px;
+    padding: 14px 22px 12px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #0c1118, #090d12); flex: none;
+  }
+  .brand { display: flex; flex-direction: column; line-height: 1.05; }
+  .brand .t {
+    font-family: "Chakra Petch", sans-serif; font-weight: 700; font-size: 21px;
+    letter-spacing: .14em; color: #eaf6ff; text-shadow: 0 0 18px rgba(56,225,255,.35);
+  }
+  .brand .t em { color: var(--cyan); font-style: normal; }
+  .brand .s { font-size: 10px; color: var(--dim); letter-spacing: .3em; margin-top: 3px; text-transform: uppercase; }
+  .stats { display: flex; gap: 24px; margin-left: 18px; align-items: flex-start; margin-top: 2px; }
+  .stat { display: flex; flex-direction: column; align-items: flex-start; min-width: 72px; }
+  .stat .n {
+    font-weight: 600; font-size: 19px; line-height: 1.1;
+    font-variant-numeric: tabular-nums; transition: color .3s;
+  }
+  .stat .l { font-size: 9px; letter-spacing: .22em; color: var(--dim); }
+  #n-dests .n { color: #eaf6ff; }
+  #n-buf .n { color: var(--cyan); }
+  #n-lag .n { color: var(--amber); }
+  #n-err .n { color: var(--bad); }
+  #n-err.zero .n { color: var(--dim); }
+  .spacer { flex: 1; }
+  #conn { display: flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: .15em; align-self: center; }
+  #conn .cdot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); transition: background .3s; }
+  #conn.live .cdot { background: var(--green); box-shadow: 0 0 10px var(--green); animation: blink 2.4s infinite; }
+  #conn.live span { color: var(--green); }
+  #conn span { color: var(--bad); }
+  @keyframes blink { 50% { opacity: .55; } }
+  main { position: relative; z-index: 1; flex: 1; overflow-y: auto; padding: 18px 22px 26px; }
+  main::-webkit-scrollbar { width: 10px; }
+  main::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 5px; }
+  .meta { color: var(--dim); font-size: 11px; margin-bottom: 16px; letter-spacing: .04em; }
+  .pool-head {
+    display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px;
+    font-family: "Chakra Petch", sans-serif;
+  }
+  .pool-head .name { font-size: 14px; font-weight: 600; letter-spacing: .2em; color: var(--cyan);
+    text-shadow: 0 0 12px rgba(56,225,255,.4); text-transform: uppercase; }
+  .pool-head .count { font-size: 11px; color: var(--dim); font-family: "IBM Plex Mono", monospace; }
+  .pool-head::after { content: ""; flex: 1; height: 1px;
+    background: linear-gradient(90deg, var(--line-bright), transparent); align-self: center; }
+  table { border-collapse: collapse; width: 100%;
+    background: linear-gradient(180deg, var(--panel2), var(--panel));
+    border: 1px solid var(--line-bright); border-radius: 6px; }
+  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--line); }
+  th {
+    font-family: "Chakra Petch", sans-serif; font-weight: 600; font-size: 11px;
+    letter-spacing: .14em; text-transform: uppercase; color: #9fb4c8;
+    white-space: nowrap; vertical-align: bottom; background: var(--panel2);
+  }
+  tr:hover td { background: rgba(56,225,255,.03); }
+  .unit { display: block; font-weight: 400; font-size: 0.75em; letter-spacing: .08em;
+    color: var(--dim); text-transform: none; font-family: "IBM Plex Mono", monospace; }
+  .sort-ind { font-size: 0.75em; color: var(--cyan); margin-left: 4px; }
+  .lag-warn { color: var(--amber); font-weight: 600; }
+  .lag-bad { color: var(--bad); font-weight: 600; }
   th[data-sort] { cursor: pointer; user-select: none; }
+  th[data-sort]:hover { color: var(--cyan); }
   /* numeric columns: Snapshot, Lag, Rows Processed, Buffered */
   th:nth-child(n+3):nth-child(-n+7), td:nth-child(n+3):nth-child(-n+7) { text-align: right; }
   td:nth-child(8) { cursor: help; }
-  .tip { cursor: help; border-bottom: 1px dotted #999; }
-  .healthy { color: #2e7d32; }
-  .buffering { color: #1565c0; }
-  .flushing { color: #00838f; }
-  .lagging { color: #f57f17; }
-  .error { color: #c62828; font-weight: bold; }
-  .pool { margin-top: 1.5em; font-size: 0.9em; color: #666; }
+  .tip { cursor: help; border-bottom: 1px dotted var(--dim); }
+  .healthy { color: var(--green); }
+  .buffering { color: var(--cyan); }
+  .flushing { color: var(--purple); }
+  .lagging { color: var(--amber); }
+  .error { color: var(--bad); font-weight: bold; }
+  .pool { margin-top: 16px; font-size: 11px; color: var(--dim); letter-spacing: .1em; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-         margin-right: 6px; vertical-align: middle; }
-  .dot-healthy { background: #4caf50; }
-  .dot-buffering { background: #42a5f5; }
-  .dot-flushing { background: #26c6da; }
-  .dot-lagging { background: #ffb300; }
-  .dot-error { background: #e53935; }
-  #disconnected { display: none; color: #c62828; font-size: 0.9em; margin-top: 1em; }
+         margin-right: 8px; vertical-align: middle; }
+  .dot-healthy { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot-buffering { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+  .dot-flushing { background: var(--purple); box-shadow: 0 0 8px var(--purple); }
+  .dot-lagging { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+  .dot-error { background: var(--bad); box-shadow: 0 0 10px var(--bad); }
 </style>
 </head>
 <body>
-<h1>Viaduck</h1>
+<header>
+  <div class="brand">
+    <div class="t">VIADUCK <em>//</em> DUCK DECK</div>
+    <div class="s" id="subtitle">CONNECTING&#8230;</div>
+  </div>
+  <div class="stats">
+    <div class="stat" id="n-dests"><span class="n">&#8211;</span><span class="l">DESTINATIONS</span></div>
+    <div class="stat" id="n-buf"><span class="n">&#8211;</span><span class="l">BUFFERED ROWS</span></div>
+    <div class="stat" id="n-lag"><span class="n">&#8211;</span><span class="l">MAX LAG</span></div>
+    <div class="stat" id="n-err"><span class="n">&#8211;</span><span class="l">ERRORS</span></div>
+  </div>
+  <div class="spacer"></div>
+  <div id="conn"><div class="cdot"></div><span>LINK</span></div>
+</header>
+<main>
 <div class="meta" id="meta">Connecting...</div>
+<div class="pool-head"><span class="name">Destinations</span><span class="count" id="dest-count"></span></div>
 <table>
   <thead>
     <tr>
@@ -244,12 +339,12 @@ data-sort="last_error" data-type="str">Last Error<span class="sort-ind"></span><
   <tbody id="tbody"></tbody>
 </table>
 <div class="pool" id="pool"></div>
-<div id="disconnected">SSE disconnected. Reconnecting...</div>
+</main>
 <script>
 const tbody = document.getElementById('tbody');
 const meta = document.getElementById('meta');
 const pool = document.getElementById('pool');
-const disc = document.getElementById('disconnected');
+const conn = document.getElementById('conn');
 
 function fmt(n) { return n != null ? n.toLocaleString() : '-'; }
 
@@ -324,8 +419,23 @@ document.querySelectorAll('th[data-sort]').forEach(function(th) {
   });
 });
 
+function setStat(id, val, zeroDim) {
+  const el = document.getElementById(id);
+  el.querySelector('.n').textContent = val;
+  if (zeroDim !== undefined) el.classList.toggle('zero', zeroDim);
+}
+
 function update(d) {
   lastData = d;
+  const ds = d.destinations || [];
+  document.getElementById('subtitle').textContent =
+    (d.source_table || '?') + ' @ ' + fmt(d.source_snapshot) + ' \u00b7 ' + (d.mode || '?');
+  document.getElementById('dest-count').textContent = ds.length + ' lakes';
+  setStat('n-dests', ds.length);
+  setStat('n-buf', fmt(ds.reduce(function(a, x) { return a + x.buffer_rows; }, 0)));
+  setStat('n-lag', Math.round(Math.max.apply(null, [0].concat(ds.map(function(x) { return x.lag_seconds; })))) + 's');
+  const errs = ds.filter(function(x) { return x.status === 'error'; }).length;
+  setStat('n-err', errs, errs === 0);
   meta.innerHTML = 'Source: ' + esc(d.source_table || '?') +
     ' @ snapshot ' + fmt(d.source_snapshot) +
     '  |  Mode: <span class="tip" title="' + esc(modeTips[d.mode] || '') + '">' + esc(d.mode || '?') + '</span>' +
@@ -369,8 +479,8 @@ function update(d) {
 
 function connect() {
   const es = new EventSource('/ui/sse');
-  es.onmessage = function(e) { disc.style.display = 'none'; update(JSON.parse(e.data)); };
-  es.onerror = function() { disc.style.display = 'block'; };
+  es.onmessage = function(e) { conn.classList.add('live'); update(JSON.parse(e.data)); };
+  es.onerror = function() { conn.classList.remove('live'); };
 }
 connect();
 </script>
