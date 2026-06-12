@@ -69,6 +69,15 @@ class DestDeliveryStatus:
     buffer_rows: int
     buffer_age_s: float
     flushing: bool
+    # This-run cumulative counters (in-memory, reset on restart). Applied
+    # counts are taken from the flushed batch's change_type column BEFORE
+    # Phase 2 — post-resolution the types are mangled (inserts collapse
+    # into upserts, tombstones inflate deletes), so pre-Phase-2 is the
+    # count that means something to a human.
+    applied_inserts: int = 0
+    applied_updates: int = 0
+    applied_deletes: int = 0
+    buffered_rows_total: int = 0
 
 
 class DeliveryManager:
@@ -124,6 +133,12 @@ class DeliveryManager:
         # watermark and the total-bytes gauge so memory backpressure sees
         # the worker-owned data too, not just live buffers.
         self._inflight_bytes: dict[str, int] = {d: 0 for d in assigned_ids}
+        # This-run counters for the status page: pre-Phase-2 change-type
+        # counts of successfully flushed batches, and total rows ever
+        # buffered. In-memory only; at-least-once replays may double-count
+        # (same caveat as rows_replicated).
+        self._applied: dict[str, dict[str, int]] = {d: {"inserts": 0, "updates": 0, "deletes": 0} for d in assigned_ids}
+        self._buffered_rows_total: dict[str, int] = {d: 0 for d in assigned_ids}
 
     # ------------------------------------------------------------------ #
     # Poll-thread API
@@ -162,6 +177,7 @@ class DeliveryManager:
             buf.tables.append(table)
             buf.rows += table.num_rows
             buf.bytes += table.nbytes
+            self._buffered_rows_total[dest_id] += table.num_rows
             if buf.first_buffered_at is None:
                 buf.first_buffered_at = now
             self._position[dest_id] = through_snapshot
@@ -277,6 +293,10 @@ class DeliveryManager:
                     if self._buffers[d].first_buffered_at is not None
                     else 0.0,
                     flushing=d in self._inflight,
+                    applied_inserts=self._applied[d]["inserts"],
+                    applied_updates=self._applied[d]["updates"],
+                    applied_deletes=self._applied[d]["deletes"],
+                    buffered_rows_total=self._buffered_rows_total[d],
                 )
                 for d in self._buffers
             }
@@ -284,6 +304,18 @@ class DeliveryManager:
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
+
+    def _change_type_counts(self, batch: pa.Table) -> tuple[int, int, int]:
+        """(inserts, updates, deletes) from the PRE-Phase-2 batch — the
+        counts as the source meant them, before conflict resolution
+        collapses inserts into upserts and emits tombstone deletes."""
+        if not self._full_cdc or "change_type" not in batch.column_names:
+            return (batch.num_rows, 0, 0)  # append-only: everything is an insert
+        counts = {"insert": 0, "update_postimage": 0, "delete": 0}
+        for entry in batch.column("change_type").value_counts().to_pylist():
+            if entry["values"] in counts:
+                counts[entry["values"]] += entry["counts"]
+        return (counts["insert"], counts["update_postimage"], counts["delete"])
 
     @staticmethod
     def _log_escaped_exception(future) -> None:
@@ -334,10 +366,16 @@ class DeliveryManager:
                 cumulative = self._rows_replicated[dest_id] + ops_count
             self._advance_cursor_with_retry(dest_id, through, cumulative)
             duration = time.monotonic() - t0
+            type_counts = self._change_type_counts(batch) if tables else None
             with self._lock:
                 self._flushed[dest_id] = max(self._flushed[dest_id], through)
                 self._rows_replicated[dest_id] = cumulative
                 self._last_error[dest_id] = None
+                if type_counts is not None:
+                    applied = self._applied[dest_id]
+                    applied["inserts"] += type_counts[0]
+                    applied["updates"] += type_counts[1]
+                    applied["deletes"] += type_counts[2]
             metrics.delivery_flushes_total.labels(destination=dest_id, trigger=trigger).inc()
             metrics.dest_last_snapshot_id.labels(destination=dest_id).set(through)
             if tables:

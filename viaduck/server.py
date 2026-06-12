@@ -91,6 +91,12 @@ class DestStatus:
     last_error: str | None
     buffer_rows: int = 0
     buffer_age_s: float = 0.0
+    # This-run cumulative counters (reset on restart): applied counts are
+    # pre-Phase-2 change types of successfully flushed batches.
+    applied_inserts: int = 0
+    applied_updates: int = 0
+    applied_deletes: int = 0
+    buffered_rows_total: int = 0
 
 
 class StatusState:
@@ -171,8 +177,8 @@ _UI_HTML = """\
        white-space: nowrap; vertical-align: bottom; }
   .unit { display: block; font-weight: 400; font-size: 0.75em; color: #888; }
   /* numeric columns: Snapshot, Lag, Rows Processed, Buffered */
-  th:nth-child(n+3):nth-child(-n+6), td:nth-child(n+3):nth-child(-n+6) { text-align: right; }
-  td:nth-child(7) { cursor: help; }
+  th:nth-child(n+3):nth-child(-n+7), td:nth-child(n+3):nth-child(-n+7) { text-align: right; }
+  td:nth-child(8) { cursor: help; }
   .tip { cursor: help; border-bottom: 1px dotted #999; }
   .healthy { color: #2e7d32; }
   .buffering { color: #1565c0; }
@@ -204,8 +210,13 @@ With buffered delivery a nonzero value between flushes is normal — see Status"
 class="unit">snapshots behind</span></th>
       <th title="Cumulative operations applied since seeding (upserts + deletes),
 not the destination's current row count">Rows Processed<span class="unit">ops applied</span></th>
-      <th title="Rows read from the source and awaiting flush (buffer age in seconds)">Buffered<span
+      <th title="Rows read from the source and awaiting flush (buffer age in seconds).
+Hover a cell for the cumulative rows buffered this run">Buffered<span
 class="unit">rows (age)</span></th>
+      <th title="Rows forwarded to the destination this run, counted before conflict
+resolution (+ inserts / Δ updates / − deletes). In-memory: resets on restart;
+at-least-once replays can double-count">Applied<span
+class="unit">+ / Δ / −</span></th>
       <th title="healthy: flushed through the current snapshot. buffering: read-current,
 data awaiting flush (normal). flushing: a flush is in progress. lagging: reads are
 behind the source. error: last flush failed; the range will be re-read">Status</th>
@@ -261,8 +272,11 @@ function update(d) {
       '<td>' + fmt(dest.snapshot) + '</td>' +
       '<td>' + fmt(dest.lag) + '</td>' +
       '<td>' + fmt(dest.rows_replicated) + '</td>' +
-      '<td>' + (dest.buffer_rows
+      '<td title="Cumulative rows buffered this run: ' + fmt(dest.buffered_rows_total) + '">' +
+        (dest.buffer_rows
         ? fmt(dest.buffer_rows) + ' (' + Math.round(dest.buffer_age_s) + 's)' : '-') + '</td>' +
+      '<td>+' + fmt(dest.applied_inserts) + ' \u0394' + fmt(dest.applied_updates) +
+        ' \u2212' + fmt(dest.applied_deletes) + '</td>' +
       '<td class="' + cls + '" title="' + (statusTips[cls] || '') + '">' + cls + '</td>' +
       '<td>' + (dest.last_error || '') + '</td></tr>';
   });

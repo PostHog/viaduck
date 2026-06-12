@@ -184,18 +184,16 @@ def test_full_cdc_insert_delete_round_trip(source_catalog, source_table, dest_ca
 
     # Phase 1: resolve preimages (no preimages here, pass-through)
     resolved = _resolve_preimages(cdc_data, "company", ["event_id"])
-    # Phase 2: resolve conflicts — insert+delete for event_id=2 cancel
+    # Phase 2: insert for event_id=2 drops; its delete SURVIVES (tombstone)
     resolved = _resolve_conflicts(resolved)
 
-    # After conflict resolution: only inserts for 1,3 remain
-    remaining_ids = sorted(resolved.column("event_id").to_pylist())
-    assert remaining_ids == [1, 3]
-    assert all(ct == "insert" for ct in resolved.column("change_type").to_pylist())
+    by_id = dict(zip(resolved.column("event_id").to_pylist(), resolved.column("change_type").to_pylist()))
+    assert by_id == {1: "insert", 2: "delete", 3: "insert"}
 
-    # Phase 3: apply to empty destination
+    # Phase 3: the tombstone is an idempotent no-op on an empty destination
     counts = _apply_changes(dest_catalog_a, dest_table_a, resolved, ["event_id"])
     assert counts["upserted"] == 2
-    assert counts["deleted"] == 0
+    assert counts["deleted"] == 1
 
     # Verify destination matches source
     dest_scan = _read_all(dest_table_a)
@@ -284,12 +282,13 @@ def test_full_cdc_insert_then_delete_same_key(source_catalog, source_table, dest
     resolved = _resolve_preimages(cdc_data, "company", ["event_id"])
     resolved = _resolve_conflicts(resolved)
 
-    # Should be empty after conflict resolution (insert + delete cancel)
-    assert resolved.num_rows == 0
+    # The insert drops; the delete survives as a tombstone.
+    assert resolved.column("change_type").to_pylist() == ["delete"]
 
-    # Apply (no-op)
+    # Apply: tombstone delete against a destination that never saw the
+    # insert — idempotent no-op on the data, counted as one delete op.
     counts = _apply_changes(dest_catalog_a, dest_table_a, resolved, ["event_id"])
-    assert counts == {"deleted": 0, "upserted": 0, "upsert_matched": 0}
+    assert counts == {"deleted": 1, "upserted": 0, "upsert_matched": 0}
 
     # Destination should be empty
     dest_scan = _read_all(dest_table_a)
@@ -595,3 +594,161 @@ def test_seed_boundary_delete_not_cancelled_by_reread(source_table, dest_catalog
 
     dest_scan = _read_all(dest_table_a)
     assert dest_scan.column("event_id").to_pylist() == [2]
+
+
+def _seed_cfg(routing_value="acme", key_columns=None, seed_truncate=True):
+    from unittest.mock import MagicMock
+
+    cfg = MagicMock()
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = key_columns if key_columns is not None else ["event_id"]
+    cfg.routing.seed_mode = "scan"
+    cfg.routing.seed_truncate = seed_truncate
+    dest_cfg = MagicMock()
+    dest_cfg.routing_value = routing_value
+    cfg.destination_by_id.return_value = dest_cfg
+    return cfg
+
+
+def _seed_pool(dest_catalog, dest_table):
+    from unittest.mock import MagicMock
+
+    dest_pool = MagicMock()
+    dest_pool.get.return_value = (dest_catalog, dest_table)
+    return dest_pool
+
+
+def test_seed_truncates_leftovers_from_crashed_seed(
+    source_table, dest_catalog_a, dest_table_a, pg_uri, state_table_name
+):
+    """REPLACE semantics: cursor 0 + non-empty destination (a crashed prior
+    seed) truncates before streaming — leftover rows for since-deleted
+    source rows must NOT survive (the upsert-onto-leftovers phantom).
+    The truncate is scoped to the routing value: rows for a DIFFERENT
+    value (a misconfigured shared table) must survive."""
+    # Crashed prior seed left rows 1 and 99 in the destination; the source
+    # has since lost row 99 entirely. Row 500 belongs to another routing
+    # value sharing the table — the guard must not touch it.
+    dest_table_a.append(_arrow_rows([1, 99, 500], ["acme", "acme", "beta"], [10, 990, 5000]))
+    source_table.append(_arrow_rows([1, 2], ["acme", "acme"], [10, 20]))
+
+    sm = StateManager(pg_uri, "seed-instance", StateConfig(table=state_table_name))
+    sm.initialize_destinations(["dest-acme"])
+
+    _seed_new_destinations(source_table, sm, _seed_pool(dest_catalog_a, dest_table_a), _seed_cfg(), ["dest-acme"])
+
+    rows = _read_all(dest_table_a)
+    assert sorted(rows.column("event_id").to_pylist()) == [1, 2, 500]  # 99 gone; beta's 500 intact
+    assert sm.load_cursors(["dest-acme"])["dest-acme"].last_snapshot_id > 0
+    sm.close()
+
+
+def test_seed_truncates_in_append_only_mode(source_table, dest_catalog_a, dest_table_a, pg_uri, state_table_name):
+    """Append-only re-seed used to duplicate (documented caveat since the
+    first audit); truncate-first heals it."""
+    dest_table_a.append(_arrow_rows([1], ["acme"], [10]))  # crashed-seed leftover
+    source_table.append(_arrow_rows([1, 2], ["acme", "acme"], [10, 20]))
+
+    sm = StateManager(pg_uri, "seed-instance", StateConfig(table=state_table_name))
+    sm.initialize_destinations(["dest-acme"])
+
+    _seed_new_destinations(
+        source_table, sm, _seed_pool(dest_catalog_a, dest_table_a), _seed_cfg(key_columns=[]), ["dest-acme"]
+    )
+
+    rows = _read_all(dest_table_a)
+    assert sorted(rows.column("event_id").to_pylist()) == [1, 2]  # no duplicate row 1
+    sm.close()
+
+
+def test_seed_refuses_nonempty_destination_when_truncate_disabled(
+    source_table, dest_catalog_a, dest_table_a, pg_uri, state_table_name
+):
+    """routing.seed_truncate=false: a populated table at cursor 0 is a
+    refuse-loudly condition (protects a misconfigured destination)."""
+    from viaduck.router import RoutingError
+
+    dest_table_a.append(_arrow_rows([7], ["acme"], [70]))
+    source_table.append(_arrow_rows([1], ["acme"], [10]))
+
+    sm = StateManager(pg_uri, "seed-instance", StateConfig(table=state_table_name))
+    sm.initialize_destinations(["dest-acme"])
+
+    with pytest.raises(RoutingError, match="seed_truncate"):
+        _seed_new_destinations(
+            source_table, sm, _seed_pool(dest_catalog_a, dest_table_a), _seed_cfg(seed_truncate=False), ["dest-acme"]
+        )
+
+    # Untouched: data intact, cursor still 0.
+    assert _read_all(dest_table_a).column("event_id").to_pylist() == [7]
+    assert sm.load_cursors(["dest-acme"])["dest-acme"].last_snapshot_id == 0
+    sm.close()
+
+
+def test_seed_uniqueness_failure_then_retry_truncates(
+    source_table, dest_catalog_a, dest_table_a, pg_uri, state_table_name
+):
+    """A seed that fails the key-uniqueness check AFTER writing leaves
+    cursor 0 + partial rows; the retry truncates first instead of
+    upserting on top — destination row count must not grow across
+    retries."""
+    from viaduck.router import RoutingError
+
+    source_table.append(_arrow_rows([1, 1], ["acme", "acme"], [10, 11]))  # duplicate key
+
+    sm = StateManager(pg_uri, "seed-instance", StateConfig(table=state_table_name))
+    sm.initialize_destinations(["dest-acme"])
+    pool = _seed_pool(dest_catalog_a, dest_table_a)
+
+    with pytest.raises(RoutingError, match="not unique"):
+        _seed_new_destinations(source_table, sm, pool, _seed_cfg(), ["dest-acme"])
+    first_count = _read_all(dest_table_a).num_rows
+
+    with pytest.raises(RoutingError, match="not unique"):
+        _seed_new_destinations(source_table, sm, pool, _seed_cfg(), ["dest-acme"])
+    assert _read_all(dest_table_a).num_rows == first_count  # truncated, not stacked
+    assert sm.load_cursors(["dest-acme"])["dest-acme"].last_snapshot_id == 0
+    sm.close()
+
+
+def test_tombstone_with_null_key(tmp_path):
+    """A NULL-key insert+delete pair's tombstone flows into the IS NULL
+    delete path: removes a phantom null-key row, leaves non-null rows."""
+    nullable_schema = Schema(
+        NestedField(field_id=1, name="event_id", field_type=IntegerType()),
+        NestedField(field_id=2, name="company", field_type=StringType()),
+        NestedField(field_id=3, name="value", field_type=IntegerType()),
+    )
+    dest_catalog = _make_catalog(tmp_path, "dest_nullable")
+    dest_table = dest_catalog.create_table("events", nullable_schema)
+
+    # Destination: a phantom null-key row (from a "crashed" write) + a real row.
+    dest_table.append(
+        pa.table(
+            {
+                "event_id": pa.array([None, 1], type=pa.int32()),
+                "company": pa.array(["acme", "acme"], type=pa.string()),
+                "value": pa.array([5, 10], type=pa.int32()),
+            }
+        )
+    )
+
+    batch = pa.table(
+        {
+            "event_id": pa.array([None, None], type=pa.int32()),
+            "company": pa.array(["acme", "acme"], type=pa.string()),
+            "value": pa.array([5, 5], type=pa.int32()),
+            "change_type": pa.array(["insert", "delete"], type=pa.string()),
+            "snapshot_id": pa.array([3, 4], type=pa.int64()),
+            "rowid": pa.array([9, 9], type=pa.int64()),
+        }
+    )
+    resolved = _resolve_conflicts(batch)
+    assert resolved.column("change_type").to_pylist() == ["delete"]
+
+    counts = _apply_changes(dest_catalog, dest_table, resolved, ["event_id"])
+    assert counts["deleted"] == 1
+
+    rows = _read_all(dest_table)
+    assert rows.column("event_id").to_pylist() == [1]  # null-key phantom gone
+    dest_catalog.close()

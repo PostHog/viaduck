@@ -26,9 +26,9 @@ Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* an
 - LRU connection pool for high fanout (local bench: ~43 destinations/s flat through 1000 destinations)
 - Persistent cursor tracking on plain Postgres
 - Horizontal scaling via hash or explicit destination partitioning
-- 26 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
+- 27 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
 - At-least-once delivery with documented failure modes
-- [TLA+ formally verified](tla/Viaduck.tla): 9 safety invariants checked across 31.4M states (incl. buffered delivery, concurrent flushes, and crash recovery; no-data-loss and partition correctness hold even through crash windows)
+- [TLA+ formally verified](tla/Viaduck.tla): 7 safety invariants checked across 22.6M states with NO crash conditioning — eventual consistency, phantom-freedom, no-data-loss, and partition correctness all hold through every modeled crash and failure window
 
 ## Why
 
@@ -143,7 +143,7 @@ At most one flush per destination is in flight (the in-flight guard); flushes fo
 | Rows with no matching destination | Counted as unrouted, metricked, silently dropped | [`test_split_string_no_match`](tests/unit/test_router.py) |
 | NULL values in routing column | Not routed, counted as unrouted | [`test_split_null_values_not_routed`](tests/unit/test_router.py) |
 | Routing field missing from schema | `RoutingError` raised, group processing halted | [`test_poll_cycle_routing_error_breaks_gracefully`](tests/unit/test_main.py) |
-| Insert then delete same row in range | Conflict resolution cancels both — net no-op | [`test_resolve_conflicts_insert_delete_cancel`](tests/unit/test_main.py), [`test_torture_insert_update_delete_same_key`](tests/unit/test_main.py) |
+| Insert then delete same row in range | Insert dropped; the delete survives as a tombstone (idempotent no-op normally; heals commit/cursor-gap phantoms on replay) | [`test_resolve_conflicts_insert_delete_keeps_tombstone`](tests/unit/test_main.py), [`test_torture_insert_update_delete_same_key`](tests/unit/test_main.py) |
 | Update then delete same row | Postimage dropped, delete kept — row removed | [`test_resolve_conflicts_update_delete_keeps_delete`](tests/unit/test_main.py) |
 | Same key, different logical rows | NOT cancelled — uses `rowid` to distinguish | [`test_resolve_conflicts_same_key_different_rowid_no_cancel`](tests/unit/test_main.py) |
 | Cross-tenant row migration | Preimage → delete on old dest, postimage → upsert on new dest | [`test_resolve_preimages_cross_tenant_converts_to_delete`](tests/unit/test_main.py), [`test_torture_routing_value_mutation_cross_tenant`](tests/unit/test_main.py) |
@@ -159,9 +159,10 @@ At most one flush per destination is in flight (the in-flight guard); flushes fo
 - If the process crashes **after a destination commit** but **before the cursor persists**, the next start re-reads the same range and re-applies it. Full CDC mode re-applies idempotently (delete + upsert); append-only mode duplicates rows.
 - In full CDC mode, deletes + upserts on each destination are applied within a **single transaction**. A crash mid-apply rolls back both — no partial state.
 - A failed flush drops the destination's buffers and leaves its cursor untouched; the range is re-read next cycle. Other destinations are unaffected.
-- **Known phantom window** (precisely stated in [`tla/Viaduck.tla`](tla/Viaduck.tla)): if a row is committed to a destination, the cursor fails to persist (crash, or a PG outage outlasting the in-process retry), and the source *deletes* that row before the re-read — the re-read insert and the delete cancel in conflict resolution and the committed row remains. Inherent to at-least-once delivery without cross-catalog transactions; requires a full re-seed to repair.
+- **The commit/cursor-gap window heals itself.** If a row is committed to a destination, the cursor fails to persist (crash, or a PG outage outlasting the in-process retry), and the source deletes that row before the re-read — the replayed delete survives conflict resolution as a *tombstone* and removes the committed row. (Earlier revisions cancelled the insert+delete pair, making such phantoms permanent; the tombstone rule retired that limitation, machine-checked by TLC with no crash conditioning.)
+- **Seeding is REPLACE.** A destination at cursor 0 with existing rows (only legitimate cause: a crashed prior seed) is truncated before the seed streams, so re-seeds are full repairs in both CDC modes. Set `routing.seed_truncate: false` to refuse loudly instead.
 
-There is **no data loss path** — this is machine-checked, not just argued: the spec's `NoDataLossEvenAfterCrash` and `PartitionCorrectnessEvenAfterCrash` invariants hold even in executions containing commit/cursor-gap events (the phantom window adds rows; it never loses or misroutes them). The source DuckLake's snapshot history is the durable log.
+There is **no data loss path** — machine-checked, not just argued: every consistency invariant (including phantom-freedom) holds with no crash conditioning at all. The source DuckLake's snapshot history is the durable log.
 
 ## Failure Modes
 
@@ -170,7 +171,7 @@ There is **no data loss path** — this is machine-checked, not just argued: the
 | Source catalog unavailable | CDC read fails | Poll loop exits, buffered data is drained to destinations, process exits cleanly; K8s (`restartPolicy: Always`) restarts it and it resumes from the persisted cursors | All destinations blocked |
 | Destination catalog unavailable | Flush fails | 3 retries with backoff ([`apply.py:_write_with_retry`](viaduck/apply.py)), then error recorded, connection evicted, buffers dropped, read position reset to the persisted cursor. Range re-read next cycle. | **Per-destination** — other destinations unaffected |
 | Crash with data buffered | Buffers and read positions lost | Re-read from persisted cursors on restart. No data loss. | All destinations re-read |
-| Crash after destination commit, before cursor persist | Destination has data, cursor stale | At-least-once: range re-read and re-applied idempotently (full CDC). See the phantom-window note above. | Per-destination |
+| Crash after destination commit, before cursor persist | Destination has data, cursor stale | At-least-once: range re-read and re-applied idempotently (full CDC); tombstones remove any since-deleted rows the crashed commit wrote. | Per-destination |
 | Cursor persist failure (PG down) | Destination commit already landed | 3 in-process retries ([`delivery.py:_advance_cursor_with_retry`](viaduck/delivery.py)); on exhaustion, same path as flush failure — range re-read, idempotent re-apply. | Per-destination |
 | Destination apply failure (full CDC) | Delete + upsert transaction rolled back | No partial state on destination. Buffer dropped, range re-read. | Per-destination |
 | SIGTERM with data buffered | Shutdown drain | `drain()` flushes everything buffered (trigger=shutdown), bounded by a 60s deadline; anything abandoned is re-read on restart. Note: the 60s deadline exceeds K8s's default 30s `terminationGracePeriodSeconds` — raise the grace period or expect SIGKILL to cut the drain short (safe, just re-read). | — |
@@ -185,6 +186,7 @@ There is **no data loss path** — this is machine-checked, not just argued: the
 - **Halted destination state** — permanent per-destination failures (e.g. schema mismatch) retry forever with growing re-read ranges; no schema pre-flight check or consecutive-failure circuit breaker yet (see Error states).
 - **Exactly-once delivery** — at-least-once only. No deduplication layer.
 - **PostHog events integration** — operational events (flush failures, seeds, drains, halted destinations) emitted as PostHog events for product-side observability.
+- **Rowid-reuse tolerance** — DuckLake reuses a rowid when an upsert re-creates a deleted key; if the re-create lands in the same flush window as its predecessor's delete, Phase 2 mistakes them for one row and the new row is lost (pre-existing; both old and new conflict rules affected; append-only mode immune). Fix in design: snapshot-ordered latest-event-wins conflict resolution.
 - **E2E tests** — the docker-compose stack supports a manual kill-sequence soak (SIGKILL/SIGTERM + convergence diff); not yet automated in CI.
 
 ## Configuration
@@ -209,6 +211,7 @@ routing:
   key_columns: ["event_id"]                  # primary key for delete/update replication
                                              # omit or [] for append-only mode
   seed_mode: "scan"                          # "scan" (default) or "cdc_replay"
+  seed_truncate: true                        # REPLACE-semantics seeding (truncate a cursor-0, non-empty dest)
 
 destinations:
   - id: "quacksworth-lake"                   # internal identifier (state tracking, logs)
@@ -306,6 +309,8 @@ With `scan` mode, adding a new tenant is instant regardless of source history de
 
 When `key_columns` is configured, seeding uses `upsert` for idempotency — safe if the process crashes mid-seed and re-seeds on restart. Without `key_columns`, seeding uses `append` (at-least-once semantics apply).
 
+Seeding has **REPLACE semantics**: a destination at cursor 0 with existing rows can only be a crashed prior seed (single-master assumption), so it is truncated — with a loud WARNING — before the seed streams. Crash mid-seed leaves the cursor at 0 and the next attempt re-truncates: convergent, and it also fixes the historical append-mode re-seed duplication. `routing.seed_truncate: false` switches the behavior to refuse-loudly, protecting a misconfigured destination pointed at a populated table. The truncate is scoped to the destination's routing value, so even two destinations misconfigured onto one physical table cannot wipe each other. Downstream readers of destination lakes should gate on cursor > 0 (the seed may leave the table briefly empty during a re-seed retry).
+
 The seed scan also **verifies `key_columns` uniqueness** within the partition (DuckLake has no unique constraints, so the key contract is otherwise unenforceable). Duplicate keys would silently corrupt the destination — delete-by-key over-deletes, duplicate-key upserts duplicate — so a violation fails the seed loudly before the cursor advances. The check piggybacks on the scan the seed already does (zero extra I/O, memory bounded by the partition's distinct-key count). Rows inserted after seeding are not re-verified; the contract still applies.
 
 Verified by TLC: the `SeedDestination` action in the TLA+ spec produces the same invariant-satisfying state as a full CDC replay ([`tla/Viaduck.tla`](tla/Viaduck.tla)).
@@ -348,7 +353,7 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `lagging` | CDC reads are behind the source — data exists that viaduck has not yet read |
 | `error` | The last flush failed; the buffered range was dropped and will be re-read (see Error states) |
 
-26 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
+27 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -375,7 +380,8 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_delivery_flush_seconds` | Histogram | destination | Flush duration (data flushes only) |
 | `viaduck_delivery_buffers_dropped_total` | Counter | destination | Buffers dropped on flush failure |
 | `viaduck_cdc_routing_mutations_total` | Counter | — | Cross-tenant routing value changes |
-| `viaduck_cdc_conflicts_resolved_total` | Counter | — | Insert+delete pairs cancelled |
+| `viaduck_cdc_conflicts_resolved_total` | Counter | — | Rowid-level conflicts resolved in Phase 2 |
+| `viaduck_cdc_tombstones_emitted_total` | Counter | — | Deletes surviving from insert+delete pairs (write cost of phantom healing; churn signal) |
 | `viaduck_cdc_orphaned_preimages_total` | Counter | — | Preimages with no matching postimage |
 | `viaduck_errors_total` | Counter | type, destination | Errors by type |
 
@@ -470,7 +476,7 @@ Every error state and how it resolves:
 | Error | Where | Resolution |
 |-------|-------|------------|
 | Flush failure (`errors_total{type="dest_write"}`) | Destination write fails after retries — catalog down, transaction failure, schema mismatch | Automatic: connection evicted, buffer dropped, read position reset to the persisted cursor, range re-read next cycle. `last_error` durable in PG and shown in the UI (`error` status); cleared on the next successful flush |
-| Cursor persist failure after destination commit | PG outage outlasting the in-process retry | Same path as flush failure; the re-read re-applies idempotently. This is the spec's `FlushCommitNoCursor` phantom window — see Delivery guarantees |
+| Cursor persist failure after destination commit | PG outage outlasting the in-process retry | Same path as flush failure; the re-read re-applies idempotently and tombstones heal any phantom (the spec's `FlushCommitNoCursor` window) |
 | Routing error (`errors_total{type="routing"}`) | Key column missing from CDC data (Phase 1) or routing field missing from the source schema | Group processing halts for the cycle, retried every poll. Needs an operator fix (config or source schema); affects all destinations in the read group |
 | Source CDC read failure | Any poll-cycle exception | Poll loop exits, buffered data drains, clean process exit; K8s restarts and resumes from persisted cursors |
 | Seed key-uniqueness violation | `key_columns` not unique in the source partition | Fatal before the cursor advances; fix the source data or `key_columns`, the seed re-runs on restart |

@@ -104,6 +104,13 @@ class RoutingConfig:
     field: str
     key_columns: list[str] = field(default_factory=list)
     seed_mode: str = "scan"  # "scan" or "cdc_replay"
+    # REPLACE-semantics seeding: a destination at cursor 0 with existing
+    # rows (only legitimate cause under single-master: a crashed prior
+    # seed) is truncated before the seed streams — matching the spec's
+    # SeedDestination and healing the CrashAfterSeed window. Set False to
+    # refuse loudly instead (protects a misconfigured destination pointed
+    # at a populated table).
+    seed_truncate: bool = True
 
     def __post_init__(self):
         if self.seed_mode not in ("scan", "cdc_replay"):
@@ -328,6 +335,7 @@ def load(path: str | Path) -> ViaduckConfig:
         field=_require_non_empty(rt.get("field", ""), "routing.field"),
         key_columns=raw_key_cols,
         seed_mode=rt.get("seed_mode", "scan"),
+        seed_truncate=bool(rt.get("seed_truncate", True)),
     )
 
     # Defaults

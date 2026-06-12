@@ -120,7 +120,8 @@ def test_buffered_flush_end_to_end(tmp_path, state):
 
 def test_cross_read_conflict_resolution_at_flush(tmp_path, state):
     """Insert buffered in one read, its delete in a later read: Phase 2 at
-    flush cancels them — the row never reaches the destination."""
+    flush drops the insert and applies the surviving tombstone delete —
+    the row never appears in the destination."""
     pool = _make_pool(tmp_path, ["d1"])
     state.initialize_destinations(["d1"])
     mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
@@ -220,4 +221,123 @@ def test_multi_update_window_no_duplicate_keys(tmp_path, state):
     rows = _read_dest(pool, "d1")
     assert rows.num_rows == 1
     assert rows.column("value").to_pylist() == [222]  # last write wins
+    pool.close_all()
+
+
+def test_phantom_heal_after_commit_cursor_gap(tmp_path, state):
+    """The commit/cursor-gap replay heals phantoms (spec: tombstone rule).
+
+    Simulate the gap exactly: apply a batch directly to the destination
+    WITHOUT advancing the cursor (the crashed flush), then replay the
+    range through the DeliveryManager with the row's delete included.
+    Under the old cancel-both rule the insert+delete pair cancelled and
+    the committed row stayed forever; the tombstone removes it."""
+    from viaduck.apply import apply_full_cdc
+
+    pool = _make_pool(tmp_path, ["d1"])
+    state.initialize_destinations(["d1"])
+    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+
+    # Normal flush through snapshot 7: row 1 delivered, cursor = 7.
+    mgr.buffer("d1", _cdc_batch("acme", [1]), through_snapshot=7)
+    mgr.maybe_flush()
+    assert mgr.wait_idle()
+    assert state.load_cursors(["d1"])["d1"].last_snapshot_id == 7
+
+    # Crashed flush: destination commit lands (row 2), cursor does NOT move.
+    crashed = pa.table(
+        {
+            "event_id": pa.array([2], type=pa.int32()),
+            "company": pa.array(["acme"], type=pa.string()),
+            "value": pa.array([20], type=pa.int32()),
+            "change_type": pa.array(["insert"], type=pa.string()),
+            "snapshot_id": pa.array([8], type=pa.int64()),
+            "rowid": pa.array([2], type=pa.int64()),
+        }
+    )
+    apply_full_cdc(pool, "d1", crashed, ["event_id"])
+    assert sorted(_read_dest(pool, "d1").column("event_id").to_pylist()) == [1, 2]
+
+    # Source deletes row 2 before recovery. The replay range (7, 9]
+    # carries BOTH the insert (snap 8) and the delete (snap 9).
+    replay = pa.table(
+        {
+            "event_id": pa.array([2, 2], type=pa.int32()),
+            "company": pa.array(["acme", "acme"], type=pa.string()),
+            "value": pa.array([20, 20], type=pa.int32()),
+            "change_type": pa.array(["insert", "delete"], type=pa.string()),
+            "snapshot_id": pa.array([8, 9], type=pa.int64()),
+            "rowid": pa.array([2, 2], type=pa.int64()),
+        }
+    )
+    mgr.buffer("d1", replay, through_snapshot=9)
+    mgr.maybe_flush()
+    assert mgr.wait_idle()
+
+    # Phantom healed; cursor advanced past the replay.
+    assert _read_dest(pool, "d1").column("event_id").to_pylist() == [1]
+    assert state.load_cursors(["d1"])["d1"].last_snapshot_id == 9
+    pool.close_all()
+
+
+def test_phantom_heal_with_key_reuse_in_replay(tmp_path, state):
+    """Replay contains the phantom's insert+delete AND a new same-key
+    insert (key reuse, new rowid): the tombstone removes the old copy and
+    the Winner upsert lands the new row — delete-before-upsert ordering
+    is load-bearing here."""
+    from viaduck.apply import apply_full_cdc
+
+    pool = _make_pool(tmp_path, ["d1"])
+    state.initialize_destinations(["d1"])
+    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+
+    crashed = pa.table(
+        {
+            "event_id": pa.array([2], type=pa.int32()),
+            "company": pa.array(["acme"], type=pa.string()),
+            "value": pa.array([20], type=pa.int32()),
+            "change_type": pa.array(["insert"], type=pa.string()),
+            "snapshot_id": pa.array([8], type=pa.int64()),
+            "rowid": pa.array([2], type=pa.int64()),
+        }
+    )
+    apply_full_cdc(pool, "d1", crashed, ["event_id"])
+
+    replay = pa.table(
+        {
+            "event_id": pa.array([2, 2, 2], type=pa.int32()),
+            "company": pa.array(["acme"] * 3, type=pa.string()),
+            "value": pa.array([20, 20, 99], type=pa.int32()),
+            "change_type": pa.array(["insert", "delete", "insert"], type=pa.string()),
+            "snapshot_id": pa.array([8, 9, 10], type=pa.int64()),
+            "rowid": pa.array([2, 2, 5], type=pa.int64()),
+        }
+    )
+    mgr.buffer("d1", replay, through_snapshot=10)
+    mgr.maybe_flush()
+    assert mgr.wait_idle()
+
+    rows = _read_dest(pool, "d1")
+    assert rows.column("event_id").to_pylist() == [2]
+    assert rows.column("value").to_pylist() == [99]  # the reused key's NEW row
+    pool.close_all()
+
+
+def test_applied_counters_accumulate_by_change_type(tmp_path, state):
+    """Vanity counters for the UI: per-type applied counts (pre-Phase-2)
+    and cumulative buffered rows accumulate on successful flushes."""
+    pool = _make_pool(tmp_path, ["d1"])
+    state.initialize_destinations(["d1"])
+    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+
+    mgr.buffer("d1", _cdc_batch("acme", [1, 2]), through_snapshot=7)  # 2 inserts
+    mgr.buffer("d1", _cdc_batch("acme", [2], "delete"), through_snapshot=8)  # 1 delete
+    mgr.maybe_flush()
+    assert mgr.wait_idle()
+
+    st = mgr.status_snapshot()["d1"]
+    # Pre-Phase-2 counts: the insert+delete pair for event 2 still counts
+    # one insert and one delete even though Phase 2 tombstoned it.
+    assert (st.applied_inserts, st.applied_updates, st.applied_deletes) == (2, 0, 1)
+    assert st.buffered_rows_total == 3
     pool.close_all()
