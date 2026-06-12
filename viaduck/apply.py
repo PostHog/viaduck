@@ -86,11 +86,26 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
 
     Uses rowid (not just key_columns) to identify the same logical row.
     This depends on DuckLake rowids being monotonically increasing and never
-    reused. If rowids were recycled, unrelated rows could be incorrectly
-    cancelled.
+    reused.
+
+    KNOWN OPEN ISSUE (2026-06-11): DuckLake empirically REUSES a row's
+    rowid when an upsert re-creates a previously deleted key (observed:
+    insert@s4/delete@s5/re-insert@s18 all carrying one rowid in a churn
+    soak; 6 of ~8400 rows at 200 rows/s). When that happens within one
+    flush window, the re-insert pairs with the tombstone and the new row
+    is lost — and the OLD cancel-both rule lost it identically, so this
+    predates the tombstone change. Pending fix: a snapshot-ordered
+    "latest event wins" Phase 2 rule (spec-first redesign) and/or an
+    upstream DuckLake ruling on rowid stability. Does not affect
+    append-only mode (Phase 2 unused).
 
     Rules:
-    - insert + delete for same rowid → cancel both (net no-op)
+    - insert + delete for same rowid → drop the insert, KEEP the delete
+      (tombstone). Against a destination that never saw the insert the
+      delete is an idempotent no-op; against one that DID see it via a
+      commit/cursor-gap replay it is the only event that can ever remove
+      the row. Cancelling both (the old rule) made such phantoms
+      permanent — the spec's retired everCrashed limitation.
     - update_postimage + delete for same rowid → drop postimage, keep delete
     - insert + update_postimage for same rowid → drop insert, keep postimage
       (postimage carries the newer state; passing both to a single upsert
@@ -127,40 +142,43 @@ def _resolve_conflicts(batch: pa.Table) -> pa.Table:
         .sort_by("__idx")
     )
 
-    has_ins = work.column("__ins_max")
     has_del = work.column("__del_max")
     has_post = work.column("__post_max")
 
-    # Drop rules (same as the row-loop predecessor):
+    # Drop rules:
     #   insert row:    dropped when a postimage exists (newer state wins) or
-    #                  a delete exists (insert+delete cancel)
-    #   delete row:    dropped when an insert exists (cancel pair)
+    #                  a delete exists (the delete survives as a tombstone)
+    #   delete row:    NEVER dropped — see the tombstone rule above
     #   postimage row: dropped when a delete exists (delete wins)
     drop = pc.or_(
-        pc.or_(
-            pc.and_(is_insert, pc.or_(has_post, has_del)),
-            pc.and_(is_delete, has_ins),
-        ),
+        pc.and_(is_insert, pc.or_(has_post, has_del)),
         pc.and_(is_post, has_del),
     )
     keep_mask = pc.invert(pc.fill_null(drop, False)).combine_chunks()
 
     # Metric parity with the predecessor: one increment per rowid with an
     # insert+postimage (no delete) conflict, one per rowid with an
-    # insert+delete cancellation.
+    # insert+delete pair.
+    has_tombstone = pc.and_(flags.column("__ins_max"), flags.column("__del_max"))
     n_conflicts = pc.sum(
         pc.cast(
             pc.or_(
                 pc.and_(
                     pc.and_(flags.column("__ins_max"), flags.column("__post_max")), pc.invert(flags.column("__del_max"))
                 ),
-                pc.and_(flags.column("__ins_max"), flags.column("__del_max")),
+                has_tombstone,
             ),
             pa.int64(),
         )
     ).as_py()
     if n_conflicts:
         metrics.cdc_conflicts_resolved_total.inc(n_conflicts)
+    # Tombstones: deletes surviving from insert+delete pairs. Normally
+    # no-ops at the destination; the count is the write-amplification cost
+    # of phantom healing (and a churn signal worth alerting on).
+    n_tombstones = pc.sum(pc.cast(has_tombstone, pa.int64())).as_py()
+    if n_tombstones:
+        metrics.cdc_tombstones_emitted_total.inc(n_tombstones)
 
     result = batch if pc.all(keep_mask).as_py() else batch.filter(keep_mask)
 

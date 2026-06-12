@@ -111,9 +111,15 @@ _cdc_routing_mutations_total = Counter(
     "Cross-tenant routing value changes detected in updates",
     ["pipeline"],
 )
+_cdc_tombstones_emitted_total = Counter(
+    "viaduck_cdc_tombstones_emitted_total",
+    "Deletes surviving Phase 2 from insert+delete pairs (tombstones): "
+    "normally no-ops at the destination; the write cost of phantom healing",
+    ["pipeline"],
+)
 _cdc_conflicts_resolved_total = Counter(
     "viaduck_cdc_conflicts_resolved_total",
-    "Insert+delete pairs cancelled in conflict resolution",
+    "Rowid-level conflicts resolved in Phase 2 (insert+postimage, insert+delete)",
     ["pipeline"],
 )
 _cdc_orphaned_preimages_total = Counter(
@@ -178,6 +184,7 @@ dest_rows_upserted_total = _dest_rows_upserted_total
 dest_upsert_matched_total = _dest_upsert_matched_total
 cdc_routing_mutations_total = _cdc_routing_mutations_total
 cdc_conflicts_resolved_total = _cdc_conflicts_resolved_total
+cdc_tombstones_emitted_total = _cdc_tombstones_emitted_total
 cdc_orphaned_preimages_total = _cdc_orphaned_preimages_total
 
 delivery_buffer_rows = _delivery_buffer_rows
@@ -198,6 +205,7 @@ def init(pipeline: str):
     global cdc_batch_rows
     global dest_rows_deleted_total, dest_rows_upserted_total, dest_upsert_matched_total
     global cdc_routing_mutations_total, cdc_conflicts_resolved_total, cdc_orphaned_preimages_total
+    global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
 
@@ -229,4 +237,5 @@ def init(pipeline: str):
     cdc_batch_rows = _cdc_batch_rows.labels(pipeline=pipeline)
     cdc_routing_mutations_total = _cdc_routing_mutations_total.labels(pipeline=pipeline)
     cdc_conflicts_resolved_total = _cdc_conflicts_resolved_total.labels(pipeline=pipeline)
+    cdc_tombstones_emitted_total = _cdc_tombstones_emitted_total.labels(pipeline=pipeline)
     cdc_orphaned_preimages_total = _cdc_orphaned_preimages_total.labels(pipeline=pipeline)

@@ -81,8 +81,13 @@ The 3-phase CDC algorithm is eventually consistent under these assumptions:
 
 2. **Rowid monotonicity**: DuckLake's internal `rowid` is assumed to be monotonically
    increasing and never reused. Conflict resolution (Phase 2) uses rowid to identify
-   the same logical row across change types. If rowids were recycled, unrelated rows
-   could be incorrectly cancelled.
+   the same logical row across change types. **KNOWN OPEN ISSUE (2026-06-11)**:
+   DuckLake empirically reuses a rowid when an upsert re-creates a previously
+   deleted key — within one flush window the re-created row pairs with its
+   predecessor's tombstone and is lost (the pre-tombstone cancel rule lost it
+   identically). Candidate fix: snapshot-ordered latest-event-wins Phase 2
+   (spec-first); upstream rowid-stability question filed with the ducklake team.
+   Append-only mode is unaffected.
 
 3. **Single-master destinations**: Each destination table must only be written to by
    viaduck from the configured source. Concurrent writes from other sources break
@@ -93,7 +98,9 @@ The 3-phase CDC algorithm is eventually consistent under these assumptions:
    has no unique constraints to enforce this). Violations mean delete-by-key
    over-deletes and duplicate-key upserts duplicate. Verified at seed time per
    partition (`main.py:_verify_seed_key_uniqueness`, fails the seed loudly);
-   post-seed inserts are not re-verified.
+   post-seed inserts are not re-verified. NOTE: tombstone deletes widen the
+   blast radius of a violation — a duplicate live key means a tombstone
+   over-deletes the surviving duplicate, where the old cancel rule was inert.
 
 ## CDC Algorithm: Three Phases
 
@@ -106,7 +113,9 @@ The 3-phase CDC algorithm is eventually consistent under these assumptions:
 
 **Phase 2: Conflict Resolution** (per-destination, at flush time) — `apply.py:_resolve_conflicts()`
 - Runs on the concatenation of all buffered reads for the flush
-- insert + delete for same rowid → cancel both (net no-op)
+- insert + delete for same rowid → drop the insert, KEEP the delete
+  (tombstone: idempotent no-op normally, heals commit/cursor-gap phantom
+  replays — deletes are never dropped)
 - update_postimage + delete for same rowid → drop postimage, keep delete
 - insert + update_postimage for same rowid → drop insert, keep postimage
 - Post-condition assertion: no rowid in both insert and delete
@@ -135,10 +144,9 @@ The CDC algorithm is formally specified in `tla/Viaduck.tla` and verified by
 TLC. Run via `flox activate` then `just tlc`. The spec models source operations,
 buffered CDC reads, two-step flushes (buffer swap → commit/fail), concurrent
 per-destination flush workers, seeding, and commit/cursor-gap scenarios both
-with and without process death (safe buffer-loss crashes checked
-unconditionally; phantom-window events conditioned via everCrashed — except
-NoDataLoss and PartitionCorrectness, which are also checked through crash
-windows), checking 9 invariants across 31.4M distinct states (~5 min). Modify the spec when changing
+with and without process death — ALL checked unconditionally; the
+tombstone rule retired the everCrashed phantom conditioning entirely —
+checking 7 invariants across 22.6M distinct states (~3 min). Modify the spec when changing
 the CDC algorithm or adding new failure modes — and when designing semantic
 changes, extend the spec FIRST and let TLC pass judgment before implementing.
 Always run `just tlc` after spec changes.
@@ -152,7 +160,7 @@ Always run `just tlc` after spec changes.
 - **LRU connection pool with lease pinning**: bounds memory at high fanout (default 100 open connections); eviction never closes a connection mid-transaction
 - **Per-destination error isolation**: one broken destination doesn't block others; a failed flush drops only that destination's buffers
 - **Grouped CDC reads**: destinations at the same read position share a single CDC call
-- **Scan-based seeding**: new destinations bulk-load from a filtered source scan instead of replaying CDC history. Configurable via `seed_mode` (default: `scan`)
+- **Scan-based seeding with REPLACE semantics**: new destinations bulk-load from a filtered source scan; a cursor-0 destination with leftover rows (crashed prior seed) is truncated first (`routing.seed_truncate`, default true). Configurable via `seed_mode` (default: `scan`)
 - **Worker threads are a concurrency knob, not a CPU multiplier**: Arrow's compute pool and DuckDB's threads are process-global underneath every flush worker — see README "Worker-thread sizing"
 
 ## Module Layout
@@ -168,7 +176,7 @@ Always run `just tlc` after spec changes.
 | `destination.py` | LRU connection pool for destination catalogs, lease pinning |
 | `state.py` | Per-destination cursors on plain Postgres (psycopg) |
 | `arrowutil.py` | Shared Arrow kernel helpers (row_indices, full_bool) |
-| `metrics.py` | Prometheus metric definitions (26 metrics) |
+| `metrics.py` | Prometheus metric definitions (27 metrics) |
 | `server.py` | HTTP /metrics, /healthz, /readyz, /status, /ui, /ui/sse |
 | `logging_config.py` | Structured logging setup |
 

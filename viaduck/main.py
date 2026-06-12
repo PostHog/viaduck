@@ -40,8 +40,9 @@ Phases:
   1. Preimage Resolution (before routing) — pair update pre/postimages by
      rowid, convert cross-tenant preimages to deletes, drop same-tenant
      preimages.
-  2. Conflict Resolution (per-destination, after routing) — cancel
-     insert+delete pairs by rowid, drop postimages shadowed by deletes.
+  2. Conflict Resolution (per-destination, after routing) — drop inserts
+     shadowed by a same-rowid postimage or delete (the delete survives as
+     a tombstone), drop postimages shadowed by deletes.
   3. Apply (per-destination, atomic) — delete then upsert within a
      destination catalog transaction.
 """
@@ -441,6 +442,42 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
         write_secs_total = 0.0
         try:
             seed_t0 = time.monotonic()
+            # REPLACE-semantics guard: cursor 0 + existing rows for THIS
+            # routing value can only mean a crashed prior seed
+            # (single-master assumption). Truncate the partition so the
+            # re-seed is a full repair — the spec's SeedDestination is
+            # REPLACE; an upsert/append seed onto leftovers would preserve
+            # phantoms (rows deleted in the source since the crashed
+            # attempt) or duplicate (append mode). Crash mid-seed leaves
+            # the cursor at 0, so the next attempt re-truncates:
+            # convergent. Scoped by routing value, not whole-table, so a
+            # misconfigured second destination sharing the table can never
+            # wipe a sibling's data. Runs inside the heartbeat: a large
+            # leftover delete can be slow.
+            dest_filter = EqualTo(cfg.routing.field, routing_value)
+            catalog, table = dest_pool.get(dest_id)
+            try:
+                existing_rows = table.scan(row_filter=dest_filter).count()
+                if existing_rows > 0:
+                    if not cfg.routing.seed_truncate:
+                        raise RoutingError(
+                            f"Destination {dest_id}: cursor is 0 but the destination table "
+                            f"already has {existing_rows} rows for routing_value="
+                            f"{routing_value!r}, and routing.seed_truncate is false. "
+                            "Refusing to seed onto existing data — fix the destination "
+                            "config or enable seed_truncate for REPLACE-semantics seeding."
+                        )
+                    log.warning(
+                        "Destination %s: cursor 0 with %d existing rows for routing_value=%s "
+                        "(crashed prior seed); truncating the partition before re-seed "
+                        "(REPLACE semantics)",
+                        dest_id,
+                        existing_rows,
+                        routing_value,
+                    )
+                    table.delete(dest_filter)
+            finally:
+                dest_pool.release(dest_id)
             # Pin scan to the captured snapshot to avoid skew — ensures the
             # cursor and the scanned data refer to the same point in time.
             scan = src_table.scan(
@@ -472,12 +509,18 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
                 batch_table = pa.Table.from_batches([batch])
                 if key_columns:
                     seen_key_batches.append(batch_table.select(key_columns).group_by(key_columns).aggregate([]))
+                # get/release per batch: get() pins the pool entry, and an
+                # unmatched pin makes the catalog unevictable for the
+                # process lifetime (this loop leaked pins before).
                 catalog, table = dest_pool.get(dest_id)
                 write_t0 = time.monotonic()
-                if key_columns:
-                    table.upsert(batch_table, join_cols=key_columns)
-                else:
-                    table.append(batch_table)
+                try:
+                    if key_columns:
+                        table.upsert(batch_table, join_cols=key_columns)
+                    else:
+                        table.append(batch_table)
+                finally:
+                    dest_pool.release(dest_id)
                 write_secs_total += time.monotonic() - write_t0
                 progress["rows"] += batch.num_rows
                 progress["batches"] += 1
@@ -744,6 +787,10 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                 last_error=d.last_error,
                 buffer_rows=d.buffer_rows,
                 buffer_age_s=round(d.buffer_age_s, 1),
+                applied_inserts=d.applied_inserts,
+                applied_updates=d.applied_updates,
+                applied_deletes=d.applied_deletes,
+                buffered_rows_total=d.buffered_rows_total,
             )
         )
 

@@ -16,7 +16,11 @@
 (* ASSUMPTIONS:                                                            *)
 (*   1. Routing column is immutable (updates don't change routing value).  *)
 (*   2. Rowids are stable per row: assigned on insert, reused in all CDC   *)
-(*      events for that row (delete, update pre/postimage).                *)
+(*      events for that row (delete, update pre/postimage). KNOWN OPEN     *)
+(*      ISSUE: DuckLake empirically reuses a rowid when an upsert          *)
+(*      re-creates a deleted key, violating this assumption (the model     *)
+(*      excludes it by construction via nextRowid++). A snapshot-ordered   *)
+(*      latest-event-wins Phase2 is the candidate fix — to be modeled.     *)
 (*   3. Each destination is handled by exactly one viaduck instance, and   *)
 (*      at most one flush per destination is in flight at a time.          *)
 (*   4. Destination catalog provides atomic transactions: the delete+upsert*)
@@ -34,19 +38,21 @@
 (* rowid grouping in Phase 2 at flush time, exactly as within-read         *)
 (* conflicts are.                                                          *)
 (*                                                                         *)
-(* CRASH MODEL: ProcessCrash (lose all in-memory buffers, keep persisted   *)
-(* cursors and destination data) is SAFE and unconditioned — invariants    *)
-(* must hold through it, since lost buffers are re-read from persisted     *)
-(* cursors. FlushFail (destination transaction rolls back) is likewise     *)
-(* safe and unconditioned. Only CrashDuringFlush — destination commit      *)
-(* lands but the process dies before the cursor persists — sets            *)
-(* everCrashed, preserving the original spec's precisely-stated limitation:*)
-(* eventual consistency is guaranteed for executions with no               *)
-(* commit/cursor-gap crash (see the everCrashed comment below).            *)
+(* CRASH MODEL: every crash and failure transition is checked              *)
+(* UNCONDITIONALLY — ProcessCrash (lose all in-memory state), FlushFail    *)
+(* (destination rollback + drop-buffer recovery), CrashDuringFlush and     *)
+(* FlushCommitNoCursor (destination commit lands, cursor does not), and    *)
+(* CrashAfterSeed. Earlier revisions conditioned the consistency           *)
+(* invariants on no commit/cursor-gap crash ever occurring (an             *)
+(* `everCrashed` flag), because Phase 2 cancelled insert+delete pairs and  *)
+(* a cancelled delete could never remove a crashed write (permanent        *)
+(* phantom). Phase 2's tombstone rule (keep the delete) retired that       *)
+(* limitation: the recovery replay's delete removes the phantom, and TLC   *)
+(* now proves all invariants with no crash conditioning at all.            *)
 (*                                                                         *)
-(* MODEL SIZE: with Keys={1,2}, Dests={d1,d2}, MaxOps=4, TLC checks all 9  *)
-(* invariants over 31,406,425 distinct states (332.7M generated, depth     *)
-(* 21) in ~5 minutes. The unbuffered predecessor model was 730,153         *)
+(* MODEL SIZE: with Keys={1,2}, Dests={d1,d2}, MaxOps=4, TLC checks all 7  *)
+(* invariants over 22,589,617 distinct states (240.8M generated, depth     *)
+(* 19) in ~3 minutes. The unbuffered predecessor model was 730,153         *)
 (* distinct states — the growth is the BufferRead/FlushStart/FlushCommit  *)
 (* interleavings and the crash actions (incl. FlushCommitNoCursor).        *)
 (***************************************************************************)
@@ -74,27 +80,11 @@ VARIABLES
     flushing,       \* function: dest -> BOOLEAN, a flush is in flight (in-flight guard)
     inflight,       \* function: dest -> set of records snapshot at FlushStart
     inflightThrough,\* function: dest -> cursor value to persist if the flush commits
-    opCount,        \* operation counter (bounded by MaxOps)
-    everCrashed     \* BOOLEAN: has a commit/cursor-gap crash ever occurred?
-                    \*
-                    \* Invariants are conditioned on ~everCrashed. This is NOT a
-                    \* hack — it's a precise statement: the algorithm provides
-                    \* eventual consistency for executions free of crashes in
-                    \* the window between a destination commit and its cursor
-                    \* persist. A per-destination lastPollClean flag was tried
-                    \* but is insufficient: a successful recovery poll CANNOT
-                    \* fix phantom data because insert+delete for the same rowid
-                    \* cancel in conflict resolution, leaving the crashed write
-                    \* in place. Phantoms from that window are permanent without
-                    \* full re-sync. This is inherent to at-least-once delivery
-                    \* without cross-catalog transactions. Note that plain
-                    \* process crashes (ProcessCrash) and flush failures
-                    \* (FlushFail) do NOT set everCrashed — safety through
-                    \* those paths is checked unconditionally.
+    opCount         \* operation counter (bounded by MaxOps)
 
 vars == <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
           buffered, bufferedThrough, flushing, inflight, inflightThrough,
-          opCount, everCrashed>>
+          opCount>>
 
 memVars == <<buffered, bufferedThrough, flushing, inflight, inflightThrough>>
 
@@ -117,7 +107,7 @@ SrcInsert(key, rv, val) ==
                                 rowid |-> nextRowid]}
     /\ nextRowid' = nextRowid + 1
     /\ opCount' = opCount + 1
-    /\ UNCHANGED <<dstRows, cursors, everCrashed>>
+    /\ UNCHANGED <<dstRows, cursors>>
     /\ UNCHANGED memVars
 
 SrcDelete(key) ==
@@ -131,7 +121,7 @@ SrcDelete(key) ==
                                       snap |-> srcSnap + 1,
                                       rowid |-> row.rowid]}
           /\ opCount' = opCount + 1
-    /\ UNCHANGED <<nextRowid, dstRows, cursors, everCrashed>>
+    /\ UNCHANGED <<nextRowid, dstRows, cursors>>
     /\ UNCHANGED memVars
 
 SrcUpdate(key, newVal) ==
@@ -150,7 +140,7 @@ SrcUpdate(key, newVal) ==
                 [type |-> "update_postimage", key |-> key, rv |-> old.rv,
                  val |-> newVal, snap |-> srcSnap + 1, rowid |-> old.rowid]}
           /\ opCount' = opCount + 1
-    /\ UNCHANGED <<nextRowid, dstRows, cursors, everCrashed>>
+    /\ UNCHANGED <<nextRowid, dstRows, cursors>>
     /\ UNCHANGED memVars
 
 (***************************************************************************)
@@ -180,14 +170,19 @@ Phase1(changes) ==
 \* of all buffered reads — cross-read conflicts (insert read in one poll,
 \* its delete read in a later poll, both still buffered) resolve exactly
 \* like within-read conflicts.
-\* - insert + delete for same rowid → cancel both (net no-op)
+\* - insert + delete for same rowid → drop the insert, KEEP the delete
+\*   (tombstone). The delete is idempotent against a destination that
+\*   never saw the insert; against a destination that DID see it via a
+\*   commit/cursor-gap replay, it is the only event that can ever remove
+\*   the row. Cancelling both (the previous rule) made such phantoms
+\*   permanent — the retired everCrashed conditioning existed for that.
 \* - update_postimage + delete for same rowid → drop postimage, keep delete
 Phase2(changes) ==
     LET insertRids == {c.rowid : c \in {x \in changes : x.type = "insert"}}
         deleteRids == {c.rowid : c \in {x \in changes : x.type = "delete"}}
-        cancelledRids == insertRids \cap deleteRids
+        tombstonedRids == insertRids \cap deleteRids
     IN {c \in changes :
-          /\ ~(c.type \in {"insert", "delete"} /\ c.rowid \in cancelledRids)
+          /\ ~(c.type = "insert" /\ c.rowid \in tombstonedRids)
           /\ ~(c.type = "update_postimage" /\ c.rowid \in deleteRids)}
 
 \* Phase 3: Apply — delete then upsert.
@@ -223,7 +218,7 @@ BufferRead(d, i) ==
     /\ buffered' = [buffered EXCEPT ![d] = @ \cup Phase1(CDCReadFrom(d, bufferedThrough[d]))]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = srcSnap]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
-                   flushing, inflight, inflightThrough, opCount, everCrashed>>
+                   flushing, inflight, inflightThrough, opCount>>
 
 \* Start a flush: swap the buffer out (worker takes a snapshot of the
 \* accumulated changes + the position they cover; the live buffer resets).
@@ -239,7 +234,7 @@ FlushStart(d, i) ==
     /\ inflightThrough' = [inflightThrough EXCEPT ![d] = bufferedThrough[d]]
     /\ buffered' = [buffered EXCEPT ![d] = {}]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
-                   bufferedThrough, opCount, everCrashed>>
+                   bufferedThrough, opCount>>
 
 \* Flush commits: Phase 2 + Phase 3 on the in-flight set, then persist the
 \* cursor. Destination commit and cursor persist are SEPARATE steps in the
@@ -253,7 +248,7 @@ FlushCommit(d, i) ==
     /\ inflight' = [inflight EXCEPT ![d] = {}]
     /\ inflightThrough' = [inflightThrough EXCEPT ![d] = 0]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, buffered,
-                   bufferedThrough, opCount, everCrashed>>
+                   bufferedThrough, opCount>>
 
 \* Flush fails: the destination transaction rolls back (ASSUMPTION 4), the
 \* in-flight set is discarded, AND the live buffer is discarded with the
@@ -261,8 +256,7 @@ FlushCommit(d, i) ==
 \* both ranges. (Keeping the live buffer would leave a gap: it covers
 \* (inflightThrough, bufferedThrough] but nothing covers
 \* (cursors, inflightThrough] anymore.) This is the implementation's
-\* drop-buffer failure path; it does NOT set everCrashed — safety through
-\* this path is checked unconditionally.
+\* drop-buffer failure path.
 FlushFail(d, i) ==
     /\ DestOwner[d] = i
     /\ flushing[d]
@@ -272,19 +266,19 @@ FlushFail(d, i) ==
     /\ buffered' = [buffered EXCEPT ![d] = {}]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = cursors[d]]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
-                   opCount, everCrashed>>
+                   opCount>>
 
 \* Crash in the commit/cursor gap: the destination transaction committed
 \* but the process died before the cursor persisted. All in-memory state
 \* is lost (process death); persisted cursors and destination data remain.
 \* The next start re-reads from the stale cursor (at-least-once).
 \*
-\* KNOWN LIMITATION (carried over from the unbuffered spec): if the source
-\* deletes a row between this crash and the recovery read, the insert+delete
-\* for the same rowid cancel in Phase 2, but the destination already has the
-\* row from the crashed write. This leaves phantom data — inherent to
-\* at-least-once delivery without cross-catalog transactions.
-\* See FlushCommitNoCursor for the non-crash variant of the same window.
+\* RETIRED LIMITATION: under the old cancel-both Phase 2 rule, a source
+\* delete landing between this crash and the recovery read produced a
+\* PERMANENT phantom (insert+delete cancelled; the crashed write stayed).
+\* The tombstone rule heals it: the replayed delete survives Phase 2 and
+\* removes the crashed write. All invariants now hold through this action
+\* unconditionally. See FlushCommitNoCursor for the non-crash variant.
 CrashDuringFlush(d, i) ==
     /\ DestOwner[d] = i
     /\ flushing[d]
@@ -294,7 +288,6 @@ CrashDuringFlush(d, i) ==
     /\ flushing' = [e \in Dests |-> FALSE]
     /\ inflight' = [e \in Dests |-> {}]
     /\ inflightThrough' = [e \in Dests |-> 0]
-    /\ everCrashed' = TRUE
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, cursors, opCount>>
 
 \* The commit/cursor gap WITHOUT a process crash: the destination
@@ -304,8 +297,8 @@ CrashDuringFlush(d, i) ==
 \* path with the write already landed: only THIS destination's buffers
 \* and read position reset (the process keeps running, other destinations
 \* are untouched — unlike CrashDuringFlush, which loses everything).
-\* Same at-least-once window, same phantom limitation, so it sets
-\* everCrashed.
+\* Same at-least-once window as CrashDuringFlush; healed the same way by
+\* the tombstone rule on replay.
 FlushCommitNoCursor(d, i) ==
     /\ DestOwner[d] = i
     /\ flushing[d]
@@ -315,16 +308,14 @@ FlushCommitNoCursor(d, i) ==
     /\ inflightThrough' = [inflightThrough EXCEPT ![d] = 0]
     /\ buffered' = [buffered EXCEPT ![d] = {}]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = cursors[d]]
-    /\ everCrashed' = TRUE
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, cursors, opCount>>
 
 \* Plain process crash OUTSIDE the commit/cursor gap: all in-memory state
 \* (buffers, read positions, in-flight sets) is lost; persisted cursors and
 \* destination data are intact. An in-flight flush whose destination
-\* transaction had not committed rolls back with the process. This is the
-\* SAFE crash: it does NOT set everCrashed, so TLC checks that losing
-\* buffers can never violate safety — re-reads from persisted cursors
-\* re-cover everything that was buffered.
+\* transaction had not committed rolls back with the process. TLC checks
+\* that losing buffers can never violate safety — re-reads from persisted
+\* cursors re-cover everything that was buffered.
 ProcessCrash ==
     /\ \E d \in Dests : buffered[d] /= {} \/ bufferedThrough[d] > cursors[d] \/ flushing[d]
     /\ buffered' = [d \in Dests |-> {}]
@@ -333,7 +324,7 @@ ProcessCrash ==
     /\ inflight' = [d \in Dests |-> {}]
     /\ inflightThrough' = [d \in Dests |-> 0]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
-                   opCount, everCrashed>>
+                   opCount>>
 
 \* Seed: for a new destination (cursor at 0), read the current source state
 \* filtered by routing value and bulk-load the destination. Advances cursor
@@ -355,12 +346,13 @@ SeedDestination(d, i) ==
     /\ cursors' = [cursors EXCEPT ![d] = srcSnap]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = srcSnap]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, buffered, flushing,
-                   inflight, inflightThrough, opCount, everCrashed>>
+                   inflight, inflightThrough, opCount>>
 
 \* Crash after seed: destination seeded but cursor NOT advanced; process
-\* death loses all in-memory state. Re-seed on restart is idempotent (same
-\* scan result applied again), but conservatively conditioned like the
-\* unbuffered spec did.
+\* death loses all in-memory state. The next start re-seeds — and because
+\* SeedDestination is REPLACE, the re-seed is a full repair even if the
+\* source changed in between. (The implementation matches by truncating a
+\* non-empty destination whose cursor is 0 before streaming the seed.)
 CrashAfterSeed(d, i) ==
     /\ DestOwner[d] = i
     /\ cursors[d] = 0
@@ -375,28 +367,22 @@ CrashAfterSeed(d, i) ==
     /\ flushing' = [e \in Dests |-> FALSE]
     /\ inflight' = [e \in Dests |-> {}]
     /\ inflightThrough' = [e \in Dests |-> 0]
-    /\ everCrashed' = TRUE
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, cursors, opCount>>
 
 (***************************************************************************)
 (* Safety Properties                                                       *)
 (*                                                                         *)
-(* The consistency invariants are conditioned on full quiescence —         *)
+(* The consistency invariants are conditioned ONLY on full quiescence —    *)
 (* cursors persisted through the current source snapshot, nothing          *)
-(* buffered, no flush in flight — and on no commit/cursor-gap crash        *)
-(* having occurred (~everCrashed). ProcessCrash and FlushFail do NOT       *)
-(* weaken the condition: executions containing them are fully checked.     *)
+(* buffered, no flush in flight. There is NO crash conditioning: every     *)
+(* crash and failure action (ProcessCrash, FlushFail, CrashDuringFlush,    *)
+(* FlushCommitNoCursor, CrashAfterSeed) is fully explored and the          *)
+(* invariants must hold through all of them. (The pre-tombstone spec       *)
+(* conditioned consistency on an everCrashed flag — retired; see the       *)
+(* CRASH MODEL header note.)                                               *)
 (***************************************************************************)
 
 AllCleanAndCurrent ==
-    /\ \A d \in Dests : cursors[d] = srcSnap /\ buffered[d] = {} /\ ~flushing[d]
-    /\ ~everCrashed
-
-\* Quiescence WITHOUT the no-crash condition: used by the invariants that
-\* hold even in executions containing commit/cursor-gap events. The
-\* at-least-once window can only ADD rows (phantoms), never lose or
-\* misroute them.
-AllCleanAndCurrentAnyCrash ==
     \A d \in Dests : cursors[d] = srcSnap /\ buffered[d] = {} /\ ~flushing[d]
 
 \* Eventual consistency: destinations exactly match source partitions.
@@ -407,6 +393,8 @@ EventualConsistency ==
                        r \in {s \in srcRows : s.rv = RoutingMap[d]}})
 
 \* No phantom data: no destination row without a matching source row.
+\* Holds through commit/cursor-gap windows because Phase 2's tombstone
+\* rule lets the recovery replay's delete remove a crashed write.
 NoPhantomWhenCurrent ==
     AllCleanAndCurrent =>
     (\A d \in Dests :
@@ -431,35 +419,14 @@ PartitionCorrectness ==
     (\A d \in Dests :
         \A r \in dstRows[d] : r.rv = RoutingMap[d])
 
-\* NEW: data loss never happens, even in executions containing
-\* commit/cursor-gap events (crash or cursor-persist failure). This is the
-\* checked form of the README's "there is no data loss path" claim — the
-\* window produces phantoms (extra rows), never missing rows.
-NoDataLossEvenAfterCrash ==
-    AllCleanAndCurrentAnyCrash =>
-    (\A r \in srcRows :
-        \E d \in Dests :
-            RoutingMap[d] = r.rv /\
-            \E dr \in dstRows[d] : dr.key = r.key)
-
-\* NEW: partition correctness also holds through crash windows — a row can
-\* be stale or phantom, but never in the WRONG destination (routing
-\* immutability means every CDC event and seed row carries its final
-\* routing value).
-PartitionCorrectnessEvenAfterCrash ==
-    AllCleanAndCurrentAnyCrash =>
-    (\A d \in Dests :
-        \A r \in dstRows[d] : r.rv = RoutingMap[d])
-
-\* NEW: the read position never falls behind the persisted cursor and never
-\* runs ahead of the source. Holds unconditionally (incl. through
-\* ProcessCrash / FlushFail resets).
+\* The read position never falls behind the persisted cursor and never
+\* runs ahead of the source. Holds in every state (not just quiescence).
 BufferPositionBound ==
     \A d \in Dests :
         /\ cursors[d] <= bufferedThrough[d]
         /\ bufferedThrough[d] <= srcSnap
 
-\* NEW: no flush in flight => no in-flight state (the in-flight guard's
+\* No flush in flight => no in-flight state (the in-flight guard's
 \* structural half; per-destination flush serialization is inherent in the
 \* action atomicity of FlushStart..FlushCommit pairs guarded by flushing).
 FlushStateConsistency ==
@@ -483,7 +450,6 @@ Init ==
     /\ inflight = [d \in Dests |-> {}]
     /\ inflightThrough = [d \in Dests |-> 0]
     /\ opCount = 0
-    /\ everCrashed = FALSE
 
 Next ==
     \/ \E key \in Keys, rv \in RoutingValues, val \in 1..3 :

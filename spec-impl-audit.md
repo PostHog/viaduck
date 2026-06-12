@@ -6,10 +6,12 @@ concurrently-flushed delivery) against the implementation:
 `viaduck/source.py`, `viaduck/state.py`, `viaduck/destination.py`,
 `viaduck/router.py`. Captured at the close of the delivery rework
 (PR #21), after the M3 soak fixes (Winner(k) dedup, exclusive CDC read
-bounds). TLC re-checked green at this commit: 9 invariants over
-31,406,425 distinct states (incl. `FlushCommitNoCursor` and the two
-crash-unconditioned invariants added in this pass — see finding 1 and
-the refinements section).
+bounds). Amended same-day for the TOMBSTONE change: Phase 2 keeps the
+delete from an insert+delete pair instead of cancelling both, which
+heals commit/cursor-gap phantoms on replay and retired the spec's
+`everCrashed` conditioning entirely. TLC re-checked green: 7 canonical
+invariants — including phantom-freedom and full eventual consistency —
+over 22,589,617 distinct states with NO crash conditioning.
 
 Supersedes the 2026-04-28 audit (pre-buffering; archived in git history).
 
@@ -19,7 +21,7 @@ Supersedes the 2026-04-28 audit (pre-buffering; archived in git history).
 |---|---|---|
 | `CDCReadFrom(d, fromSnap)` — `c.snap > fromSnap /\ c.snap <= srcSnap` | `source.read_cdc_changes` / `read_cdc` (`source.py:88,132`: `after_snapshot + 1` to ducklake's inclusive API), issued per position group in `_poll_cycle` (`main.py:605-612`) | Half-open `(after, end]` contract restored by the M3 fix — see "Conformance-gap case study" below |
 | `Phase1(changes)` — drop preimages, at read time | `_resolve_preimages` (`main.py:178`), per poll read before routing | Code adds two defensive conversions (cross-tenant, orphaned preimage → delete) the spec excludes as constraint violations — extensions, not divergence |
-| `Phase2(changes)` — rowid conflict rules, at flush time | `_resolve_conflicts` (`apply.py:84-177`), called by `apply_full_cdc` on the concatenated in-flight tables | Spec has exactly two rules (Viaduck.tla `Phase2`); the impl adds a third — insert+postimage same rowid → drop insert (`apply.py:95-97`). Equivalent: a same-rowid postimage always carries a higher snapshot than its insert, so the spec's `Winner(k)` discards the insert in Phase 3 anyway; the impl just does it earlier. Post-condition assert mirrors the cancelled-pair invariant |
+| `Phase2(changes)` — rowid conflict rules, at flush time | `_resolve_conflicts` (`apply.py`), called by `apply_full_cdc` on the concatenated in-flight tables | TOMBSTONE rule: insert+delete same rowid drops only the insert — deletes are never dropped (heals commit/cursor-gap replays). The impl adds a third rule — insert+postimage same rowid → drop insert — equivalent via `Winner(k)`. Post-condition assert (no rowid in both insert and delete sets) still holds: inserts drop, deletes survive |
 | `Phase3Apply(d, resolved)` — delete-then-upsert, atomic, `Winner(k)` | `_apply_changes` (`apply.py:264-319`): chunked deletes then upsert inside one `begin_transaction`; `_dedupe_upserts_last_write_wins` (`apply.py:239-261`) is `Winner(k)` | Impl refines the spec's `CHOOSE` tie with a deterministic (snapshot_id, rowid) order — noted in the spec comment (Viaduck.tla:196-199) |
 | `BufferRead(d, i)` | `DeliveryManager.buffer` / `advance_position` (`delivery.py:144-184`); poll thread is the only caller (`main.py:647-657`) | See "Read epochs" refinement below |
 | `FlushStart(d, i)` — buffer swap, in-flight guard, fires for empty buffers with position ahead | `maybe_flush` (`delivery.py:195-231`): skips in-flight dests, swaps `_Buffer()`, submits worker | Spec's `buffered /= {} \/ bufferedThrough > cursors` guard ≡ `_trigger_for_locked`'s `has_data or position_ahead` (`delivery.py:297-315`). Triggers (interval/rows/bytes/memory/shutdown) are scheduling policy below spec granularity — any FlushStart timing is allowed by the spec |
@@ -28,8 +30,8 @@ Supersedes the 2026-04-28 audit (pre-buffering; archived in git history).
 | `CrashDuringFlush(d, i)` — dest commit lands, cursor doesn't, process dies | The real gap between `_apply_changes`'s transaction commit and `advance_cursor` | `_advance_cursor_with_retry` (`delivery.py:383-399`) narrows the window |
 | `FlushCommitNoCursor(d, i)` — dest commit lands, cursor persist fails, process lives | `_flush`'s except path entered via `_advance_cursor_with_retry` exhaustion: per-destination `_on_flush_failure` with the write already committed | Added in this pass (finding 1); TLC-checked |
 | `ProcessCrash` — lose memory state, keep cursors/data | No persistence of buffers/positions; `DeliveryManager.__init__` re-initializes `flushed`/`position` from PG cursors (`delivery.py:99-110`) | Soak-verified (SIGKILL → re-read → convergence) |
-| `SeedDestination(d, i)` | `_seed_new_destinations` (`main.py:299-449`): filtered scan pinned to `current_id`, cursor advanced once after all batches | Spec REPLACEs dest rows; code upserts (key_columns) or appends. Equivalent for the modeled case (cursor=0 ⇒ empty dest). Divergence on re-seed without key_columns: append duplicates — documented in the docstring (`main.py:309-312`) |
-| `CrashAfterSeed(d, i)` | Partial seed leaves cursor at 0 → full re-seed on restart (`main.py:316-318`) | Same idempotency caveats as seeding |
+| `SeedDestination(d, i)` | `_seed_new_destinations` (`main.py`): filtered scan pinned to `current_id`, cursor advanced once after all batches | Now REPLACE-equivalent: a cursor-0 destination with existing rows is truncated before streaming (`routing.seed_truncate`, default true; refuse-loudly when false). The historical upsert/append-onto-leftovers divergence — including append-mode re-seed duplication — is closed |
+| `CrashAfterSeed(d, i)` | Partial seed leaves cursor at 0 → truncate + full re-seed on restart | REPLACE semantics make the retry a full repair (spec-conformant) |
 | `DestOwner[d] = i` precondition | `cfg.assigned_destination_ids()` static hash partitioning | Spec assumes fixed assignment; dynamic reassignment remains unmodeled (out of scope, unchanged from previous audit) |
 | `SrcInsert` / `SrcUpdate` / `SrcDelete` | — (environment actions) | Model the *source's* behavior, not viaduck's; intentionally unmapped |
 
@@ -40,8 +42,7 @@ Supersedes the 2026-04-28 audit (pre-buffering; archived in git history).
 | `BufferPositionBound` (`cursors <= bufferedThrough <= srcSnap`) | `position` initialized to `flushed`; `_on_flush_failure` resets `position = flushed`; `advance_position` is max-guarded (`delivery.py:181`). Note `buffer()` stamps `position = through_snapshot` *unconditionally* (`delivery.py:167`) — safe only because the poll thread is the single position writer reading forward from `read_plan()`, and the epoch check discards stamps that overlapped a failure reset. Not enforced by an assertion; the bound rests on the single-writer + epoch discipline |
 | `FlushStateConsistency` | `_inflight.discard` + `_inflight_bytes = 0` in `_flush`'s `finally` (`delivery.py:377-381`) — holds on commit, fail, and escaped-exception paths |
 | `CursorMonotonicity` | PG upsert guard `WHERE last_snapshot_id <= EXCLUDED.last_snapshot_id` (`state.py`, both advance paths) — enforced at the durability layer, not just in memory |
-| `EventualConsistency` / `NoPhantom` / `NoDataLoss` / `PartitionCorrectness` | Not directly assertable in code; locked by the integration suite (phase round-trips, buffered-delivery end-to-end, seed-boundary regression) and the kill-sequence soak |
-| `NoDataLossEvenAfterCrash` / `PartitionCorrectnessEvenAfterCrash` (new) | Same code paths; these drop the `~everCrashed` condition, machine-checking that the at-least-once window only ever ADDS rows (phantoms) — the README's "no data loss path" claim is now TLC-backed |
+| `EventualConsistency` / `NoPhantomWhenCurrent` / `NoDataLossWhenCurrent` / `PartitionCorrectness` | Not directly assertable in code; locked by the integration suite (phase round-trips, buffered-delivery end-to-end, phantom-heal e2e, seed-REPLACE regressions) and the kill-sequence soak. All four are now checked by TLC with NO crash conditioning — the previously-separate `*EvenAfterCrash` variants became identical after the tombstone change and were deduplicated away |
 
 ## Refinements (impl is finer-grained than spec, equivalence argued)
 
@@ -66,20 +67,17 @@ Supersedes the 2026-04-28 audit (pre-buffering; archived in git history).
 
 ## Findings
 
-1. **MEDIUM (RESOLVED in this pass) — cursor-persist failure after
-   destination commit is a phantom window without a crash.** If
-   `_advance_cursor_with_retry` exhausts its 3 attempts, `_flush`
-   falls into the failure path with the destination transaction
-   already committed: position resets, range re-reads — the
-   commit/cursor gap without process death, and with only the one
-   destination affected (the process keeps running). Originally this
-   audit recommended a spec comment; review correctly pushed for
-   modeling instead, since `FlushFail` is defined by ASSUMPTION 4
-   rollback and cannot represent a committed write. Now modeled as
-   `FlushCommitNoCursor(d, i)`: Phase3Apply + per-destination reset +
-   `everCrashed`, TLC-checked. Operator takeaway stands: "PG down
-   during a flush" is in the phantom window; the in-process retry
-   narrows it to multi-second outages.
+1. **RESOLVED — the commit/cursor-gap phantom window no longer
+   exists.** Two steps: first the window was modeled precisely
+   (`FlushCommitNoCursor` for the non-crash variant alongside
+   `CrashDuringFlush`); then the tombstone Phase 2 rule made the
+   recovery replay heal it — the previously-cancelled delete now
+   lands and removes the crashed write. TLC proves phantom-freedom
+   and full eventual consistency with no crash conditioning; the
+   `everCrashed` variable and its conditioned invariants were
+   removed from the spec. Residual operator note: the replay window
+   still costs an idempotent re-apply (and tombstone deletes are
+   counted in `cdc_tombstones_emitted_total`).
 
 2. **LOW — `append_only` mode is unmodeled.** The spec is full-CDC
    only. Append-only shares the read/buffer/flush machinery but skips
@@ -89,10 +87,13 @@ Supersedes the 2026-04-28 audit (pre-buffering; archived in git history).
    duplicated rows every flush boundary; crash re-reads can still
    duplicate (documented in README's delivery guarantees).
 
-3. **LOW — carried forward**: source key uniqueness now verified at
-   seed time per partition (see follow-up 1), but post-seed inserts
-   remain unverified; routing column immutability detected per-row,
-   not rejected at config; pool schema cached for process lifetime
+3. **MEDIUM (raised from LOW) — key uniqueness post-seed remains
+   unverified, and tombstones widen the blast radius**: a duplicate
+   live key means a tombstone delete-by-key over-deletes the
+   surviving duplicate, where the old cancel rule was inert. The
+   steady-state uniqueness check moves up the follow-up list.
+   Also carried: routing column immutability detected per-row, not
+   rejected at config; pool schema cached for process lifetime
    (schema drift out of scope).
 
 ## Conformance-gap case study: the inclusive-read phantom
@@ -139,7 +140,14 @@ Follow-ups worth doing eventually (not blocking):
    (`main.py:_verify_seed_key_uniqueness`). Remaining gap: post-seed
    inserts are not re-verified (the contract still applies; a
    steady-state check would need a scan).
-2. Property-based (hypothesis) equivalence test driving random CDC
+2. **Rowid reuse (OPEN, found by the churn soak 2026-06-11)**: DuckLake
+   reuses a rowid when an upsert re-creates a deleted key; a re-create
+   within one flush window pairs with the tombstone and is lost (both
+   old and new Phase 2 rules fail; assumption 2 violated upstream).
+   Evidence: event 73 → insert@4/delete@5/re-insert@18 all rowid 77;
+   6/~8400 rows at 200 rows/s. Candidate fix: snapshot-ordered
+   latest-event-wins Phase 2, spec-first. Append-only unaffected.
+3. Property-based (hypothesis) equivalence test driving random CDC
    batches through `_resolve_conflicts` + `_apply_changes` against a
    set-semantics oracle of `Phase2`/`Phase3Apply`.
 3. Worker-count sweep (1/2/4/8/16) on the fanout bench before making

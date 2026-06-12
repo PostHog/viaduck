@@ -519,18 +519,26 @@ def test_resolve_preimages_validates_key_columns_exist():
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_conflicts_insert_delete_cancel():
-    """Same rowid insert + delete should cancel both. Metric incremented."""
+def test_resolve_conflicts_insert_delete_keeps_tombstone():
+    """Same rowid insert + delete: the insert drops, the delete SURVIVES
+    (tombstone). Against a destination that never saw the insert it is an
+    idempotent no-op; against one that did (commit/cursor-gap replay) it
+    is the only event that can remove the phantom. Both metrics fire."""
     batch = _cdc_table(
         [
             {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
             {"company": "acme", "value": 1, "change_type": "delete", "snapshot_id": 1, "rowid": 100},
         ]
     )
-    with patch("viaduck.main.metrics.cdc_conflicts_resolved_total") as mock_metric:
+    with (
+        patch("viaduck.main.metrics.cdc_conflicts_resolved_total") as mock_conflicts,
+        patch("viaduck.main.metrics.cdc_tombstones_emitted_total") as mock_tombstones,
+    ):
         result = _resolve_conflicts(batch)
-    assert result.num_rows == 0
-    mock_metric.inc.assert_called_once()
+    assert result.column("change_type").to_pylist() == ["delete"]
+    assert result.column("rowid").to_pylist() == [100]
+    mock_conflicts.inc.assert_called_once_with(1)
+    mock_tombstones.inc.assert_called_once_with(1)
 
 
 def test_resolve_conflicts_update_delete_keeps_delete():
@@ -558,8 +566,8 @@ def test_resolve_conflicts_no_conflicts():
     assert result.num_rows == 2
 
 
-def test_resolve_conflicts_mixed_some_cancel():
-    """Some cancel, some don't."""
+def test_resolve_conflicts_mixed_pairs_and_plain():
+    """A paired rowid keeps only its tombstone delete; unrelated rows pass."""
     batch = _cdc_table(
         [
             {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
@@ -568,8 +576,8 @@ def test_resolve_conflicts_mixed_some_cancel():
         ]
     )
     result = _resolve_conflicts(batch)
-    assert result.num_rows == 1
-    assert result.column("rowid")[0].as_py() == 200
+    by_rowid = dict(zip(result.column("rowid").to_pylist(), result.column("change_type").to_pylist()))
+    assert by_rowid == {100: "delete", 200: "insert"}
 
 
 def test_resolve_conflicts_empty_batch():
@@ -580,7 +588,8 @@ def test_resolve_conflicts_empty_batch():
 
 
 def test_resolve_conflicts_insert_update_delete_sequence():
-    """Same rowid: insert + postimage + delete. Insert+delete cancel, postimage dropped."""
+    """Same rowid: insert + postimage + delete. Insert and postimage drop;
+    the delete survives as the tombstone (matches spec Phase2)."""
     batch = _cdc_table(
         [
             {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
@@ -589,8 +598,7 @@ def test_resolve_conflicts_insert_update_delete_sequence():
         ]
     )
     result = _resolve_conflicts(batch)
-    # insert+delete cancel (both removed), postimage dropped because delete exists
-    assert result.num_rows == 0
+    assert result.column("change_type").to_pylist() == ["delete"]
 
 
 def test_resolve_conflicts_duplicate_keys_last_wins():
@@ -629,9 +637,9 @@ def test_resolve_conflicts_uses_rowid_not_just_key():
         ]
     )
     result = _resolve_conflicts(batch)
-    # rowid 100: insert+delete cancel. rowid 300: insert preserved.
-    assert result.num_rows == 1
-    assert result.column("rowid")[0].as_py() == 300
+    # rowid 100: insert drops, tombstone delete survives. rowid 300: insert preserved.
+    by_rowid = dict(zip(result.column("rowid").to_pylist(), result.column("change_type").to_pylist()))
+    assert by_rowid == {100: "delete", 300: "insert"}
 
 
 def test_resolve_conflicts_insert_postimage_same_rowid_drops_insert():
@@ -974,6 +982,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
     mock_catalog, txn_table = _txn_catalog()
     mock_dest_table = MagicMock()
     mock_dest_table.identifier = "dest_table"
+    mock_dest_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
     delivery = _make_real_delivery(state_mgr, dest_pool, ["value"], ["dest-1"])
@@ -1060,6 +1069,7 @@ def test_poll_cycle_cdc_delete_only_changeset():
     mock_catalog, txn_table = _txn_catalog()
     mock_dest_table = MagicMock()
     mock_dest_table.identifier = "dest_table"
+    mock_dest_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
     delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"])
@@ -1108,6 +1118,7 @@ def test_poll_cycle_cdc_write_failure_isolation():
     mock_dest_table = MagicMock()
     mock_dest_table.identifier = "dest_table"
     mock_catalog.begin_transaction.side_effect = Exception("catalog down")
+    mock_dest_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
     delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"])
@@ -1171,6 +1182,7 @@ def test_poll_cycle_cdc_routing_value_mutation():
     mock_catalog, _txn_table = _txn_catalog()
     mock_dest_table = MagicMock()
     mock_dest_table.identifier = "dest_table"
+    mock_dest_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
     delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1", "dest-2"])
@@ -1258,7 +1270,8 @@ def test_poll_cycle_branches_on_key_columns():
 
 
 def test_torture_insert_update_delete_same_key():
-    """3 ops on same rowid: insert + postimage + delete -> net no-op after conflict resolution."""
+    """3 ops on same rowid: insert + postimage + delete -> only the
+    tombstone delete survives conflict resolution."""
     batch = _cdc_table(
         [
             {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
@@ -1267,7 +1280,7 @@ def test_torture_insert_update_delete_same_key():
         ]
     )
     result = _resolve_conflicts(batch)
-    assert result.num_rows == 0
+    assert result.column("change_type").to_pylist() == ["delete"]
 
 
 def test_torture_routing_value_mutation_cross_tenant():
@@ -1510,6 +1523,7 @@ def test_seed_new_destinations_populates_from_scan():
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
@@ -1576,10 +1590,18 @@ def test_seed_new_destinations_no_matching_rows():
     mock_scan.to_arrow_batch_reader.return_value = iter([])
     src_table.scan.return_value = mock_scan
 
+    mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0
+    dest_pool.get.return_value = (MagicMock(), mock_table)
+
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
         _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
 
-    dest_pool.get.assert_not_called()
+    # Only the REPLACE-guard get/release; no rows means no writes.
+    dest_pool.get.assert_called_once_with("dest-1")
+    dest_pool.release.assert_called_once_with("dest-1")
+    mock_table.upsert.assert_not_called()
+    mock_table.append.assert_not_called()
     state_mgr.advance_cursor.assert_called_once_with("dest-1", 100, cumulative_rows=0)
 
 
@@ -1601,6 +1623,7 @@ def test_seed_new_destinations_uses_upsert_with_key_columns():
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
@@ -1631,6 +1654,7 @@ def test_seed_new_destinations_uses_append_without_key_columns():
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
@@ -1671,7 +1695,8 @@ def test_seed_new_destinations_multiple():
     tables = {}
 
     def mock_get(dest_id):
-        t = MagicMock()
+        t = tables.get(dest_id) or MagicMock()
+        t.scan.return_value.count.return_value = 0
         tables[dest_id] = t
         return (MagicMock(), t)
 
@@ -1700,6 +1725,10 @@ def test_seed_new_destinations_pins_snapshot():
     mock_scan = MagicMock()
     mock_scan.to_arrow_batch_reader.return_value = iter([])
     src_table.scan.return_value = mock_scan
+
+    mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0
+    dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=42):
         _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
@@ -1976,6 +2005,7 @@ def test_seed_new_destinations_logs_prescan_stats(caplog):
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=42):
@@ -2012,6 +2042,7 @@ def test_seed_new_destinations_continues_when_prescan_stats_fail(caplog):
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=42):
@@ -2041,6 +2072,7 @@ def test_seed_new_destinations_logs_first_batch_milestone(caplog):
     src_table.scan.return_value = mock_scan
 
     mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=99):
@@ -2203,3 +2235,32 @@ def test_derive_dest_status(snap_now, kw, expected):
     """Between flushes the cursor always trails the source; that must NOT
     display as 'lagging' — only reads being behind is operationally lag."""
     assert _derive_dest_status(_delivery_status(**kw), snap_now) == expected
+
+
+def test_phase1_converted_delete_survives_phase2_as_tombstone():
+    """Phase 1 converts a cross-tenant preimage to a delete; when the same
+    rowid's insert is in the window (row created then migrated), the OLD
+    tenant's routed batch carries insert+converted-delete for one rowid —
+    Phase 2 must keep the converted delete (tombstone) so the old copy is
+    removed. Mirrors the real pipeline order: Phase 1 → route → Phase 2
+    per destination."""
+    import pyarrow.compute as pc
+
+    batch = _cdc_table(
+        [
+            {"company": "old_tenant", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+            {"company": "old_tenant", "value": 1, "change_type": "update_preimage", "snapshot_id": 2, "rowid": 100},
+            {"company": "new_tenant", "value": 1, "change_type": "update_postimage", "snapshot_id": 2, "rowid": 100},
+        ]
+    )
+    resolved = _resolve_preimages(batch, "company", ["value"])
+
+    # Route by company (what the Router does), then Phase 2 per destination.
+    old_routed = resolved.filter(pc.equal(resolved.column("company"), "old_tenant"))
+    new_routed = resolved.filter(pc.equal(resolved.column("company"), "new_tenant"))
+
+    old_resolved = _resolve_conflicts(old_routed)
+    assert old_resolved.column("change_type").to_pylist() == ["delete"]  # tombstone survives
+
+    new_resolved = _resolve_conflicts(new_routed)
+    assert new_resolved.column("change_type").to_pylist() == ["update_postimage"]

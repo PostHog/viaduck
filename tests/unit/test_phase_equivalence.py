@@ -99,12 +99,12 @@ def _oracle_resolve_conflicts(batch: pa.Table) -> pa.Table:
 
     rows_to_remove: set = set()
     for rowid, ins_indices in insert_rowids.items():
-        if rowid in postimage_rowids and rowid not in delete_rowids:
+        # insert dropped when shadowed by a postimage OR paired with a
+        # delete; the delete itself is NEVER dropped (tombstone rule —
+        # it must survive to heal commit/cursor-gap replays).
+        if rowid in postimage_rowids or rowid in delete_rowids:
             rows_to_remove.update(ins_indices)
-    for rowid, del_indices in delete_rowids.items():
-        if rowid in insert_rowids:
-            rows_to_remove.update(del_indices)
-            rows_to_remove.update(insert_rowids[rowid])
+    for rowid in delete_rowids:
         if rowid in postimage_rowids:
             rows_to_remove.update(postimage_rowids[rowid])
 
@@ -163,6 +163,13 @@ def _random_batch(rng: random.Random, n_rows: int, *, with_mutations: bool, with
                 change_types.append(follow)
                 rowids.append(rowid)
                 routings.append(rv)
+                # The full insert+postimage+delete triple on one rowid:
+                # all three Phase 2 rules fire — only the tombstone delete
+                # must survive.
+                if follow == "update_postimage" and rng.random() < 0.3:
+                    change_types.append("delete")
+                    rowids.append(rowid)
+                    routings.append(rv)
         elif shape < 0.6:  # update pair (pre+post), possibly mutated routing
             post_rv = rv
             if with_mutations and rng.random() < 0.3:
