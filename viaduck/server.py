@@ -97,6 +97,7 @@ class DestStatus:
     applied_updates: int = 0
     applied_deletes: int = 0
     buffered_rows_total: int = 0
+    lag_seconds: float = 0.0
 
 
 class StatusState:
@@ -115,6 +116,7 @@ class StatusState:
         mode: str,
         poll_interval: float,
         flush_interval: float = 0.0,
+        delivery_config: dict | None = None,
         destinations: list[DestStatus],
         pool_open: int,
         pool_max: int,
@@ -126,6 +128,7 @@ class StatusState:
                 "mode": mode,
                 "poll_interval": poll_interval,
                 "flush_interval": flush_interval,
+                "delivery_config": delivery_config or {},
                 "uptime_s": round(time.monotonic() - self._started_at, 1),
                 "destinations": [asdict(d) for d in destinations],
                 "pool": {"open": pool_open, "max": pool_max},
@@ -140,6 +143,7 @@ class StatusState:
                     "mode": None,
                     "poll_interval": None,
                     "flush_interval": None,
+                    "delivery_config": {},
                     "uptime_s": round(time.monotonic() - self._started_at, 1),
                     "destinations": [],
                     "pool": {"open": 0, "max": 0},
@@ -176,6 +180,10 @@ _UI_HTML = """\
   th { background: #f0f0f0; font-weight: 600; cursor: help;
        white-space: nowrap; vertical-align: bottom; }
   .unit { display: block; font-weight: 400; font-size: 0.75em; color: #888; }
+  .sort-ind { font-size: 0.75em; color: #555; margin-left: 4px; }
+  .lag-warn { color: #f57f17; font-weight: 600; }
+  .lag-bad { color: #c62828; font-weight: 600; }
+  th[data-sort] { cursor: pointer; user-select: none; }
   /* numeric columns: Snapshot, Lag, Rows Processed, Buffered */
   th:nth-child(n+3):nth-child(-n+7), td:nth-child(n+3):nth-child(-n+7) { text-align: right; }
   td:nth-child(8) { cursor: help; }
@@ -202,25 +210,35 @@ _UI_HTML = """\
 <table>
   <thead>
     <tr>
-      <th title="Destination id from the config">Destination</th>
-      <th title="Source rows whose routing field equals this value are delivered here">Routing Value</th>
-      <th title="Last source snapshot durably flushed to this destination (the persisted cursor)">Snapshot</th>
-      <th title="Snapshots behind the source (source snapshot minus flushed snapshot).
-With buffered delivery a nonzero value between flushes is normal — see Status">Lag<span
-class="unit">snapshots behind</span></th>
+      <th title="Destination id from the config" data-sort="id"
+data-type="str">Destination<span class="sort-ind"></span></th>
+      <th title="Source rows whose routing field equals this value are delivered here"
+data-sort="routing_value" data-type="str">Routing Value<span class="sort-ind"></span></th>
+      <th title="Last source snapshot durably flushed to this destination (the persisted cursor)"
+data-sort="snapshot" data-type="num">Snapshot<span class="sort-ind"></span></th>
+      <th title="Age of the oldest position advance not yet flushed durable — how far the
+persisted cursor trails in wall-clock terms. Anything under the flush interval is the
+buffering design working. Hover a cell for the snapshot count"
+data-sort="lag_seconds" data-type="num">Lag<span class="sort-ind"></span><span
+class="unit">seconds behind</span></th>
       <th title="Cumulative operations applied since seeding (upserts + deletes),
-not the destination's current row count">Rows Processed<span class="unit">ops applied</span></th>
+not the destination's current row count" data-sort="rows_replicated"
+data-type="num">Rows Processed<span class="sort-ind"></span><span class="unit">ops applied</span></th>
       <th title="Rows read from the source and awaiting flush (buffer age in seconds).
-Hover a cell for the cumulative rows buffered this run">Buffered<span
+Hover a cell for the cumulative rows buffered this run"
+data-sort="buffer_rows" data-type="num">Buffered<span class="sort-ind"></span><span
 class="unit">rows (age)</span></th>
       <th title="Rows forwarded to the destination this run, counted before conflict
 resolution (+ inserts / Δ updates / − deletes). In-memory: resets on restart;
-at-least-once replays can double-count">Applied<span
+at-least-once replays can double-count" data-sort="applied_total"
+data-type="num">Applied<span class="sort-ind"></span><span
 class="unit">+ / Δ / −</span></th>
       <th title="healthy: flushed through the current snapshot. buffering: read-current,
 data awaiting flush (normal). flushing: a flush is in progress. lagging: reads are
-behind the source. error: last flush failed; the range will be re-read">Status</th>
-      <th title="Most recent flush error; cleared on the next successful flush">Last Error</th>
+behind the source. error: last flush failed; the range will be re-read"
+data-sort="status" data-type="str">Status<span class="sort-ind"></span></th>
+      <th title="Most recent flush error; cleared on the next successful flush"
+data-sort="last_error" data-type="str">Last Error<span class="sort-ind"></span></th>
     </tr>
   </thead>
   <tbody id="tbody"></tbody>
@@ -254,23 +272,86 @@ function esc(x) {
   return String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+let sortKey = null;
+let sortDir = 1;  // 1 asc, -1 desc
+let lastData = null;
+
+function fmtBytes(n) {
+  if (n == null) return '?';
+  if (n >= 1073741824) return (n / 1073741824).toFixed(n % 1073741824 ? 1 : 0) + ' GiB';
+  if (n >= 1048576) return Math.round(n / 1048576) + ' MiB';
+  return fmt(n) + ' B';
+}
+
+function flushTip(d) {
+  const c = d.delivery_config || {};
+  return 'Changes buffer in memory and flush on the FIRST trigger to fire: ' +
+    'age \u2265 ' + esc(d.flush_interval || '?') + 's \u00b7 ' +
+    'rows \u2265 ' + fmt(c.flush_max_rows) + ' \u00b7 ' +
+    'bytes \u2265 ' + fmtBytes(c.flush_max_bytes) + ' \u00b7 ' +
+    'global watermark ' + fmtBytes(c.buffer_total_max_bytes) + ' (largest first) \u00b7 ' +
+    'shutdown. Workers: ' + fmt(c.workers) + ', connection pool: ' + fmt(c.pool_max_open);
+}
+
+function lagClass(dest, d) {
+  // Within one flush interval is the buffering design working; past it,
+  // something is slow; past two, something is stuck.
+  const fi = d.flush_interval || 0;
+  if (!fi || dest.lag_seconds <= fi) return '';
+  return dest.lag_seconds > 2 * fi ? 'lag-bad' : 'lag-warn';
+}
+
+function sortVal(dest, key) {
+  if (key === 'applied_total') {
+    return dest.applied_inserts + dest.applied_updates + dest.applied_deletes;
+  }
+  return dest[key];
+}
+
+document.querySelectorAll('th[data-sort]').forEach(function(th) {
+  th.addEventListener('click', function() {
+    const key = th.dataset.sort;
+    if (sortKey === key) {
+      sortDir = -sortDir;
+    } else {
+      sortKey = key;
+      // numbers feel right descending first; strings ascending
+      sortDir = th.dataset.type === 'num' ? -1 : 1;
+    }
+    document.querySelectorAll('.sort-ind').forEach(function(el) { el.textContent = ''; });
+    th.querySelector('.sort-ind').textContent = sortDir === 1 ? '\u25b2' : '\u25bc';
+    if (lastData) update(lastData);
+  });
+});
+
 function update(d) {
+  lastData = d;
   meta.innerHTML = 'Source: ' + esc(d.source_table || '?') +
     ' @ snapshot ' + fmt(d.source_snapshot) +
     '  |  Mode: <span class="tip" title="' + esc(modeTips[d.mode] || '') + '">' + esc(d.mode || '?') + '</span>' +
     '  |  Poll: every ' + esc(d.poll_interval || '?') + 's' +
-    '  |  <span class="tip" title="Changes buffer in memory up to this long before flushing to the destination;' +
-    ' row/byte/memory triggers can flush sooner">Flush: every ' + esc(d.flush_interval || '?') + 's</span>' +
+    '  |  <span class="tip" title="' + flushTip(d) + '">Flush: every ' + esc(d.flush_interval || '?') + 's</span>' +
     '  |  Uptime: ' + Math.round((d.uptime_s || 0) / 60) + 'm';
 
   let html = '';
-  (d.destinations || []).forEach(function(dest) {
+  let dests = (d.destinations || []).slice();
+  if (sortKey) {
+    dests.sort(function(a, b) {
+      const av = sortVal(a, sortKey), bv = sortVal(b, sortKey);
+      if (av === bv) return a.id < b.id ? -1 : 1;  // stable-ish tiebreak
+      if (av === null || av === undefined) return 1;
+      if (bv === null || bv === undefined) return -1;
+      return (av < bv ? -1 : 1) * sortDir;
+    });
+  }
+  dests.forEach(function(dest) {
     const cls = dest.status || 'healthy';
     html += '<tr>' +
       '<td><span class="dot dot-' + cls + '"></span>' + dest.id + '</td>' +
       '<td>' + dest.routing_value + '</td>' +
       '<td>' + fmt(dest.snapshot) + '</td>' +
-      '<td>' + fmt(dest.lag) + '</td>' +
+      '<td title="' + fmt(dest.lag) + ' snapshots behind" class="' + lagClass(dest, d) + '">' +
+        (dest.lag_seconds >= 0.5 ? Math.round(dest.lag_seconds) + 's' : '-') + '</td>' +
       '<td>' + fmt(dest.rows_replicated) + '</td>' +
       '<td title="Cumulative rows buffered this run: ' + fmt(dest.buffered_rows_total) + '">' +
         (dest.buffer_rows

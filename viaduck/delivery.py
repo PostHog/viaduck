@@ -78,6 +78,10 @@ class DestDeliveryStatus:
     applied_updates: int = 0
     applied_deletes: int = 0
     buffered_rows_total: int = 0
+    # Wall-clock staleness of the durable cursor: age of the oldest
+    # position advance not yet submitted for flush (0 when clean or
+    # mid-flush). Reads better than snapshot counts on busy sources.
+    lag_seconds: float = 0.0
 
 
 class DeliveryManager:
@@ -297,6 +301,9 @@ class DeliveryManager:
                     applied_updates=self._applied[d]["updates"],
                     applied_deletes=self._applied[d]["deletes"],
                     buffered_rows_total=self._buffered_rows_total[d],
+                    lag_seconds=(now - self._position_dirty_since[d])
+                    if self._position_dirty_since[d] is not None
+                    else 0.0,
                 )
                 for d in self._buffers
             }

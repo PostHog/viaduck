@@ -30,7 +30,35 @@ S3_DATA_PATH = os.environ.get("S3_DATA_PATH", "s3://source/")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
 BATCH_INTERVAL = float(os.environ.get("BATCH_INTERVAL", "2"))
 
-COMPANIES = ["quacksworth", "mallardine", "tealford"]
+# 20 routed companies (rank-ordered) + tealford, which is intentionally
+# unrouted to exercise the unrouted-rows metric. Event volume follows a
+# Zipf-ish power law over rank (weight = 1/rank^1.2): quacksworth dominates,
+# the tail trickles — mirroring production tenant skew.
+COMPANIES = [
+    "quacksworth",
+    "mallardine",
+    "drakeford",
+    "gosswick",
+    "eiderdown",
+    "pintailor",
+    "scaupson",
+    "wigeonton",
+    "gadwallace",
+    "smewbury",
+    "pochardly",
+    "canvasbeck",
+    "redheadly",
+    "buffleton",
+    "goldeneye",
+    "merganser",
+    "ruddyshore",
+    "shovelnook",
+    "woodington",
+    "brantley",
+    "tealford",
+]
+_POWER_LAW_S = 1.2
+COMPANY_WEIGHTS = [1.0 / (rank**_POWER_LAW_S) for rank in range(1, len(COMPANIES) + 1)]
 
 # --- Globals ---
 
@@ -90,7 +118,7 @@ def generate_inserts(count: int) -> pa.Table:
     for _ in range(count):
         eid = next_event_id
         next_event_id += 1
-        company = random.choice(COMPANIES)
+        company = random.choices(COMPANIES, weights=COMPANY_WEIGHTS, k=1)[0]
         value = random.randint(1, 1000)
 
         event_ids.append(eid)
