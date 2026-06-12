@@ -2020,7 +2020,7 @@ def test_seed_new_destinations_logs_prescan_stats(caplog):
     line = prescan[0]
     assert "2 data files" in line
     assert "3.00 GiB" in line
-    assert "0.75 MiB" in line
+    assert "768.00 KiB" in line
 
 
 def test_seed_new_destinations_continues_when_prescan_stats_fail(caplog):
