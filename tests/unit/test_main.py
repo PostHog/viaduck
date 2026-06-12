@@ -16,9 +16,11 @@ from viaduck.apply import (
 )
 from viaduck.main import (
     _derive_dest_status,
+    _fmt_duration,
     _group_by_cursor,
     _poll_cycle,
     _resolve_preimages,
+    _scan_progress_suffix,
     _seed_new_destinations,
     _start_progress_heartbeat,
 )
@@ -2264,3 +2266,180 @@ def test_phase1_converted_delete_survives_phase2_as_tombstone():
 
     new_resolved = _resolve_conflicts(new_routed)
     assert new_resolved.column("change_type").to_pylist() == ["update_postimage"]
+
+
+# --- seed-scan progress reporting ---
+
+
+def test_fmt_duration():
+    assert _fmt_duration(42) == "42s"
+    assert _fmt_duration(90) == "2m"  # rounds
+    assert _fmt_duration(25 * 60) == "25m"
+    assert _fmt_duration(3 * 3600 + 17 * 60) == "3h 17m"
+
+
+def test_scan_progress_suffix_no_conn():
+    assert _scan_progress_suffix(None, 100.0) == ""
+
+
+def test_scan_progress_suffix_no_query_running():
+    conn = MagicMock()
+    conn.query_progress.return_value = -1.0
+    assert _scan_progress_suffix(conn, 100.0) == ""
+
+
+def test_scan_progress_suffix_sub_one_percent_suppressed():
+    """Fractional early readings must not render '~0%' with a noise ETA."""
+    conn = MagicMock()
+    for pct in (0.0, 0.3, 0.99):
+        conn.query_progress.return_value = pct
+        assert _scan_progress_suffix(conn, 100.0) == ""
+
+
+def test_scan_progress_suffix_midway():
+    conn = MagicMock()
+    conn.query_progress.return_value = 25.0
+    # 25% in 100s -> 300s remaining -> 5m
+    assert _scan_progress_suffix(conn, 100.0) == " (~25% scanned, est. 5m remaining)"
+
+
+def test_scan_progress_suffix_complete():
+    conn = MagicMock()
+    conn.query_progress.return_value = 100.0
+    assert _scan_progress_suffix(conn, 100.0) == " (~100% scanned)"
+
+
+def test_scan_progress_suffix_swallows_errors_warning_once(caplog, monkeypatch):
+    monkeypatch.setattr("viaduck.main._scan_progress_poll_warned", False)
+    conn = MagicMock()
+    conn.query_progress.side_effect = RuntimeError("connection busy")
+    with caplog.at_level("WARNING", logger="viaduck.main"):
+        assert _scan_progress_suffix(conn, 100.0) == ""
+        assert _scan_progress_suffix(conn, 200.0) == ""
+    warnings = [r for r in caplog.records if "progress polling failed" in r.message]
+    assert len(warnings) == 1
+
+
+def test_scan_progress_suffix_recovers_after_transient_error(monkeypatch):
+    """A failed poll (e.g. closed-connection race) must not disable polling."""
+    monkeypatch.setattr("viaduck.main._scan_progress_poll_warned", False)
+    conn = MagicMock()
+    conn.query_progress.side_effect = [RuntimeError("teardown race"), 50.0]
+    assert _scan_progress_suffix(conn, 100.0) == ""
+    assert "50%" in _scan_progress_suffix(conn, 100.0)
+
+
+def test_progress_heartbeat_suffix_in_rate_line(caplog, monkeypatch):
+    """progress_conn suffix lands in the rows-flowing log variant."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+    conn = MagicMock()
+    conn.query_progress.return_value = 25.0
+
+    state = {"rows": 10, "batches": 4}
+    stop = _start_progress_heartbeat("rate-label", interval_s=100.0, state=state, progress_conn=conn)
+
+    waits: list[float] = []
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock["t"] += timeout
+        return len(waits) >= 2
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "rate-label" in r.message]
+    assert msgs
+    # 25% in 100s -> 300s -> 5m remaining
+    assert "10 rows" in msgs[0]
+    assert "(~25% scanned, est. 5m remaining)" in msgs[0]
+
+
+def test_progress_heartbeat_suffix_in_pre_progress_line(caplog, monkeypatch):
+    """progress_conn suffix lands in the pre-execution variant — the original blind spot."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+    conn = MagicMock()
+    conn.query_progress.return_value = 10.0
+
+    state = {"rows": 0, "batches": 0}
+    stop = _start_progress_heartbeat(
+        "pre-label",
+        interval_s=100.0,
+        state=state,
+        pre_progress_label="DuckDB pre-execution",
+        progress_conn=conn,
+    )
+
+    waits: list[float] = []
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock["t"] += timeout
+        return len(waits) >= 2
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "pre-label" in r.message]
+    assert msgs
+    assert "DuckDB pre-execution" in msgs[0]
+    # 10% in 100s -> 900s -> 15m remaining
+    assert "(~10% scanned, est. 15m remaining)" in msgs[0]
+
+
+def test_progress_heartbeat_suffix_in_still_working_line(caplog, monkeypatch):
+    """progress_conn suffix lands in the no-state variant."""
+    captured, clock = _install_fake_heartbeat_runtime(monkeypatch)
+    conn = MagicMock()
+    conn.query_progress.return_value = 50.0
+
+    stop = _start_progress_heartbeat("plain-progress", interval_s=100.0, progress_conn=conn)
+
+    waits: list[float] = []
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock["t"] += timeout
+        return len(waits) >= 2
+
+    monkeypatch.setattr(stop, "wait", fake_wait)
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        captured["target"]()
+
+    msgs = [r.message for r in caplog.records if "plain-progress" in r.message]
+    assert msgs
+    assert "still working" in msgs[0]
+    assert "(~50% scanned" in msgs[0]
+
+
+def test_seed_passes_source_connection_to_heartbeat():
+    """The seed path must wire src_table.catalog.connection into the heartbeat;
+    a regression to progress_conn=None passes every other test silently."""
+    src_table = MagicMock()
+    state_mgr = MagicMock()
+    dest_pool = MagicMock()
+    cfg = _make_cfg([("dest-1", "acme")])
+    cfg.routing.field = "company"
+    cfg.routing.key_columns = []
+    cfg.routing.seed_mode = "scan"
+
+    state_mgr.load_cursors.return_value = {}
+
+    rows = pa.table({"company": ["acme"], "value": [1]})
+    mock_scan = MagicMock()
+    mock_scan.to_arrow_batch_reader.return_value = iter(rows.to_batches())
+    src_table.scan.return_value = mock_scan
+
+    mock_table = MagicMock()
+    mock_table.scan.return_value.count.return_value = 0
+    dest_pool.get.return_value = (MagicMock(), mock_table)
+
+    with patch("viaduck.main.source.current_snapshot_id", return_value=42):
+        with patch("viaduck.main._start_progress_heartbeat") as mock_hb:
+            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+
+    seed_calls = [c for c in mock_hb.call_args_list if "Seed scan" in c.args[0]]
+    assert seed_calls, f"No seed-scan heartbeat started; calls: {mock_hb.call_args_list}"
+    assert seed_calls[0].kwargs["progress_conn"] is src_table.catalog.connection

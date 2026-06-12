@@ -75,6 +75,7 @@ def _start_progress_heartbeat(
     early_interval_s: float | None = None,
     early_duration_s: float = 60.0,
     pre_progress_label: str = "no progress yet",
+    progress_conn=None,
 ) -> threading.Event:
     """Start a background heartbeat for a long-running blocking operation.
 
@@ -97,6 +98,20 @@ def _start_progress_heartbeat(
     seconds, then the interval falls back to `interval_s`. This gives
     operators faster confirmation the pod is alive during cold-start without
     spamming the log forever.
+
+    `progress_conn` (a duckdb connection, e.g. `table.catalog.connection`)
+    enables percentage reporting: each tick polls `query_progress()` —
+    a lightweight cross-thread read of DuckDB's executor state — and, when
+    a query is live (>= 0), appends "~N% scanned, est. M remaining" to the
+    line (ETA extrapolated as elapsed * (100-pct)/pct). Requires
+    `enable_progress_bar=true` on the connection (set in
+    source._CONNECTION_DEFAULTS) or the poll returns -1 forever. The
+    percentage belongs to whatever query is currently running on that
+    connection, so this is only meaningful while the caller holds the
+    connection's single query slot (true for the seed scan: DuckDB
+    invalidates an open streaming result if another query starts on the
+    same connection, so one-scan-per-connection is already structurally
+    enforced).
 
     The rate format only kicks in once `state["rows"] > 0`. While the
     counter is still at 0 — i.e. no batch has arrived yet — the tick
@@ -121,23 +136,25 @@ def _start_progress_heartbeat(
             if stop.wait(timeout=wait_s):
                 return
             elapsed = time.monotonic() - start_t
+            scanned = _scan_progress_suffix(progress_conn, elapsed)
             if state and "rows" in state:
                 rows = state["rows"]
                 if rows > 0:
                     batches = state.get("batches", 0)
                     rate = rows / elapsed if elapsed > 0 else 0
                     log.info(
-                        "%s: %d rows in %d batches, %.0fs elapsed (%.0f rows/s)",
+                        "%s: %d rows in %d batches, %.0fs elapsed (%.0f rows/s)%s",
                         label,
                         rows,
                         batches,
                         elapsed,
                         rate,
+                        scanned,
                     )
                 else:
-                    log.info("%s: %s, %.0fs elapsed", label, pre_progress_label, elapsed)
+                    log.info("%s: %s, %.0fs elapsed%s", label, pre_progress_label, elapsed, scanned)
             else:
-                log.info("%s: still working (%.0fs elapsed)", label, elapsed)
+                log.info("%s: still working (%.0fs elapsed)%s", label, elapsed, scanned)
             health.record_poll()
 
     threading.Thread(target=_tick, daemon=True).start()
@@ -160,6 +177,50 @@ def _interruptible_sleep(total_seconds: float, should_stop, tick: float = 1.0) -
         chunk = min(tick, total_seconds - elapsed)
         time.sleep(chunk)
         elapsed += chunk
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.0f}m"
+    return f"{int(minutes // 60)}h {int(minutes % 60)}m"
+
+
+_scan_progress_poll_warned = False
+
+
+def _scan_progress_suffix(progress_conn, elapsed: float) -> str:
+    """Format DuckDB query progress as a log suffix, or '' when unavailable.
+
+    query_progress() returns -1 when no query is running (or progress
+    tracking is disabled). Readings below 1% are suppressed: early in a
+    huge scan DuckDB reports fractional percentages, and extrapolating an
+    ETA from "0.3% in 30s" yields a wildly noisy estimate attached to a
+    display of "~0%". Failures are swallowed: progress is decoration,
+    never worth killing the heartbeat over — but the first one is warned
+    so API drift (e.g. a duckdb upgrade renaming query_progress) doesn't
+    silently erase progress reporting forever. Polling continues after a
+    failure since closed-connection races during scan teardown are
+    transient.
+    """
+    global _scan_progress_poll_warned
+    if progress_conn is None:
+        return ""
+    try:
+        pct = float(progress_conn.query_progress())
+    except Exception:
+        if not _scan_progress_poll_warned:
+            _scan_progress_poll_warned = True
+            log.warning("Scan progress polling failed; omitting progress suffix", exc_info=True)
+        return ""
+    if pct < 1:
+        return ""
+    if pct >= 100:
+        return " (~100% scanned)"
+    eta = elapsed * (100.0 - pct) / pct
+    return f" (~{pct:.0f}% scanned, est. {_fmt_duration(eta)} remaining)"
 
 
 def _fmt_bytes(n: float) -> str:
@@ -440,12 +501,16 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
         # the often-slow DuckDB pre-execution phase (snapshot resolution,
         # zone-map evaluation) before the first batch arrives. Backs off to
         # 30s once streaming is under way.
+        # Seeds run one at a time on this thread, so the source connection's
+        # single query slot belongs to this scan — query_progress() can't
+        # report someone else's query (see _start_progress_heartbeat).
         stop_heartbeat = _start_progress_heartbeat(
             f"Seed scan for destination {dest_id}",
             state=progress,
             early_interval_s=5.0,
             early_duration_s=60.0,
             pre_progress_label="DuckDB pre-execution",
+            progress_conn=src_table.catalog.connection,
         )
         write_secs_total = 0.0
         try:

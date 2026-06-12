@@ -36,9 +36,15 @@ META_COLUMNS = ("change_type", "snapshot_id", "rowid")
 # mid-read with "maximum total string size ... exceeds this"). Large buffers
 # use 64-bit offsets (pyarrow large_string), which Arrow compute and the
 # postgres writer handle transparently.
+# enable_progress_bar(+print=false): DuckDB only computes query progress
+# when the progress bar is enabled; print-off keeps it out of the terminal.
+# This is what lets `conn.query_progress()` (polled cross-thread by the
+# seed-scan heartbeat) return a real percentage instead of -1.
 _CONNECTION_DEFAULTS = {
     "pg_connection_limit": "64",
     "arrow_large_buffer_size": "true",
+    "enable_progress_bar": "true",
+    "enable_progress_bar_print": "false",
 }
 
 
