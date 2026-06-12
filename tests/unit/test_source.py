@@ -90,7 +90,7 @@ def test_connect():
                 "src",
                 "postgres:host=localhost dbname=test",
                 data_path="/tmp/data",
-                properties={"pg_connection_limit": "64"},
+                properties={"pg_connection_limit": "64", "arrow_large_buffer_size": "true"},
             )
 
 
