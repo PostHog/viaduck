@@ -162,6 +162,14 @@ def _interruptible_sleep(total_seconds: float, should_stop, tick: float = 1.0) -
         elapsed += chunk
 
 
+def _fmt_bytes(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024:
+            return f"{n:.2f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.2f} PiB"
+
+
 def _group_by_cursor(
     cursors: dict[str, int],
     all_dest_ids: list[str],
@@ -401,11 +409,11 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
         data_bytes = pc.sum(files.column("data_file_size_bytes")).as_py() or 0
         delete_bytes = pc.sum(files.column("delete_file_size_bytes")).as_py() or 0
         log.info(
-            "Source snapshot %d: %d data files (%.2f GiB), %.2f MiB of delete data",
+            "Source snapshot %d: %d data files (%s), %s of delete data",
             current_id,
             file_count,
-            data_bytes / (1024**3),
-            delete_bytes / (1024**2),
+            _fmt_bytes(data_bytes),
+            _fmt_bytes(delete_bytes),
         )
     except Exception:
         log.exception("Could not read snapshot file inventory; continuing without it")
