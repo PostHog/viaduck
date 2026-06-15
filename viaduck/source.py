@@ -87,8 +87,10 @@ def earliest_snapshot_id(table: Table) -> int | None:
     safe on large catalogs where table.snapshots() would OOM.
     """
     catalog_name = table._catalog.name
-    meta_schema = f"__ducklake_metadata_{catalog_name}"
-    row = table._catalog.connection.execute(f"SELECT MIN(snapshot_id) FROM {meta_schema}.ducklake_snapshot").fetchone()
+    meta_schema = f"__ducklake_metadata_{catalog_name}".replace('"', '""')
+    row = table._catalog.connection.execute(
+        f'SELECT MIN(snapshot_id) FROM "{meta_schema}".ducklake_snapshot'
+    ).fetchone()
     if row is None or row[0] is None:
         return None
     return int(row[0])

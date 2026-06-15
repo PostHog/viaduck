@@ -43,7 +43,8 @@ def test_earliest_snapshot_id_returns_min():
     assert result == 5_000_000
     sql = table._catalog.connection.execute.call_args[0][0]
     assert "MIN(snapshot_id)" in sql
-    assert "__ducklake_metadata_megaduck-mw-prod-us" in sql
+    # Schema name must be double-quoted so hyphens in catalog names are valid identifiers
+    assert '"__ducklake_metadata_megaduck-mw-prod-us"' in sql
 
 
 def test_earliest_snapshot_id_returns_none_on_empty_catalog():
