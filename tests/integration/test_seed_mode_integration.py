@@ -31,7 +31,7 @@ import os
 import pyarrow as pa
 import pytest
 from pyducklake import Catalog, Schema
-from pyducklake.types import IntegerType, NestedField, StringType
+from pyducklake.types import IntegerType, NestedField
 
 from viaduck import metrics
 from viaduck.config import StateConfig
@@ -255,7 +255,7 @@ def test_earliest_to_latest_existing_cursor_preserved(src, sm):
     sm.advance_cursor("d1", snapshot_id=snap1)
 
     # Config changes to latest
-    snap2 = _insert(src, [(2, 2)])
+    _insert(src, [(2, 2)])
     latest_initial = _initial_snapshot_id("latest", src)
     sm.initialize_destinations(["d1"], initial_snapshot_id=latest_initial)
 
@@ -286,10 +286,7 @@ def test_stale_zero_cursor_not_reset_by_latest(src, sm):
 
     cursor = sm.load_cursors(["d1"])["d1"].last_snapshot_id
     # Current behavior: cursor stays at 0 (DO NOTHING)
-    assert cursor == 0, (
-        "Known limitation: stale cursor-0 is not reset to latest. "
-        "See FOLLOWUP.md for the planned fix."
-    )
+    assert cursor == 0, "Known limitation: stale cursor-0 is not reset to latest. See FOLLOWUP.md for the planned fix."
 
 
 def test_stale_zero_cursor_not_reset_by_earliest(src, sm):
@@ -308,10 +305,7 @@ def test_stale_zero_cursor_not_reset_by_earliest(src, sm):
     sm.initialize_destinations(["d1"], initial_snapshot_id=earliest_initial)
 
     cursor = sm.load_cursors(["d1"])["d1"].last_snapshot_id
-    assert cursor == 0, (
-        "Known limitation: stale cursor-0 not reset by earliest. "
-        "See FOLLOWUP.md for the planned fix."
-    )
+    assert cursor == 0, "Known limitation: stale cursor-0 not reset by earliest. See FOLLOWUP.md for the planned fix."
 
 
 # ---------------------------------------------------------------------------

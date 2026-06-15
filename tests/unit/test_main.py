@@ -18,6 +18,7 @@ from viaduck.main import (
     _derive_dest_status,
     _fmt_duration,
     _group_by_cursor,
+    _initial_snapshot_id,
     _poll_cycle,
     _resolve_preimages,
     _scan_progress_suffix,
@@ -2448,9 +2449,6 @@ def test_seed_passes_source_connection_to_heartbeat():
 # ---------------------------------------------------------------------------
 # _initial_snapshot_id: seed_mode earliest / latest / scan
 # ---------------------------------------------------------------------------
-
-
-from viaduck.main import _initial_snapshot_id
 
 
 def test_initial_snapshot_id_latest_returns_current_head():
