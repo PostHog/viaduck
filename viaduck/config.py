@@ -103,7 +103,7 @@ class SourceConfig:
 class RoutingConfig:
     field: str
     key_columns: list[str] = field(default_factory=list)
-    seed_mode: str = "scan"  # "scan" or "cdc_replay"
+    seed_mode: str = "scan"  # "scan", "earliest", or "latest"
     # REPLACE-semantics seeding: a destination at cursor 0 with existing
     # rows (only legitimate cause under single-master: a crashed prior
     # seed) is truncated before the seed streams — matching the spec's
@@ -113,8 +113,8 @@ class RoutingConfig:
     seed_truncate: bool = True
 
     def __post_init__(self):
-        if self.seed_mode not in ("scan", "cdc_replay"):
-            raise ConfigError(f"routing.seed_mode must be 'scan' or 'cdc_replay', got {self.seed_mode!r}")
+        if self.seed_mode not in ("scan", "earliest", "latest"):
+            raise ConfigError(f"routing.seed_mode must be 'scan', 'earliest', or 'latest', got {self.seed_mode!r}")
 
 
 @dataclass(frozen=True)

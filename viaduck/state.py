@@ -171,8 +171,12 @@ class StateManager:
 
         return self._run(_op)
 
-    def initialize_destinations(self, destination_ids: list[str]) -> None:
-        """Ensure all destination IDs have a state row. Creates rows with snapshot_id=0."""
+    def initialize_destinations(self, destination_ids: list[str], initial_snapshot_id: int = 0) -> None:
+        """Ensure all destination IDs have a state row.
+
+        Creates rows with last_snapshot_id=initial_snapshot_id for new destinations.
+        Existing rows are left unchanged (ON CONFLICT DO NOTHING).
+        """
         if not destination_ids:
             return
         now = datetime.now(UTC)
@@ -182,10 +186,10 @@ class StateManager:
                 f"""
                 INSERT INTO {self._qualified}
                     (destination_id, instance_id, last_snapshot_id, rows_replicated, updated_at)
-                SELECT unnest(%s::text[]), %s, 0, 0, %s
+                SELECT unnest(%s::text[]), %s, %s, 0, %s
                 ON CONFLICT (destination_id, instance_id) DO NOTHING
                 """,
-                (destination_ids, self._instance_id, now),
+                (destination_ids, self._instance_id, initial_snapshot_id, now),
             )
             return cur.rowcount
 
