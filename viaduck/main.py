@@ -801,69 +801,89 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                 routing_values = [cfg.destination_by_id(d).routing_value for d in dest_ids]
                 filter_expr = router.build_filter_expr(routing_values)
 
-                # Read CDC — full changes or insertions only.
-                # Wrap in a heartbeat so /healthz and /readyz stay green
-                # when a large snapshot range takes longer than max_poll_age_s.
-                snap_range = f"{start_snap}→{current_id}"
-                _hb = _start_progress_heartbeat(
-                    label=f"CDC read {snap_range}",
-                    pre_progress_label=f"reading snapshots {snap_range}",
-                )
-                try:
-                    if full_cdc:
-                        raw_data = source.read_cdc_changes(
-                            src_table, after_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
-                        )
-                    else:
-                        raw_data = source.read_cdc(
-                            src_table, after_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
-                        )
-                finally:
-                    _hb.set()
-
-                try:
-                    metrics.cdc_batch_rows.observe(raw_data.num_rows)
-                except Exception:
-                    log.warning("Failed to record CDC batch size metric")
-
-                cycle_rows_read += raw_data.num_rows
-
-                if raw_data.num_rows == 0:
-                    for did in dest_ids:
-                        delivery.advance_position(did, current_id, epoch=epochs[did])
-                    continue
-
-                # Phase 1: Resolve preimages (full CDC only, before routing)
-                if full_cdc:
-                    try:
-                        raw_data = _resolve_preimages(raw_data, cfg.routing.field, key_columns)
-                    except RoutingError:
-                        log.exception("Preimage resolution failed — key column may be missing from CDC data")
-                        metrics.errors_total.labels(type="routing", destination="").inc()
+                # Read CDC in snapshot chunks to bound memory use.
+                # Each chunk is read, routed, and buffered before the next is fetched.
+                chunk_size = cfg.poll.cdc_chunk_snapshots
+                chunk_start = start_snap
+                routing_error = False
+                while chunk_start < current_id:
+                    if delivery.should_pause_reads():
+                        log.warning("Buffer watermark exceeded mid-chunk; pausing CDC reads")
                         break
+                    chunk_end = min(chunk_start + chunk_size, current_id)
+                    snap_range = f"{chunk_start}→{chunk_end}"
+                    state = {"rows": 0}
+                    _hb = _start_progress_heartbeat(
+                        label=f"CDC read {snap_range}",
+                        pre_progress_label=f"reading snapshots {snap_range}",
+                        state=state,
+                    )
+                    try:
+                        if full_cdc:
+                            raw_data = source.read_cdc_changes(
+                                src_table, after_snapshot=chunk_start, end_snapshot=chunk_end, filter_expr=filter_expr
+                            )
+                        else:
+                            raw_data = source.read_cdc(
+                                src_table, after_snapshot=chunk_start, end_snapshot=chunk_end, filter_expr=filter_expr
+                            )
 
-                # Route in a single pass (split + count unrouted)
-                try:
-                    routed, unrouted = router.split_and_count(raw_data, routing_values)
-                except RoutingError:
-                    log.exception("Routing failed — routing field may be missing from source schema")
-                    metrics.errors_total.labels(type="routing", destination="").inc()
+                        state["rows"] = raw_data.num_rows
+
+                        try:
+                            metrics.cdc_batch_rows.observe(raw_data.num_rows)
+                        except Exception:
+                            log.warning("Failed to record CDC batch size metric")
+
+                        cycle_rows_read += raw_data.num_rows
+
+                        if raw_data.num_rows == 0:
+                            for did in dest_ids:
+                                delivery.advance_position(did, chunk_end, epoch=epochs[did])
+                            chunk_start = chunk_end
+                            continue
+
+                        # Phase 1: Resolve preimages (full CDC only, before routing)
+                        if full_cdc:
+                            try:
+                                raw_data = _resolve_preimages(raw_data, cfg.routing.field, key_columns)
+                            except RoutingError:
+                                log.exception("Preimage resolution failed — key column may be missing from CDC data")
+                                metrics.errors_total.labels(type="routing", destination="").inc()
+                                routing_error = True
+                                break
+
+                        # Route in a single pass (split + count unrouted)
+                        try:
+                            routed, unrouted = router.split_and_count(raw_data, routing_values)
+                        except RoutingError:
+                            log.exception("Routing failed — routing field may be missing from source schema")
+                            metrics.errors_total.labels(type="routing", destination="").inc()
+                            routing_error = True
+                            break
+
+                        if unrouted > 0:
+                            metrics.unrouted_rows_total.inc(unrouted)
+
+                        # Buffer routed batches (BufferRead); destinations with no
+                        # routed rows just advance their read position in memory.
+                        routed_dest_ids = set()
+                        for routing_val, batch in routed.items():
+                            dest_id = rv_to_dest[routing_val]
+                            routed_dest_ids.add(dest_id)
+                            if batch.num_rows > 0:
+                                delivery.buffer(dest_id, batch, chunk_end, epoch=epochs[dest_id])
+                        for did in dest_ids:
+                            if did not in routed_dest_ids:
+                                delivery.advance_position(did, chunk_end, epoch=epochs[did])
+
+                        chunk_start = chunk_end
+
+                    finally:
+                        _hb.set()
+
+                if routing_error:
                     break
-
-                if unrouted > 0:
-                    metrics.unrouted_rows_total.inc(unrouted)
-
-                # Buffer routed batches (BufferRead); destinations with no
-                # routed rows just advance their read position in memory.
-                routed_dest_ids = set()
-                for routing_val, batch in routed.items():
-                    dest_id = rv_to_dest[routing_val]
-                    routed_dest_ids.add(dest_id)
-                    if batch.num_rows > 0:
-                        delivery.buffer(dest_id, batch, current_id, epoch=epochs[dest_id])
-                for did in dest_ids:
-                    if did not in routed_dest_ids:
-                        delivery.advance_position(did, current_id, epoch=epochs[did])
 
     # Evaluate flush triggers (FlushStart) — also persists position-only
     # advances for idle destinations on the flush cadence.
