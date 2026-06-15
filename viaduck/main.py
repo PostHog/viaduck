@@ -812,6 +812,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                         break
                     chunk_end = min(chunk_start + chunk_size, current_id)
                     snap_range = f"{chunk_start}→{chunk_end}"
+                    chunk_t0 = time.monotonic()
                     state = {"rows": 0}
                     _hb = _start_progress_heartbeat(
                         label=f"CDC read {snap_range}",
@@ -828,6 +829,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                                 src_table, after_snapshot=chunk_start, end_snapshot=chunk_end, filter_expr=filter_expr
                             )
 
+                        read_elapsed = time.monotonic() - chunk_t0
                         state["rows"] = raw_data.num_rows
 
                         try:
@@ -840,6 +842,12 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                         if raw_data.num_rows == 0:
                             for did in dest_ids:
                                 delivery.advance_position(did, chunk_end, epoch=epochs[did])
+                            log.info(
+                                "CDC chunk %s: 0 rows in %.1fs, %d snapshots remaining",
+                                snap_range,
+                                read_elapsed,
+                                current_id - chunk_end,
+                            )
                             chunk_start = chunk_end
                             continue
 
@@ -877,6 +885,14 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                             if did not in routed_dest_ids:
                                 delivery.advance_position(did, chunk_end, epoch=epochs[did])
 
+                        log.info(
+                            "CDC chunk %s: %d rows in %.1fs (%.0f rows/s), %d snapshots remaining",
+                            snap_range,
+                            raw_data.num_rows,
+                            read_elapsed,
+                            raw_data.num_rows / read_elapsed if read_elapsed > 0 else 0,
+                            current_id - chunk_end,
+                        )
                         chunk_start = chunk_end
 
                     finally:
