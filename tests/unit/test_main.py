@@ -254,7 +254,7 @@ def test_poll_cycle_routes_and_buffers():
 
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
     delivery.advance_position.assert_not_called()
-    delivery.maybe_flush.assert_called_once()
+    assert delivery.maybe_flush.call_count == 2  # once per chunk + once at end of cycle
 
 
 def test_poll_cycle_empty_changeset_advances_positions():
@@ -284,6 +284,7 @@ def test_poll_cycle_empty_changeset_advances_positions():
     delivery.advance_position.assert_any_call("dest-1", 10, epoch=0)
     delivery.advance_position.assert_any_call("dest-2", 10, epoch=0)
     delivery.buffer.assert_not_called()
+    assert delivery.maybe_flush.call_count == 2  # once per chunk + once at end of cycle
 
 
 def test_poll_cycle_routing_error_breaks_gracefully():
@@ -312,7 +313,7 @@ def test_poll_cycle_routing_error_breaks_gracefully():
         )
 
     delivery.buffer.assert_not_called()
-    delivery.maybe_flush.assert_called_once()
+    assert delivery.maybe_flush.call_count == 1  # routing error skips per-chunk flush
 
 
 def test_poll_cycle_chunks_large_range():
@@ -355,6 +356,7 @@ def test_poll_cycle_chunks_large_range():
     assert buffer_calls[0] == call("dest-1", arrow_data, 5, epoch=0)
     assert buffer_calls[1] == call("dest-1", arrow_data, 10, epoch=0)
     delivery.advance_position.assert_not_called()
+    assert delivery.maybe_flush.call_count == 3  # once per chunk (×2) + once at end of cycle
 
 
 def test_poll_cycle_chunk_end_not_current_id():
@@ -362,7 +364,7 @@ def test_poll_cycle_chunk_end_not_current_id():
     delivery = _make_delivery({"dest-1": 0, "dest-2": 0})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "a"), ("dest-2", "b")])
-    cfg.poll.cdc_chunk_snapshots = 3  # first chunk: 0→3, then 3→7
+    cfg.poll.cdc_chunk_snapshots = 3  # chunks: 0→3, 3→6, 6→7
 
     row_a = pa.table({"company": ["a"]})
     empty = pa.table({"company": pa.array([], type=pa.string())})
@@ -394,9 +396,43 @@ def test_poll_cycle_chunk_end_not_current_id():
     # First chunk (0→3): dest-1 buffered at 3, dest-2 advanced to 3
     delivery.buffer.assert_any_call("dest-1", row_a, 3, epoch=0)
     delivery.advance_position.assert_any_call("dest-2", 3, epoch=0)
-    # Second chunk (3→7): empty, both advanced to 7
+    # Chunks 3→6 and 6→7: empty, both advanced through to 7
     delivery.advance_position.assert_any_call("dest-1", 7, epoch=0)
     delivery.advance_position.assert_any_call("dest-2", 7, epoch=0)
+    assert delivery.maybe_flush.call_count == 4  # once per chunk (×3) + once at end of cycle
+
+
+def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
+    """Multi-chunk catch-up where every chunk is empty still flushes and advances per chunk."""
+    delivery = _make_delivery({"dest-1": 0})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+    cfg.poll.cdc_chunk_snapshots = 5  # two chunks: 0→5, 5→10
+
+    empty = pa.table({"company": pa.array([], type=pa.string())})
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.read_cdc", return_value=empty),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
+        )
+
+    # cursor advanced to each chunk_end incrementally, not directly to 10
+    assert delivery.advance_position.call_count == 2
+    delivery.advance_position.assert_any_call("dest-1", 5, epoch=0)
+    delivery.advance_position.assert_any_call("dest-1", 10, epoch=0)
+    delivery.buffer.assert_not_called()
+    assert delivery.maybe_flush.call_count == 3  # once per chunk (×2) + once at end of cycle
 
 
 def test_poll_cycle_advances_no_data_destinations():
@@ -426,6 +462,7 @@ def test_poll_cycle_advances_no_data_destinations():
 
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
     delivery.advance_position.assert_called_once_with("dest-2", 10, epoch=0)
+    assert delivery.maybe_flush.call_count == 2  # once per chunk + once at end of cycle
 
 
 def test_poll_cycle_pauses_reads_at_watermark():
@@ -451,6 +488,41 @@ def test_poll_cycle_pauses_reads_at_watermark():
 
     delivery.read_plan.assert_not_called()
     delivery.maybe_flush.assert_called_once()
+
+
+def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
+    """Watermark firing mid-loop only skips future chunks; completed chunks already flushed."""
+    delivery = _make_delivery({"dest-1": 0})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+    cfg.poll.cdc_chunk_snapshots = 5  # chunks: 0→5 (completes), 5→10 (paused by watermark)
+
+    empty = pa.table({"company": pa.array([], type=pa.string())})
+    router.build_filter_expr.return_value = None
+
+    # outer check: False; inner chunk-1 check: False; inner chunk-2 check: True (pause)
+    delivery.should_pause_reads.side_effect = [False, False, True]
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.read_cdc", return_value=empty),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
+        )
+
+    # chunk 0→5 completed: cursor advanced and flushed
+    delivery.advance_position.assert_called_once_with("dest-1", 5, epoch=0)
+    # chunk 5→10 was never read (watermark break)
+    assert delivery.maybe_flush.call_count == 2  # once after chunk 0→5 + once at end of cycle
 
 
 def test_poll_cycle_snapshot_at_zero():
