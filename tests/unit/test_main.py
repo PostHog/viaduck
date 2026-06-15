@@ -18,6 +18,7 @@ from viaduck.main import (
     _derive_dest_status,
     _fmt_duration,
     _group_by_cursor,
+    _initial_snapshot_id,
     _poll_cycle,
     _resolve_preimages,
     _scan_progress_suffix,
@@ -2443,3 +2444,41 @@ def test_seed_passes_source_connection_to_heartbeat():
     seed_calls = [c for c in mock_hb.call_args_list if "Seed scan" in c.args[0]]
     assert seed_calls, f"No seed-scan heartbeat started; calls: {mock_hb.call_args_list}"
     assert seed_calls[0].kwargs["progress_conn"] is src_table.catalog.connection
+
+
+# ---------------------------------------------------------------------------
+# _initial_snapshot_id: seed_mode earliest / latest / scan
+# ---------------------------------------------------------------------------
+
+
+def test_initial_snapshot_id_latest_returns_current_head():
+    """seed_mode=latest returns the current head snapshot_id."""
+    src_table = MagicMock()
+    with patch("viaduck.main.source.current_snapshot_id", return_value=9_999_999):
+        assert _initial_snapshot_id("latest", src_table) == 9_999_999
+
+
+def test_initial_snapshot_id_latest_falls_back_to_zero_on_empty_catalog():
+    """seed_mode=latest returns 0 when no snapshots exist."""
+    src_table = MagicMock()
+    with patch("viaduck.main.source.current_snapshot_id", return_value=None):
+        assert _initial_snapshot_id("latest", src_table) == 0
+
+
+def test_initial_snapshot_id_earliest_returns_min_minus_one():
+    """seed_mode=earliest returns MIN(snapshot_id) - 1 so CDC range includes the first snapshot."""
+    src_table = MagicMock()
+    with patch("viaduck.main.source.earliest_snapshot_id", return_value=5_000_000):
+        assert _initial_snapshot_id("earliest", src_table) == 4_999_999
+
+
+def test_initial_snapshot_id_earliest_falls_back_to_zero_on_empty_catalog():
+    """seed_mode=earliest returns 0 when no snapshots exist."""
+    src_table = MagicMock()
+    with patch("viaduck.main.source.earliest_snapshot_id", return_value=None):
+        assert _initial_snapshot_id("earliest", src_table) == 0
+
+
+def test_initial_snapshot_id_scan_returns_zero():
+    """scan mode always returns 0; _seed_new_destinations advances from there."""
+    assert _initial_snapshot_id("scan", MagicMock()) == 0

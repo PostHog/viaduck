@@ -631,6 +631,27 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
 # ---------------------------------------------------------------------------
 
 
+def _initial_snapshot_id(seed_mode: str, src_table) -> int:
+    """Return the snapshot_id to pass to initialize_destinations for new destinations.
+
+    Kafka-style semantics:
+      "scan"     — 0; _seed_new_destinations advances to head via full table scan
+      "earliest" — MIN(snapshot_id) - 1; CDC range starts at the first available snapshot
+      "latest"   — MAX(snapshot_id); only events arriving after startup are replicated
+    """
+    if seed_mode == "latest":
+        head = source.current_snapshot_id(src_table)
+        initial = head if head is not None else 0
+        log.info("seed_mode=latest: new destinations start at snapshot %d", initial)
+        return initial
+    if seed_mode == "earliest":
+        first = source.earliest_snapshot_id(src_table)
+        initial = (first - 1) if first is not None else 0
+        log.info("seed_mode=earliest: new destinations start at snapshot %d", initial)
+        return initial
+    return 0  # scan or default: _seed_new_destinations advances from 0
+
+
 def run(cfg: config.ViaduckConfig) -> None:
     """Main poll loop."""
     metrics.init(cfg.pipeline_name)
@@ -667,7 +688,8 @@ def run(cfg: config.ViaduckConfig) -> None:
     rv_to_dest: dict[str, str] = {d.routing_value: d.id for d in cfg.destinations}
 
     assigned_ids = cfg.assigned_destination_ids()
-    state_mgr.initialize_destinations(assigned_ids)
+    initial_snapshot_id = _initial_snapshot_id(cfg.routing.seed_mode, src_table)
+    state_mgr.initialize_destinations(assigned_ids, initial_snapshot_id=initial_snapshot_id)
 
     # Seed new destinations from source scan (avoids CDC replay from snapshot 0)
     if cfg.routing.seed_mode == "scan":

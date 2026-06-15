@@ -449,10 +449,14 @@ def test_seed_mode_default_is_scan():
     assert rc.seed_mode == "scan"
 
 
-def test_seed_mode_cdc_replay():
-    """seed_mode='cdc_replay' is valid."""
-    rc = RoutingConfig(field="company", seed_mode="cdc_replay")
-    assert rc.seed_mode == "cdc_replay"
+def test_seed_mode_earliest():
+    rc = RoutingConfig(field="company", seed_mode="earliest")
+    assert rc.seed_mode == "earliest"
+
+
+def test_seed_mode_latest():
+    rc = RoutingConfig(field="company", seed_mode="latest")
+    assert rc.seed_mode == "latest"
 
 
 def test_seed_mode_invalid():
@@ -461,12 +465,18 @@ def test_seed_mode_invalid():
         RoutingConfig(field="company", seed_mode="bogus")
 
 
+def test_seed_mode_cdc_replay_invalid():
+    """cdc_replay is no longer valid; use earliest or latest."""
+    with pytest.raises(ConfigError, match="seed_mode"):
+        RoutingConfig(field="company", seed_mode="cdc_replay")
+
+
 def test_load_with_seed_mode(tmp_path: Path):
-    """YAML with seed_mode parses correctly."""
+    """YAML with seed_mode=latest parses correctly."""
     p = tmp_path / "cfg.yaml"
-    p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  seed_mode: cdc_replay"))
+    p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  seed_mode: latest"))
     cfg = load(p)
-    assert cfg.routing.seed_mode == "cdc_replay"
+    assert cfg.routing.seed_mode == "latest"
 
 
 def test_state_postgres_uri_defaults_to_source(config_file, monkeypatch):

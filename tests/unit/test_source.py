@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pyarrow as pa
 
 from viaduck import metrics
-from viaduck.source import current_snapshot_id, read_cdc, read_cdc_changes, strip_meta
+from viaduck.source import current_snapshot_id, earliest_snapshot_id, read_cdc, read_cdc_changes, strip_meta
 
 
 def setup_module():
@@ -26,6 +26,30 @@ def test_current_snapshot_id_returns_none():
     table = MagicMock()
     table.current_snapshot.return_value = None
     assert current_snapshot_id(table) is None
+
+
+def _make_table_with_catalog(catalog_name: str, min_snapshot: int | None):
+    """Build a mock Table whose catalog connection returns min_snapshot from MIN query."""
+    table = MagicMock()
+    table._catalog.name = catalog_name
+    row = (min_snapshot,) if min_snapshot is not None else (None,)
+    table._catalog.connection.execute.return_value.fetchone.return_value = row
+    return table
+
+
+def test_earliest_snapshot_id_returns_min():
+    table = _make_table_with_catalog("megaduck-mw-prod-us", 5_000_000)
+    result = earliest_snapshot_id(table)
+    assert result == 5_000_000
+    sql = table._catalog.connection.execute.call_args[0][0]
+    assert "MIN(snapshot_id)" in sql
+    # Schema name must be double-quoted so hyphens in catalog names are valid identifiers
+    assert '"__ducklake_metadata_megaduck-mw-prod-us"' in sql
+
+
+def test_earliest_snapshot_id_returns_none_on_empty_catalog():
+    table = _make_table_with_catalog("lake", None)
+    assert earliest_snapshot_id(table) is None
 
 
 def test_read_cdc_calls_table_insertions():
