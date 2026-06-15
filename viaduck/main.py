@@ -848,6 +848,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                                 read_elapsed,
                                 current_id - chunk_end,
                             )
+                            delivery.maybe_flush()
                             chunk_start = chunk_end
                             continue
 
@@ -893,6 +894,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                             raw_data.num_rows / read_elapsed if read_elapsed > 0 else 0,
                             current_id - chunk_end,
                         )
+                        delivery.maybe_flush()
                         chunk_start = chunk_end
 
                     finally:
