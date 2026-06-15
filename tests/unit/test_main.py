@@ -907,6 +907,26 @@ def test_build_delete_filter_all_null_composite_key():
     assert "NULL" in sql.upper()
 
 
+def test_build_delete_filter_composite_key_partial_null_column():
+    """Composite key where only one column has nulls — exercises col_has_nulls short-circuit."""
+    rows = pa.table(
+        {
+            "a": pa.array([None, 2], type=pa.int64()),  # has nulls
+            "b": pa.array(["x", "y"], type=pa.string()),  # no nulls
+            "change_type": ["delete", "delete"],
+            "snapshot_id": [1, 2],
+            "rowid": [10, 20],
+        }
+    )
+    sql = _build_delete_filter(rows, ["a", "b"])
+    # First row: a IS NULL AND b = 'x'
+    # Second row: a = 2 AND b = 'y'
+    assert "NULL" in sql.upper()
+    assert "2" in sql
+    assert "x" in sql
+    assert "y" in sql
+
+
 def test_build_delete_filter_mixed_null_and_values():
     """Mix of NULL and non-NULL for single key column."""
     rows = pa.table(
