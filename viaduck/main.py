@@ -801,15 +801,25 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                 routing_values = [cfg.destination_by_id(d).routing_value for d in dest_ids]
                 filter_expr = router.build_filter_expr(routing_values)
 
-                # Read CDC — full changes or insertions only
-                if full_cdc:
-                    raw_data = source.read_cdc_changes(
-                        src_table, after_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
-                    )
-                else:
-                    raw_data = source.read_cdc(
-                        src_table, after_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
-                    )
+                # Read CDC — full changes or insertions only.
+                # Wrap in a heartbeat so /healthz and /readyz stay green
+                # when a large snapshot range takes longer than max_poll_age_s.
+                snap_range = f"{start_snap}→{current_id}"
+                _hb = _start_progress_heartbeat(
+                    label=f"CDC read {snap_range}",
+                    pre_progress_label=f"reading snapshots {snap_range}",
+                )
+                try:
+                    if full_cdc:
+                        raw_data = source.read_cdc_changes(
+                            src_table, after_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
+                        )
+                    else:
+                        raw_data = source.read_cdc(
+                            src_table, after_snapshot=start_snap, end_snapshot=current_id, filter_expr=filter_expr
+                        )
+                finally:
+                    _hb.set()
 
                 try:
                     metrics.cdc_batch_rows.observe(raw_data.num_rows)
