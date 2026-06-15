@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from viaduck import metrics
 from viaduck.apply import append_only, apply_full_cdc
@@ -318,11 +319,11 @@ class DeliveryManager:
         collapses inserts into upserts and emits tombstone deletes."""
         if not self._full_cdc or "change_type" not in batch.column_names:
             return (batch.num_rows, 0, 0)  # append-only: everything is an insert
-        counts = {"insert": 0, "update_postimage": 0, "delete": 0}
-        for entry in batch.column("change_type").value_counts().to_pylist():
-            if entry["values"] in counts:
-                counts[entry["values"]] += entry["counts"]
-        return (counts["insert"], counts["update_postimage"], counts["delete"])
+        ct = batch.column("change_type")
+        inserts = pc.sum(pc.cast(pc.equal(ct, "insert"), pa.int64())).as_py() or 0
+        updates = pc.sum(pc.cast(pc.equal(ct, "update_postimage"), pa.int64())).as_py() or 0
+        deletes = pc.sum(pc.cast(pc.equal(ct, "delete"), pa.int64())).as_py() or 0
+        return (inserts, updates, deletes)
 
     @staticmethod
     def _log_escaped_exception(future) -> None:

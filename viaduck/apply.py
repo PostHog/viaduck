@@ -214,9 +214,9 @@ def _build_delete_filter(delete_rows: pa.Table, key_columns: list[str]) -> str:
 
     if len(key_columns) == 1:
         col = key_columns[0]
-        values = delete_rows.column(col).to_pylist()
-        non_null = [v for v in values if v is not None]
-        has_null = None in values
+        col_arr = delete_rows.column(col)
+        has_null = col_arr.null_count > 0
+        non_null = col_arr.drop_null().to_pylist()
 
         if non_null and has_null:
             return Or(In(col, tuple(non_null)), IsNull(col)).to_sql()
@@ -226,13 +226,16 @@ def _build_delete_filter(delete_rows: pa.Table, key_columns: list[str]) -> str:
             return In(col, tuple(non_null)).to_sql()
 
     # Multi-column composite key: Or(And(col1=v1, col2=v2), And(col1=v3, col2=v4), ...)
+    # Precompute per-column null presence so the inner loop skips the None check
+    # for columns that have no nulls (the common case).
+    col_has_nulls = {col: delete_rows.column(col).null_count > 0 for col in key_columns}
     key_lists = {col: delete_rows.column(col).to_pylist() for col in key_columns}
     row_filters = []
     for i in range(delete_rows.num_rows):
         col_eqs = []
         for col in key_columns:
             val = key_lists[col][i]
-            if val is None:
+            if col_has_nulls[col] and val is None:
                 col_eqs.append(IsNull(col))
             else:
                 col_eqs.append(EqualTo(col, val))
