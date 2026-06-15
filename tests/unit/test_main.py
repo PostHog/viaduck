@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pyarrow as pa
 import pytest
@@ -146,6 +146,7 @@ def _make_cfg(dest_ids_and_rvs: list[tuple[str, str]]):
         d.routing_value = rv
         dests.append(d)
     cfg.destinations = dests
+    cfg.poll.cdc_chunk_snapshots = 100
 
     def by_id(dest_id):
         for d in dests:
@@ -312,6 +313,90 @@ def test_poll_cycle_routing_error_breaks_gracefully():
 
     delivery.buffer.assert_not_called()
     delivery.maybe_flush.assert_called_once()
+
+
+def test_poll_cycle_chunks_large_range():
+    """Range larger than cdc_chunk_snapshots is split into multiple reads."""
+    delivery = _make_delivery({"dest-1": 0})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+    cfg.poll.cdc_chunk_snapshots = 5  # positions 0→5, 5→10
+
+    arrow_data = pa.table({"company": ["quacksworth"], "value": [1]})
+    router.build_filter_expr.return_value = None
+    router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
+
+    read_calls = []
+
+    def fake_read_cdc(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+        read_calls.append((after_snapshot, end_snapshot))
+        return arrow_data
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.read_cdc", side_effect=fake_read_cdc),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            full_cdc=False,
+        )
+
+    assert read_calls == [(0, 5), (5, 10)], f"expected two chunk reads, got {read_calls}"
+    # cursor advances to chunk_end (5, then 10), not directly to 10 in one shot
+    buffer_calls = delivery.buffer.call_args_list
+    assert len(buffer_calls) == 2
+    assert buffer_calls[0] == call("dest-1", arrow_data, 5, epoch=0)
+    assert buffer_calls[1] == call("dest-1", arrow_data, 10, epoch=0)
+    delivery.advance_position.assert_not_called()
+
+
+def test_poll_cycle_chunk_end_not_current_id():
+    """buffer() and advance_position() receive chunk_end, not current_id."""
+    delivery = _make_delivery({"dest-1": 0, "dest-2": 0})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "a"), ("dest-2", "b")])
+    cfg.poll.cdc_chunk_snapshots = 3  # first chunk: 0→3, then 3→7
+
+    row_a = pa.table({"company": ["a"]})
+    empty = pa.table({"company": pa.array([], type=pa.string())})
+    call_count = [0]
+
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+        call_count[0] += 1
+        return row_a if call_count[0] == 1 else empty
+
+    router.build_filter_expr.return_value = None
+    router.split_and_count.return_value = ({"a": row_a}, 0)
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=7),
+        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1", "dest-2"],
+            {"a": "dest-1", "b": "dest-2"},
+            key_columns=[],
+            full_cdc=False,
+        )
+
+    # First chunk (0→3): dest-1 buffered at 3, dest-2 advanced to 3
+    delivery.buffer.assert_any_call("dest-1", row_a, 3, epoch=0)
+    delivery.advance_position.assert_any_call("dest-2", 3, epoch=0)
+    # Second chunk (3→7): empty, both advanced to 7
+    delivery.advance_position.assert_any_call("dest-1", 7, epoch=0)
+    delivery.advance_position.assert_any_call("dest-2", 7, epoch=0)
 
 
 def test_poll_cycle_advances_no_data_destinations():

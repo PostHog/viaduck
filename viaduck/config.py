@@ -138,6 +138,11 @@ class DestinationConfig:
 @dataclass(frozen=True)
 class PollConfig:
     interval_seconds: float = 5.0
+    cdc_chunk_snapshots: int = 100
+
+    def __post_init__(self):
+        if self.cdc_chunk_snapshots < 1:
+            raise ConfigError(f"poll.cdc_chunk_snapshots must be >= 1, got {self.cdc_chunk_snapshots}")
 
 
 @dataclass(frozen=True)
@@ -365,7 +370,10 @@ def load(path: str | Path) -> ViaduckConfig:
 
     # Optional sections
     poll_raw = raw.get("poll", {})
-    poll = PollConfig(interval_seconds=poll_raw.get("interval_seconds", 5.0))
+    poll = PollConfig(
+        interval_seconds=poll_raw.get("interval_seconds", 5.0),
+        cdc_chunk_snapshots=_validate_int(poll_raw.get("cdc_chunk_snapshots", 100), "poll.cdc_chunk_snapshots"),
+    )
 
     server_raw = raw.get("server", {})
     server = ServerConfig(port=server_raw.get("port", 8000))
