@@ -816,7 +816,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                     state = {"rows": 0}
                     _hb = _start_progress_heartbeat(
                         label=f"CDC read {snap_range}",
-                        pre_progress_label=f"reading snapshots {snap_range}",
+                        pre_progress_label="reading",
                         state=state,
                     )
                     try:
