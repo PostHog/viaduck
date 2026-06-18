@@ -656,6 +656,12 @@ def run(cfg: config.ViaduckConfig) -> None:
     """Main poll loop."""
     metrics.init(cfg.pipeline_name)
 
+    # One INFO line per leaf config field, before any external connections.
+    # Lets ops grep the deploy log for individual values without re-reading
+    # the rendered yaml or execing into the pod. Resolved secrets (postgres
+    # URIs, S3 creds) are never logged — only env var names.
+    cfg.log_summary(log)
+
     from viaduck import server
 
     http = server.start(cfg.server.port, web_enabled=cfg.web.enabled)
