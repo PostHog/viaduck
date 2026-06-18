@@ -53,6 +53,14 @@ def _validate_int(value: object, ctx: str) -> int:
     return value
 
 
+def _validate_bool(value: object, ctx: str) -> bool:
+    """Validate that a YAML node is a real bool — reject ints and strings so
+    `append_at_least_once: 1` or `: "true"` can't silently shadow the intent."""
+    if not isinstance(value, bool):
+        raise ConfigError(f"{ctx} must be a boolean (got {type(value).__name__})")
+    return value
+
+
 def _resolve_env_properties(props: dict[str, str]) -> dict[str, str]:
     """Resolve properties: keys ending in _env have their values read from env vars."""
     resolved = {}
@@ -126,6 +134,25 @@ class DestinationConfig:
     data_path: str
     table: str
     properties: dict[str, str] = field(default_factory=dict)
+    # Opt-in fast path for insert-only CDC: when true, _apply_changes uses
+    # tbl.append() instead of tbl.upsert() on batches that contain only
+    # change_type="insert" rows. Skips pyducklake's MERGE planning + the two
+    # bookkeeping count(*) scans.
+    #
+    # Semantic change to flag carefully: today the upsert path silently
+    # collapses upstream-CDC at-least-once duplicates because MERGE WHEN
+    # MATCHED reduces them to one destination row. The append path does NOT.
+    # Both upstream-redelivery duplicates AND apply-committed-but-cursor-
+    # not-advanced replay duplicates now physically materialize in the
+    # destination table — they don't stop at viaduck. Enable ONLY when every
+    # consumer of the destination table (queries, downstream pipelines,
+    # exports) can tolerate per-key duplicates, not just the immediate
+    # downstream consumer of viaduck.
+    #
+    # Mixed batches still fall through to upsert via a per-batch check
+    # (_is_pure_insert_batch), so a future CDC schema change that introduces
+    # update_postimage doesn't silently corrupt the destination.
+    append_at_least_once: bool = False
 
     @property
     def postgres_uri(self) -> str:
@@ -354,6 +381,7 @@ def load(path: str | Path) -> ViaduckConfig:
             _validate_string_dict(d.get("properties", {}), f"destinations[{i}].properties"),
             default_props,
         )
+        raw_aaolo = d.get("append_at_least_once", False)
         destinations.append(
             DestinationConfig(
                 id=_require_non_empty(str(d.get("id", "")), f"destinations[{i}].id"),
@@ -365,6 +393,7 @@ def load(path: str | Path) -> ViaduckConfig:
                 data_path=_require_non_empty(d.get("data_path", ""), f"destinations[{i}].data_path"),
                 table=d.get("table", source.table),
                 properties=dest_props,
+                append_at_least_once=_validate_bool(raw_aaolo, f"destinations[{i}].append_at_least_once"),
             )
         )
 

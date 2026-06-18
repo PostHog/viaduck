@@ -288,7 +288,7 @@ def test_full_cdc_insert_then_delete_same_key(source_catalog, source_table, dest
     # Apply: tombstone delete against a destination that never saw the
     # insert — idempotent no-op on the data, counted as one delete op.
     counts = _apply_changes(dest_catalog_a, dest_table_a, resolved, ["event_id"])
-    assert counts == {"deleted": 1, "upserted": 0, "upsert_matched": 0}
+    assert counts == {"deleted": 1, "upserted": 0, "upsert_matched": 0, "used_append": False}
 
     # Destination should be empty
     dest_scan = _read_all(dest_table_a)

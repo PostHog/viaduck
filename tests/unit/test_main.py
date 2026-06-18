@@ -1054,7 +1054,7 @@ def test_apply_changes_empty():
     catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
     batch = _cdc_table([])
     counts = _apply_changes(catalog, dest_table, batch, ["company"])
-    assert counts == {"deleted": 0, "upserted": 0, "upsert_matched": 0}
+    assert counts == {"deleted": 0, "upserted": 0, "upsert_matched": 0, "used_append": False}
     catalog.begin_transaction.assert_not_called()
 
 
@@ -1099,6 +1099,339 @@ def test_apply_changes_strips_metadata():
     assert "rowid" not in written_table.column_names
     assert "company" in written_table.column_names
     assert "value" in written_table.column_names
+
+
+# ---------------------------------------------------------------------------
+# _apply_changes: append_at_least_once fast path
+# ---------------------------------------------------------------------------
+
+
+def test_apply_changes_aalo_flag_off_uses_upsert_on_pure_insert_batch():
+    """Default (flag off): pure-insert batch still goes through tbl.upsert(),
+    proving the fast path is opt-in."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["value"])
+    txn_table.upsert.assert_called_once()
+    txn_table.append.assert_not_called()
+    assert counts["upserted"] == 2
+
+
+def test_apply_changes_aalo_flag_on_pure_insert_uses_append():
+    """Flag on + every row is an insert: tbl.append() instead of tbl.upsert().
+    Validates the (a) branch of the fast-path decision.
+
+    Also asserts append is called with no kwargs — a future refactor that
+    accidentally passes join_cols= to append() would silently work in tests
+    that only check assert_called_once(). Locking the call shape catches it."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
+    txn_table.append.assert_called_once()
+    assert txn_table.append.call_args.kwargs == {}, "append must NOT receive join_cols= or other kwargs"
+    assert len(txn_table.append.call_args.args) == 1, "append takes the Arrow table positionally; nothing else"
+    txn_table.upsert.assert_not_called()
+    txn_table.delete.assert_not_called()
+    # No "matched" concept on append — the counter source stays 0 so the
+    # dest_upsert_matched_total gauge in apply_full_cdc never gets incremented.
+    assert counts == {"deleted": 0, "upserted": 2, "upsert_matched": 0, "used_append": True}
+
+
+def test_apply_changes_aalo_flag_on_with_delete_falls_back_to_upsert():
+    """Flag on + any delete row: must NOT use append (append can't delete).
+    Verifies the per-batch safety net rejects mixed batches even when the
+    upsert candidates within them are pure inserts."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "delete", "snapshot_id": 1, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
+    txn_table.delete.assert_called_once()
+    txn_table.upsert.assert_called_once()
+    txn_table.append.assert_not_called()
+    assert counts["deleted"] == 1
+    assert counts["upserted"] == 1
+
+
+def test_apply_changes_aalo_flag_on_with_update_postimage_falls_back_to_upsert():
+    """Flag on + any update_postimage row: must NOT use append. Updates need
+    MERGE-WHEN-MATCHED to overwrite the existing row; append would create
+    a duplicate at the key. This is the future-proofing case — a schema
+    change that introduces an update_postimage path must NOT silently
+    corrupt the destination."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "update_postimage", "snapshot_id": 1, "rowid": 200},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
+    txn_table.upsert.assert_called_once()
+    txn_table.append.assert_not_called()
+    assert counts["upserted"] == 2
+
+
+def test_apply_changes_aalo_flag_on_within_batch_dupe_keys_still_deduped():
+    """Within-batch duplicate keys (same key, multiple snapshot IDs) must be
+    collapsed to last-write-wins even on the append path; otherwise the
+    flag promotes "duplicates only on retry" to "duplicates within a single
+    apply", which is a stronger break than the contract advertises."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 2, "rowid": 100},
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 3, "rowid": 100},
+        ]
+    )
+    counts = _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
+    txn_table.append.assert_called_once()
+    written_table = txn_table.append.call_args[0][0]
+    assert written_table.num_rows == 1  # 3 candidates collapsed to 1 winner
+    assert counts["upserted"] == 1
+
+
+def test_apply_changes_aalo_flag_on_empty_batch_is_noop():
+    """Empty batch + flag on: still a no-op (no transaction opened)."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table([])
+    counts = _apply_changes(catalog, dest_table, batch, ["company"], append_at_least_once=True)
+    assert counts == {"deleted": 0, "upserted": 0, "upsert_matched": 0, "used_append": False}
+    catalog.begin_transaction.assert_not_called()
+
+
+def test_apply_changes_aalo_flag_on_uses_transaction():
+    """Even on the fast path the write goes through begin_transaction —
+    a future caller that adds more work inside the txn must stay atomic."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+        ]
+    )
+    _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
+    catalog.begin_transaction.assert_called_once()
+
+
+def test_apply_changes_aalo_flag_on_append_raises_propagates():
+    """Symmetric to test_apply_changes_transaction_rollback_on_failure (upsert
+    path): if tbl.append() raises inside the transaction context, the
+    exception propagates so the context manager can roll back. Defends
+    against a future change that wraps the append in try/except (silently
+    swallowing failures and leaving the destination in inconsistent state
+    relative to the cursor)."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    txn_table.append.side_effect = Exception("append write error")
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+        ]
+    )
+    with pytest.raises(Exception, match="append write error"):
+        _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
+    txn_table.upsert.assert_not_called()
+
+
+def test_apply_changes_aalo_flag_on_strips_metadata():
+    """change_type, snapshot_id, rowid stripped from the append payload too."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+        ]
+    )
+    _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
+    written_table = txn_table.append.call_args[0][0]
+    assert "change_type" not in written_table.column_names
+    assert "snapshot_id" not in written_table.column_names
+    assert "rowid" not in written_table.column_names
+    assert "company" in written_table.column_names
+    assert "value" in written_table.column_names
+
+
+def test_is_pure_insert_batch_pure_insert_true():
+    """Helper: all inserts → True."""
+    from viaduck.apply import _is_pure_insert_batch
+
+    batch = _cdc_table(
+        [
+            {"company": "a", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 1},
+            {"company": "a", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 2},
+        ]
+    )
+    assert _is_pure_insert_batch(batch) is True
+
+
+def test_is_pure_insert_batch_with_delete_false():
+    from viaduck.apply import _is_pure_insert_batch
+
+    batch = _cdc_table(
+        [
+            {"company": "a", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 1},
+            {"company": "a", "value": 2, "change_type": "delete", "snapshot_id": 1, "rowid": 2},
+        ]
+    )
+    assert _is_pure_insert_batch(batch) is False
+
+
+def test_is_pure_insert_batch_with_update_postimage_false():
+    from viaduck.apply import _is_pure_insert_batch
+
+    batch = _cdc_table(
+        [
+            {"company": "a", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 1},
+            {"company": "a", "value": 2, "change_type": "update_postimage", "snapshot_id": 1, "rowid": 2},
+        ]
+    )
+    assert _is_pure_insert_batch(batch) is False
+
+
+def test_is_pure_insert_batch_empty_false():
+    """Empty batch is not "pure insert" — there's nothing to insert. Returning
+    True here would push an empty batch into the fast path, which is harmless
+    today but couples the helper's meaning to a downstream branch's tolerance
+    of empty input."""
+    from viaduck.apply import _is_pure_insert_batch
+
+    batch = _cdc_table([])
+    assert _is_pure_insert_batch(batch) is False
+
+
+def test_is_pure_insert_batch_with_null_change_type_false():
+    """Null change_type must force False — defends against a regression of the
+    null-aware gate. With pc.all's default skip_nulls=True, a batch like
+    [insert, NULL, insert] silently returns True; the null-typed row would
+    then be dropped by tbl.append's column projection without any operator-
+    visible signal. The gate must trip the safety net into upsert fallback."""
+    from viaduck.apply import _is_pure_insert_batch
+
+    batch = pa.table(
+        {
+            "company": ["a", "a", "a"],
+            "value": [1, 2, 3],
+            "change_type": pa.array(["insert", None, "insert"]),
+            "snapshot_id": [1, 1, 1],
+            "rowid": [1, 2, 3],
+        }
+    )
+    assert _is_pure_insert_batch(batch) is False
+
+
+def test_is_pure_insert_batch_all_null_change_type_false():
+    """A batch where every change_type is NULL is degenerate but must still
+    return False — refusing to fast-path is the safe choice (the upsert
+    path would also drop these rows, but at least it doesn't claim "every
+    row is an insert")."""
+    from viaduck.apply import _is_pure_insert_batch
+
+    batch = pa.table(
+        {
+            "company": ["a", "a"],
+            "value": [1, 2],
+            "change_type": pa.array([None, None], type=pa.string()),
+            "snapshot_id": [1, 1],
+            "rowid": [1, 2],
+        }
+    )
+    assert _is_pure_insert_batch(batch) is False
+
+
+def test_apply_changes_aalo_flag_on_with_null_change_type_falls_back_to_upsert():
+    """End-to-end: flag on + a null change_type row in the batch must NOT
+    take the append path. The null row gets dropped by upsert_mask too, but
+    the remaining inserts must land via tbl.upsert (idempotent on retry),
+    not tbl.append (duplicates on retry)."""
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    batch = pa.table(
+        {
+            "company": ["a", "a"],
+            "value": [1, 2],
+            "change_type": pa.array(["insert", None], type=pa.string()),
+            "snapshot_id": pa.array([1, 1], type=pa.int64()),
+            "rowid": pa.array([1, 2], type=pa.int64()),
+        }
+    )
+    _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
+    txn_table.upsert.assert_called_once()
+    txn_table.append.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# apply_full_cdc: metric increments on the fast path
+# ---------------------------------------------------------------------------
+
+
+def test_apply_full_cdc_fast_path_increments_fast_path_counter():
+    """When apply_full_cdc takes the fast path, the per-batch counter
+    increments and the upsert-matched counter does NOT (the latter is silent
+    by design). Asserts the documented metric implication directly so a
+    refactor that silently disables either signal fails loudly."""
+    from unittest.mock import patch
+
+    from viaduck.apply import apply_full_cdc
+
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    pool = MagicMock()
+    pool.get.return_value = (catalog, dest_table)
+
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
+        ]
+    )
+
+    with (
+        patch("viaduck.apply.metrics.dest_apply_fast_path_batches_total") as fast_path_counter,
+        patch("viaduck.apply.metrics.dest_upsert_matched_total") as matched_counter,
+        patch("viaduck.apply.metrics.dest_rows_upserted_total") as upserted_counter,
+    ):
+        ops = apply_full_cdc(pool, "team-2", batch, ["value"], append_at_least_once=True)
+
+    assert ops == 2
+    fast_path_counter.labels.assert_called_once_with(destination="team-2")
+    fast_path_counter.labels.return_value.inc.assert_called_once_with()
+    matched_counter.labels.assert_not_called()  # silent on fast path
+    upserted_counter.labels.assert_called_once_with(destination="team-2")
+    upserted_counter.labels.return_value.inc.assert_called_once_with(2)
+
+
+def test_apply_full_cdc_upsert_path_does_not_increment_fast_path_counter():
+    """Counterpoint: flag off (default) → fast-path counter stays silent
+    even on a pure-insert batch. Defends against an accidental
+    inc() in the upsert branch."""
+    from unittest.mock import patch
+
+    from viaduck.apply import apply_full_cdc
+
+    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+    pool = MagicMock()
+    pool.get.return_value = (catalog, dest_table)
+
+    batch = _cdc_table(
+        [
+            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
+        ]
+    )
+
+    with patch("viaduck.apply.metrics.dest_apply_fast_path_batches_total") as fast_path_counter:
+        apply_full_cdc(pool, "team-2", batch, ["value"])
+
+    fast_path_counter.labels.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

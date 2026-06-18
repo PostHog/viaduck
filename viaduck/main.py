@@ -709,6 +709,7 @@ def run(cfg: config.ViaduckConfig) -> None:
         key_columns,
         assigned_ids,
         on_flush_success=health.record_replication,
+        append_at_least_once_by_dest={d.id: d.append_at_least_once for d in cfg.destinations},
     )
 
     log.info(

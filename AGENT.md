@@ -126,6 +126,60 @@ The 3-phase CDC algorithm is eventually consistent under these assumptions:
 - Within `catalog.begin_transaction()`: chunked deletes first, then upsert
 - Crash mid-apply → transaction rolled back, no partial state
 
+**Phase 3 fast path: `append_at_least_once`** (per-destination opt-in)
+
+`DestinationConfig.append_at_least_once: bool` (default `false`). When `true`
+AND `_is_pure_insert_batch(batch)` (every row's `change_type == "insert"`),
+`_apply_changes` calls `tbl.append(rows)` instead of `tbl.upsert(rows, join_cols=key_columns)`.
+
+Motivation: `pyducklake.Table.upsert()` runs `self.scan().count()` twice (before
+and after the MERGE, just to populate `UpsertResult.rows_updated/rows_inserted`)
+and the MERGE itself joins source keys against the target table — both scale
+with destination size, and both are wasted work when the batch contains no
+updates. For an insert-only events workload with UUID keys (no min/max stat
+pruning helps), the join reads the whole target every flush to confirm zero
+matches. `tbl.append()` skips all of that — pure write.
+
+Contract change to flag carefully. The upsert path doesn't just "make apply
+idempotent on retry" — it also silently collapses **upstream at-least-once
+duplicates** (a CDC redelivery of the same source snapshot range arrives as
+the same input batch; MERGE WHEN MATCHED reduces it to one destination row).
+The fast path does neither. Both apply-retry duplicates AND upstream CDC
+duplicates now physically materialize in the destination table and propagate
+to every downstream consumer (queries, exports, lakehouse aggregations) —
+they no longer stop at viaduck. The end-to-end "at-least-once" contract
+remains identical from upstream → viaduck → downstream, but the previously-
+hidden deduplication side-effect of upsert is gone. Enable only when **every
+consumer of the destination table** can tolerate per-key duplicates, not
+just the immediate consumer of viaduck.
+
+Safety net: the check is per-batch, not config-only. A non-insert row anywhere
+in the batch (a delete, an `update_postimage`) falls back to the upsert path
+transparently, so a future schema/CDC change that introduces updates doesn't
+silently corrupt the destination. `_dedupe_upserts_last_write_wins` still
+runs on the fast path so within-batch duplicate keys collapse to one row
+(the "duplicates only on retry" contract isn't weakened by the fast path
+itself — only by retries).
+
+Metric implication: `viaduck_dest_upsert_matched_total` (`metrics.dest_upsert_matched_total`)
+stays silent on the fast path — `tbl.append()` has no "matched" concept, and
+at-least-once semantics make the question ill-defined. A destination running
+in fast-path mode that has zero scrapes for this counter is consistent with
+the configuration, not a bug.
+
+TLA+ spec coverage: `tla/Viaduck.tla` models destination contents as sets,
+not bags — physical row duplicates introduced by the fast path are not
+observable in the spec's safety invariants (`EventualConsistency` uses set
+equality; `NoPhantomWhenCurrent` only requires every dest row to trace back
+to a source row, which duplicates still do). The current spec therefore
+neither breaks under the fast path nor verifies it; coverage is incidental.
+A future spec update would need bag/multiset semantics to model the
+duplicate-count semantic difference and re-run TLC. Note that moving cursor
+advance into the same transaction as the apply (the cleanest way to restore
+exactly-once and re-tighten the spec) is not achievable in the current
+architecture: cursor lives in source-side Postgres, apply lives in the
+destination DuckLake catalog, and there is no two-phase commit between them.
+
 CDC batches are processed as unordered sets. This is sound because each
 flush covers the union of adjacent half-open snapshot ranges
 `(flushed, position]`, flushes apply in ascending range order, and

@@ -282,7 +282,36 @@ def _dedupe_upserts_last_write_wins(upsert_rows: pa.Table, key_columns: list[str
     return ordered.take(winners.column("__idx_max")).drop(["__idx"])
 
 
-def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str]) -> dict[str, int]:
+def _is_pure_insert_batch(batch: pa.Table) -> bool:
+    """True iff every row in the batch is a CDC insert. The check runs on
+    the raw batch (before delete/upsert split) so a single non-insert row
+    forces the upsert path.
+
+    Null change_type forces False. pc.all defaults to skip_nulls=True, which
+    would silently classify [insert, NULL, insert] as pure-insert — and the
+    null row would then be dropped by tbl.append's column filter without ever
+    being detected, identical to how the upsert path's masks (both Kleene-
+    aware) silently swallow it. The upsert path's drop is incidental and not
+    a contract we want the fast path to inherit; gate explicitly on
+    null_count==0 so a malformed batch trips the safety net into the
+    upsert fallback rather than landing rows blindly.
+    """
+    if batch.num_rows == 0:
+        return False
+    ct_col = batch.column("change_type")
+    if ct_col.null_count != 0:
+        return False
+    return bool(pc.all(pc.equal(ct_col, pa.scalar("insert"))).as_py())
+
+
+def _apply_changes(
+    catalog,
+    dest_table,
+    batch: pa.Table,
+    key_columns: list[str],
+    *,
+    append_at_least_once: bool = False,
+) -> dict[str, int | bool]:
     """Apply CDC changes to a destination table atomically.
 
     Deletes are applied first, then upserts, within a single catalog transaction.
@@ -294,11 +323,28 @@ def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str])
     same result. This enables safe at-least-once retry on crash recovery.
     Destinations must not be written to by other sources.
 
-    Returns dict of counts: {"deleted": N, "upserted": N, "upsert_matched": N}.
+    When ``append_at_least_once`` is true AND the batch contains only
+    change_type="insert" rows, the upsert is replaced with tbl.append() —
+    pyducklake's upsert otherwise does a MERGE-with-target-join plus two full
+    count(*) scans on every call, all of which are wasted work on an insert-only
+    batch. The tradeoff is that apply-committed-but-cursor-not-advanced retries
+    produce duplicate rows (no MERGE WHEN MATCHED to collapse them). End-to-end
+    semantics are unchanged because CDC delivery into viaduck is already
+    at-least-once; the destination contract widens but doesn't break. The
+    per-batch check means a non-insert row anywhere in the batch transparently
+    falls back to the upsert path, so a future schema change that introduces
+    updates doesn't silently corrupt the destination.
+
+    Returns dict of counts:
+    ``{"deleted": N, "upserted": N, "upsert_matched": N, "used_append": bool}``.
 
     - deleted: rows sent to delete (input count; delete API doesn't return affected count)
     - upserted: rows sent to upsert (input count)
-    - upsert_matched: rows that matched existing rows during upsert (from UpsertResult.rows_updated)
+    - upsert_matched: rows that matched existing rows during upsert (from UpsertResult.rows_updated).
+      Always 0 on the append fast path — pyducklake doesn't surface a "matched" concept on append,
+      and at-least-once semantics make the question ill-defined anyway.
+    - used_append: true iff the fast path actually took the tbl.append() branch on this batch.
+      Distinguishes "flag on AND batch eligible" from "flag on but batch had a non-insert row".
     """
     ct_col = batch.column("change_type")
 
@@ -311,12 +357,18 @@ def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str])
         pc.equal(ct_col, pa.scalar("update_postimage")),
     )
     # Winner(k) BEFORE stripping meta — the dedup orders by snapshot_id/rowid.
+    # The dedup runs on the fast path too: within-batch duplicate keys (the same
+    # UUID emitted twice in one CDC read range) would otherwise materialize as
+    # destination duplicates *within a single apply*, which is a stronger break
+    # than the "duplicates on retry only" contract the flag advertises.
     upsert_rows = strip_meta(_dedupe_upserts_last_write_wins(batch.filter(upsert_mask), key_columns))
 
-    counts = {"deleted": 0, "upserted": 0, "upsert_matched": 0}
+    counts: dict[str, int | bool] = {"deleted": 0, "upserted": 0, "upsert_matched": 0, "used_append": False}
 
     if delete_rows.num_rows == 0 and upsert_rows.num_rows == 0:
         return counts
+
+    use_append = append_at_least_once and delete_rows.num_rows == 0 and _is_pure_insert_batch(batch)
 
     with catalog.begin_transaction() as txn:
         tbl = txn.load_table(dest_table.identifier)
@@ -333,9 +385,14 @@ def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str])
             counts["deleted"] = delete_rows.num_rows
 
         if upsert_rows.num_rows > 0:
-            upsert_result = tbl.upsert(upsert_rows, join_cols=key_columns)
-            counts["upserted"] = upsert_rows.num_rows
-            counts["upsert_matched"] = upsert_result.rows_updated
+            if use_append:
+                tbl.append(upsert_rows)
+                counts["upserted"] = upsert_rows.num_rows
+                counts["used_append"] = True
+            else:
+                upsert_result = tbl.upsert(upsert_rows, join_cols=key_columns)
+                counts["upserted"] = upsert_rows.num_rows
+                counts["upsert_matched"] = upsert_result.rows_updated
 
     return counts
 
@@ -345,7 +402,14 @@ def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str])
 # ---------------------------------------------------------------------------
 
 
-def apply_full_cdc(dest_pool, dest_id: str, batch: pa.Table, key_columns: list[str]) -> int:
+def apply_full_cdc(
+    dest_pool,
+    dest_id: str,
+    batch: pa.Table,
+    key_columns: list[str],
+    *,
+    append_at_least_once: bool = False,
+) -> int:
     """Phase 2 + Phase 3 for one destination flush. Returns ops applied."""
     resolved = _resolve_conflicts(batch)
     if resolved.num_rows == 0:
@@ -353,12 +417,14 @@ def apply_full_cdc(dest_pool, dest_id: str, batch: pa.Table, key_columns: list[s
     counts = _write_with_retry(
         dest_pool,
         dest_id,
-        lambda cat, tbl: _apply_changes(cat, tbl, resolved, key_columns),
+        lambda cat, tbl: _apply_changes(cat, tbl, resolved, key_columns, append_at_least_once=append_at_least_once),
     )
     if counts["deleted"] > 0:
         metrics.dest_rows_deleted_total.labels(destination=dest_id).inc(counts["deleted"])
     if counts["upserted"] > 0:
         metrics.dest_rows_upserted_total.labels(destination=dest_id).inc(counts["upserted"])
+    if counts["used_append"]:
+        metrics.dest_apply_fast_path_batches_total.labels(destination=dest_id).inc()
     if counts["upsert_matched"] > 0:
         metrics.dest_upsert_matched_total.labels(destination=dest_id).inc(counts["upsert_matched"])
     return counts["deleted"] + counts["upserted"]

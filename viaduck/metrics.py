@@ -106,6 +106,18 @@ _dest_upsert_matched_total = Counter(
     "Rows that matched existing rows during upsert (updated, not inserted)",
     ["pipeline", "destination"],
 )
+_dest_apply_mode = Gauge(
+    "viaduck_dest_apply_mode",
+    "Configured destination apply mode: 1 if append_at_least_once is enabled, 0 if the upsert path is in effect. "
+    "Set once at startup; the per-batch safety net may still take the upsert path for any batch containing a "
+    "non-insert row even when this gauge is 1.",
+    ["pipeline", "destination"],
+)
+_dest_apply_fast_path_batches_total = Counter(
+    "viaduck_dest_apply_fast_path_batches_total",
+    "Flush batches that took the append fast path (skipped pyducklake's MERGE+count scans).",
+    ["pipeline", "destination"],
+)
 _cdc_routing_mutations_total = Counter(
     "viaduck_cdc_routing_mutations_total",
     "Cross-tenant routing value changes detected in updates",
@@ -182,6 +194,8 @@ cdc_batch_rows = _cdc_batch_rows
 dest_rows_deleted_total = _dest_rows_deleted_total
 dest_rows_upserted_total = _dest_rows_upserted_total
 dest_upsert_matched_total = _dest_upsert_matched_total
+dest_apply_mode = _dest_apply_mode
+dest_apply_fast_path_batches_total = _dest_apply_fast_path_batches_total
 cdc_routing_mutations_total = _cdc_routing_mutations_total
 cdc_conflicts_resolved_total = _cdc_conflicts_resolved_total
 cdc_tombstones_emitted_total = _cdc_tombstones_emitted_total
@@ -204,6 +218,7 @@ def init(pipeline: str):
     global errors_total
     global cdc_batch_rows
     global dest_rows_deleted_total, dest_rows_upserted_total, dest_upsert_matched_total
+    global dest_apply_mode, dest_apply_fast_path_batches_total
     global cdc_routing_mutations_total, cdc_conflicts_resolved_total, cdc_orphaned_preimages_total
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
@@ -223,6 +238,8 @@ def init(pipeline: str):
     dest_rows_deleted_total = _AutoPipelineLabels(_dest_rows_deleted_total, pipeline)
     dest_rows_upserted_total = _AutoPipelineLabels(_dest_rows_upserted_total, pipeline)
     dest_upsert_matched_total = _AutoPipelineLabels(_dest_upsert_matched_total, pipeline)
+    dest_apply_mode = _AutoPipelineLabels(_dest_apply_mode, pipeline)
+    dest_apply_fast_path_batches_total = _AutoPipelineLabels(_dest_apply_fast_path_batches_total, pipeline)
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
