@@ -17,6 +17,7 @@ entirely with whatever produces the env var (chart, docker-compose, etc.).
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -302,6 +303,65 @@ class ViaduckConfig:
             if d.id == dest_id:
                 return d
         raise ConfigError(f"Unknown destination ID: {dest_id!r}")
+
+    def log_summary(self, log: logging.Logger) -> None:
+        """Emit one INFO log line per leaf config field. Each value is
+        independently greppable from the deploy log — operators can answer
+        "what flush_interval_seconds did this pod start with?" or "is the
+        fast path on for team-2?" without re-reading the values yaml or
+        execing into the pod.
+
+        Resolved secrets (postgres connection strings with credentials, S3
+        access keys) are never logged. Only raw dataclass fields are dumped,
+        so a `*_env` field holds the env var NAME — safe — while the
+        `postgres_uri` @property (which resolves the env var) is not touched.
+        `properties` dicts contain the same `*_env` references (YAML literal
+        env var names), so they're safe too.
+        """
+        log.info("config: source.name=%r", self.source.name)
+        log.info("config: source.postgres_uri_env=%r", self.source.postgres_uri_env)
+        log.info("config: source.data_path=%r", self.source.data_path)
+        log.info("config: source.table=%r", self.source.table)
+        log.info("config: source.properties=%r", self.source.properties)
+
+        log.info("config: routing.field=%r", self.routing.field)
+        log.info("config: routing.key_columns=%r", self.routing.key_columns)
+        log.info("config: routing.seed_mode=%r", self.routing.seed_mode)
+        log.info("config: routing.seed_truncate=%s", self.routing.seed_truncate)
+
+        log.info("config: poll.interval_seconds=%s", self.poll.interval_seconds)
+        log.info("config: poll.cdc_chunk_snapshots=%d", self.poll.cdc_chunk_snapshots)
+
+        log.info("config: delivery.workers=%d", self.delivery.workers)
+        log.info("config: delivery.flush_interval_seconds=%s", self.delivery.flush_interval_seconds)
+        log.info("config: delivery.flush_max_rows=%d", self.delivery.flush_max_rows)
+        log.info("config: delivery.flush_max_bytes=%d", self.delivery.flush_max_bytes)
+        log.info("config: delivery.buffer_total_max_bytes=%d", self.delivery.buffer_total_max_bytes)
+        log.info("config: delivery.pool_max_open=%d", self.delivery.pool_max_open)
+
+        log.info("config: server.port=%d", self.server.port)
+        log.info("config: web.enabled=%s", self.web.enabled)
+
+        log.info("config: instance.id=%r", self.instance.id)
+        log.info("config: instance.partition.mode=%r", self.instance.partition.mode)
+        log.info("config: instance.partition.include=%r", self.instance.partition.include)
+        log.info("config: instance.partition.total=%d", self.instance.partition.total)
+        log.info("config: instance.partition.ordinal=%d", self.instance.partition.ordinal)
+
+        log.info("config: state.table=%r", self.state.table)
+        log.info("config: state.schema=%r", self.state.schema)
+        log.info("config: state.postgres_uri_env=%r", self.state.postgres_uri_env)
+
+        log.info("config: destinations.count=%d", len(self.destinations))
+        for i, d in enumerate(self.destinations):
+            log.info("config: destinations[%d].id=%r", i, d.id)
+            log.info("config: destinations[%d].routing_value=%r", i, d.routing_value)
+            log.info("config: destinations[%d].name=%r", i, d.name)
+            log.info("config: destinations[%d].postgres_uri_env=%r", i, d.postgres_uri_env)
+            log.info("config: destinations[%d].data_path=%r", i, d.data_path)
+            log.info("config: destinations[%d].table=%r", i, d.table)
+            log.info("config: destinations[%d].properties=%r", i, d.properties)
+            log.info("config: destinations[%d].append_at_least_once=%s", i, d.append_at_least_once)
 
     def assigned_destination_ids(self) -> list[str]:
         """Return destination IDs assigned to this instance based on partition config."""

@@ -573,3 +573,136 @@ def test_state_uri_passes_through_libpq_forms(config_file, monkeypatch):
         monkeypatch.setenv("SRC_PG", raw)
         cfg = load(config_file)
         assert cfg.state.resolve_postgres_uri(cfg.source) == raw
+
+
+# --- log_summary ---
+
+
+def _captured_log_lines(cfg, caplog) -> list[str]:
+    """Helper: call cfg.log_summary and return the rendered messages.
+
+    log_summary uses lazy % formatting; the rendered text is on record.message,
+    not record.msg. Filter to the config-summary records by the "config: " prefix
+    so a stray unrelated log doesn't pollute the assertion set."""
+    import logging as _logging
+
+    log = _logging.getLogger("viaduck.test.config_summary")
+    with caplog.at_level(_logging.INFO, logger="viaduck.test.config_summary"):
+        cfg.log_summary(log)
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("config: ")]
+
+
+def test_log_summary_covers_every_top_level_section(config_file, caplog):
+    """Every top-level config section dumps at least one line. Catches the
+    case where a new section is added to ViaduckConfig but log_summary
+    isn't extended — the deploy log would silently miss the new values."""
+    cfg = load(config_file)
+    lines = _captured_log_lines(cfg, caplog)
+
+    # Section coverage: at least one line whose key starts with each section name.
+    section_prefixes = [
+        "source.",
+        "routing.",
+        "poll.",
+        "delivery.",
+        "server.",
+        "web.",
+        "instance.",
+        "state.",
+        "destinations",  # both destinations.count and destinations[i].*
+    ]
+    for prefix in section_prefixes:
+        assert any(f"config: {prefix}" in line for line in lines), (
+            f"no log line for section {prefix!r}; new field added without updating log_summary?"
+        )
+
+
+def test_log_summary_one_line_per_field_not_grouped(config_file, caplog):
+    """Each leaf field gets its own log line so operators can grep for
+    individual values (the whole point of the "one line per config" shape).
+    Defends against a refactor that bundles multiple fields onto one line."""
+    cfg = load(config_file)
+    lines = _captured_log_lines(cfg, caplog)
+
+    # Spot-check known leaf fields each appear on their own line.
+    for needle in [
+        "config: source.name=",
+        "config: source.table=",
+        "config: routing.field=",
+        "config: routing.seed_mode=",
+        "config: delivery.workers=",
+        "config: delivery.flush_interval_seconds=",
+        "config: delivery.flush_max_rows=",
+        "config: delivery.flush_max_bytes=",
+        "config: poll.interval_seconds=",
+        "config: poll.cdc_chunk_snapshots=",
+        "config: instance.partition.mode=",
+        "config: state.table=",
+        "config: state.schema=",
+    ]:
+        matching = [line for line in lines if line.startswith(needle)]
+        assert len(matching) == 1, f"expected exactly one line for {needle!r}, got {matching!r}"
+
+
+def test_log_summary_destination_fields_per_index(config_file, caplog):
+    """Each destination's fields appear under destinations[i].* so multi-
+    destination configs stay disambiguated by index (not name) in the log."""
+    cfg = load(config_file)
+    lines = _captured_log_lines(cfg, caplog)
+
+    assert "config: destinations.count=1" in lines
+    assert any("config: destinations[0].id='quacksworth-lake'" == line for line in lines)
+    assert any("config: destinations[0].routing_value='quacksworth'" == line for line in lines)
+    assert any("config: destinations[0].append_at_least_once=False" == line for line in lines)
+
+
+def test_log_summary_logs_append_at_least_once_true(tmp_path: Path, caplog):
+    """The flag value flows through verbatim — defends against a "redact bools"
+    refactor or a hardcoded False that would hide an enabled fast path."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        MINIMAL_YAML.replace(
+            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: true"
+        )
+    )
+    cfg = load(p)
+    lines = _captured_log_lines(cfg, caplog)
+    assert any("config: destinations[0].append_at_least_once=True" == line for line in lines)
+
+
+def test_log_summary_does_not_log_resolved_postgres_uri(config_file, caplog, monkeypatch):
+    """Env-var-resolved credentials (DB passwords inside the URI, S3 keys) must
+    never appear in the log — only env var NAMES. Catches a future refactor
+    that calls .postgres_uri (the resolved @property) instead of the raw field."""
+    monkeypatch.setenv("SRC_PG", "postgres:host=src password=SUPER_SECRET_PG_PW")
+    monkeypatch.setenv("DEST_QW_PG", "postgres:host=qw password=SUPER_SECRET_DEST_PW")
+    cfg = load(config_file)
+    lines = _captured_log_lines(cfg, caplog)
+
+    joined = "\n".join(lines)
+    assert "SUPER_SECRET_PG_PW" not in joined, "source resolved postgres URI leaked into the log"
+    assert "SUPER_SECRET_DEST_PW" not in joined, "destination resolved postgres URI leaked into the log"
+    # Env var NAMES are safe and SHOULD appear.
+    assert any("config: source.postgres_uri_env='SRC_PG'" == line for line in lines)
+    assert any("config: destinations[0].postgres_uri_env='DEST_QW_PG'" == line for line in lines)
+
+
+def test_log_summary_does_not_log_resolved_s3_credentials(tmp_path, caplog, monkeypatch):
+    """Properties dicts hold env var NAMES (s3_access_key_id_env: MY_KEY_ENV),
+    never the resolved credentials. The resolved_properties() @property
+    resolves env values; log_summary must dump the raw properties dict only."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        MINIMAL_YAML
+        + "\ndefaults:\n  properties:\n    s3_access_key_id_env: 'S3_KEY'\n    s3_secret_access_key_env: 'S3_SECRET'\n"
+    )
+    monkeypatch.setenv("S3_KEY", "AKIA_RESOLVED_KEY_ID_SHOULD_NOT_APPEAR")
+    monkeypatch.setenv("S3_SECRET", "RESOLVED_S3_SECRET_SHOULD_NOT_APPEAR")
+    cfg = load(p)
+    lines = _captured_log_lines(cfg, caplog)
+
+    joined = "\n".join(lines)
+    assert "AKIA_RESOLVED_KEY_ID_SHOULD_NOT_APPEAR" not in joined
+    assert "RESOLVED_S3_SECRET_SHOULD_NOT_APPEAR" not in joined
+    # The env-var names themselves are fine — they're just identifiers.
+    assert any("s3_access_key_id_env" in line and "S3_KEY" in line for line in lines)
