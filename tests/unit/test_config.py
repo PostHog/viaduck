@@ -148,6 +148,61 @@ def test_destination_custom_table(tmp_path: Path):
     assert cfg.destinations[0].table == "custom_events"
 
 
+def test_destination_append_at_least_once_defaults_false(config_file: Path):
+    """Field defaults to False — opt-in by destination."""
+    cfg = load(config_file)
+    assert cfg.destinations[0].append_at_least_once is False
+
+
+def test_destination_append_at_least_once_true(tmp_path: Path):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        MINIMAL_YAML.replace(
+            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: true"
+        )
+    )
+    cfg = load(p)
+    assert cfg.destinations[0].append_at_least_once is True
+
+
+def test_destination_append_at_least_once_false_explicit(tmp_path: Path):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        MINIMAL_YAML.replace(
+            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: false"
+        )
+    )
+    cfg = load(p)
+    assert cfg.destinations[0].append_at_least_once is False
+
+
+def test_destination_append_at_least_once_rejects_string(tmp_path: Path):
+    """YAML scalar coercion is loose — an unquoted "true" might land as a bool
+    but a quoted "true" would land as a string. Reject non-bool loudly so a
+    config typo can't silently disable the optimization (or worse, enable it
+    on a destination that needs strict idempotency)."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        MINIMAL_YAML.replace(
+            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: 'true'"
+        )
+    )
+    with pytest.raises(ConfigError, match="append_at_least_once.*boolean"):
+        load(p)
+
+
+def test_destination_append_at_least_once_rejects_int(tmp_path: Path):
+    """Reject `: 1` — Python's bool is an int subclass, but YAML 1 is an int."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        MINIMAL_YAML.replace(
+            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: 1"
+        )
+    )
+    with pytest.raises(ConfigError, match="append_at_least_once.*boolean"):
+        load(p)
+
+
 # --- Env var resolution ---
 
 

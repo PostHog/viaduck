@@ -96,6 +96,7 @@ class DeliveryManager:
         key_columns: list[str],
         assigned_ids: list[str],
         on_flush_success=None,
+        append_at_least_once_by_dest: dict[str, bool] | None = None,
     ):
         self._cfg = cfg
         self._state = state_mgr
@@ -103,6 +104,29 @@ class DeliveryManager:
         self._key_columns = key_columns
         self._full_cdc = len(key_columns) > 0
         self._on_flush_success = on_flush_success
+        # Defaults to empty dict → every destination uses the upsert path.
+        # The dict-of-bool shape (not a single flag on cfg) is deliberate:
+        # the apply mode is a per-destination contract with its downstream,
+        # not a transport-level knob shared across destinations. Constructed
+        # once in __init__ (single-threaded before the worker pool starts)
+        # and never mutated thereafter — workers read it via .get() under
+        # the GIL without holding self._lock.
+        self._append_at_least_once_by_dest: dict[str, bool] = dict(append_at_least_once_by_dest or {})
+
+        # Observability: a labeled gauge per assigned destination so dashboards
+        # can answer "is this dest on the fast path" without grepping config,
+        # and a startup log line per fast-path destination so the operator-
+        # visible signal is plain in the deploy log.
+        for dest_id in assigned_ids:
+            mode_on = self._append_at_least_once_by_dest.get(dest_id, False)
+            metrics.dest_apply_mode.labels(destination=dest_id).set(1 if mode_on else 0)
+            if mode_on:
+                log.info(
+                    "Destination %s configured with append_at_least_once=true; "
+                    "insert-only batches will skip the upsert path and may produce "
+                    "duplicate rows on apply-commit / cursor-advance failure retries",
+                    dest_id,
+                )
 
         self._lock = threading.Lock()
         self._buffers: dict[str, _Buffer] = {d: _Buffer() for d in assigned_ids}
@@ -362,7 +386,13 @@ class DeliveryManager:
             if tables:
                 batch = tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
                 if self._full_cdc:
-                    ops_count = apply_full_cdc(self._pool, dest_id, batch, self._key_columns)
+                    ops_count = apply_full_cdc(
+                        self._pool,
+                        dest_id,
+                        batch,
+                        self._key_columns,
+                        append_at_least_once=self._append_at_least_once_by_dest.get(dest_id, False),
+                    )
                 else:
                     ops_count = append_only(self._pool, dest_id, batch)
             # Cursor persist AFTER the destination commit (the gap is the

@@ -73,3 +73,23 @@ def test_init_binds_cdc_orphaned_preimages_metric():
     init("test-pipeline")
 
     assert hasattr(metrics.cdc_orphaned_preimages_total, "inc")
+
+
+def test_init_binds_apply_mode_gauge():
+    """After init(), dest_apply_mode should accept .labels(destination=).set().
+    Operator-visible signal that a destination is on the append fast path."""
+    from viaduck import metrics
+
+    init("test-pipeline")
+
+    assert hasattr(metrics.dest_apply_mode, "labels")
+
+
+def test_init_binds_apply_fast_path_batches_counter():
+    """After init(), dest_apply_fast_path_batches_total should accept
+    .labels(destination=).inc(). Increments per batch that took the fast path."""
+    from viaduck import metrics
+
+    init("test-pipeline")
+
+    assert hasattr(metrics.dest_apply_fast_path_batches_total, "labels")
