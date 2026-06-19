@@ -84,12 +84,14 @@ Core modules:
 
 ## Two Modes
 
-Viaduck operates in one of two modes based on the `key_columns` configuration:
+Viaduck operates in one of two modes, selected by the **required** `routing.mode` field:
 
 | Mode | Config | CDC API | Destination writes | Use case |
 |------|--------|---------|-------------------|----------|
-| **Append-only** | `key_columns` omitted or `[]` | `table_insertions()` | `append()` | Append-only tables, no primary key |
-| **Full CDC** | `key_columns: [event_id]` | `table_changes()` | `delete()` + `upsert()` | Tables with primary keys, full replication |
+| **Append-only** | `mode: append_only` + `key_columns: []` | `table_insertions()` | `append()` | Insert-only sources (events, append-only fact tables) |
+| **Full CDC** | `mode: full_cdc` + non-empty `key_columns` | `table_changes()` | `delete()` + `upsert()` | Sources that emit deletes/updates; the join columns are the upsert keys |
+
+`routing.mode` is required (no default). Misconfiguration (`mode` unset, unknown value, `full_cdc` with empty `key_columns`, `append_only` with non-empty `key_columns`) fails fast at startup with an actionable `ConfigError` — earlier viaduck versions inferred the mode from `len(key_columns) > 0`, which silently flipped the entire pipeline shape when an operator typo'd or accidentally emptied the list.
 
 ## Poll Cycle
 
@@ -208,9 +210,10 @@ source:
 
 routing:
   field: "company"                           # column in source table to route on
-  key_columns: ["event_id"]                  # primary key for delete/update replication
-                                             # omit or [] for append-only mode
-  seed_mode: "scan"                          # "scan" (default) or "cdc_replay"
+  mode: "full_cdc"                           # required: "full_cdc" or "append_only"
+  key_columns: ["event_id"]                  # required iff mode=full_cdc (upsert join keys)
+                                             #   forbidden if mode=append_only
+  seed_mode: "scan"                          # "scan" (default), "earliest", or "latest"
   seed_truncate: true                        # REPLACE-semantics seeding (truncate a cursor-0, non-empty dest)
 
 destinations:
@@ -298,16 +301,19 @@ State is keyed by `(destination_id, instance_id)`, enabling multiple viaduck ins
 
 ## New Destination Seeding
 
-When a new destination is added to the config, it needs the current source data. Two modes are available via `routing.seed_mode`:
+When a new destination is added to the config, it needs the current source data. Three modes are available via `routing.seed_mode`:
 
 | Mode | How it works | When to use |
 |------|-------------|-------------|
 | `scan` (default) | Reads current source state via filtered `table.scan()`, bulk-loads the destination, sets cursor to current snapshot | Most use cases. Fast — reads one snapshot, not historical CDC. |
-| `cdc_replay` | Starts cursor at snapshot 0, replays entire CDC history on first poll | Audit trails where you need to process every historical change |
+| `latest` | Skip backfill: cursor starts at the source head; only events from now onward are replicated | High-volume sources where historical backfill is infeasible (e.g. the PostHog events_nrt pipeline) |
+| `earliest` | Cursor starts at the source's minimum snapshot; CDC catches up forward from there | Replicating a freshly-provisioned source where you need every event but no destination state existed |
+
+`cdc_replay` was removed in v0.0.28 — use `earliest` if you need a full historical replay.
 
 With `scan` mode, adding a new tenant is instant regardless of source history depth. The scan is pinned to the snapshot captured at startup, so no race condition between the scan and cursor advancement ([`main.py:_seed_new_destinations`](viaduck/main.py)).
 
-When `key_columns` is configured, seeding uses `upsert` for idempotency — safe if the process crashes mid-seed and re-seeds on restart. Without `key_columns`, seeding uses `append` (at-least-once semantics apply).
+When `mode: full_cdc`, seeding uses `upsert` for idempotency — safe if the process crashes mid-seed and re-seeds on restart. When `mode: append_only`, seeding uses `append` (at-least-once semantics apply).
 
 Seeding has **REPLACE semantics**: a destination at cursor 0 with existing rows can only be a crashed prior seed (single-master assumption), so it is truncated — with a loud WARNING — before the seed streams. Crash mid-seed leaves the cursor at 0 and the next attempt re-truncates: convergent, and it also fixes the historical append-mode re-seed duplication. `routing.seed_truncate: false` switches the behavior to refuse-loudly, protecting a misconfigured destination pointed at a populated table. The truncate is scoped to the destination's routing value, so even two destinations misconfigured onto one physical table cannot wipe each other. Downstream readers of destination lakes should gate on cursor > 0 (the seed may leave the table briefly empty during a re-seed retry).
 

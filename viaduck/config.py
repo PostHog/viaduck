@@ -54,14 +54,6 @@ def _validate_int(value: object, ctx: str) -> int:
     return value
 
 
-def _validate_bool(value: object, ctx: str) -> bool:
-    """Validate that a YAML node is a real bool — reject ints and strings so
-    `append_at_least_once: 1` or `: "true"` can't silently shadow the intent."""
-    if not isinstance(value, bool):
-        raise ConfigError(f"{ctx} must be a boolean (got {type(value).__name__})")
-    return value
-
-
 def _resolve_env_properties(props: dict[str, str]) -> dict[str, str]:
     """Resolve properties: keys ending in _env have their values read from env vars."""
     resolved = {}
@@ -108,9 +100,29 @@ class SourceConfig:
         return _resolve_env_properties(self.properties)
 
 
+_VALID_ROUTING_MODES = ("full_cdc", "append_only")
+
+
 @dataclass(frozen=True)
 class RoutingConfig:
     field: str
+    # Source-read + apply mode for the pipeline:
+    #   full_cdc      — read source via ducklake_table_changes (inserts +
+    #                   deletes + update preimages/postimages), run Phase 1
+    #                   preimage resolution and Phase 2 conflict resolution,
+    #                   apply via tbl.upsert(rows, join_cols=key_columns).
+    #                   Requires non-empty key_columns.
+    #   append_only   — read source via ducklake_table_insertions (inserts
+    #                   only), skip Phase 1 and Phase 2 entirely, apply
+    #                   via tbl.append(rows). Requires empty key_columns
+    #                   (none of the apply-path machinery uses them, so a
+    #                   non-empty value would be silent misconfiguration).
+    # Required: no default — the previous "infer full_cdc from len(key_columns)
+    # > 0" derivation was a silent misconfig hazard (a typo'd or accidentally-
+    # empty list flipped the entire pipeline shape with no operator-visible
+    # signal). Explicit mode + a startup error on mismatch keeps the operator
+    # honest.
+    mode: str = ""
     key_columns: list[str] = field(default_factory=list)
     seed_mode: str = "scan"  # "scan", "earliest", or "latest"
     # REPLACE-semantics seeding: a destination at cursor 0 with existing
@@ -122,6 +134,37 @@ class RoutingConfig:
     seed_truncate: bool = True
 
     def __post_init__(self):
+        if not isinstance(self.mode, str):
+            # YAML 1.1 coerces bare `yes`/`no`/`on`/`off` to bools, and `1`/`0`
+            # to ints, so a typo'd `mode: yes` lands here as Python True and
+            # the enum check below would print `got True` — operator-confusing.
+            raise ConfigError(
+                f"routing.mode must be a string, got {type(self.mode).__name__} ({self.mode!r}). "
+                'Quote the value if YAML coerced it (e.g. `mode: "append_only"`).'
+            )
+        if not self.mode:
+            raise ConfigError(
+                f"routing.mode is required, no default. Set it to one of {list(_VALID_ROUTING_MODES)}: "
+                f"'full_cdc' for sources that emit deletes/updates (requires key_columns), "
+                f"'append_only' for insert-only sources (key_columns must be empty)."
+            )
+        if self.mode not in _VALID_ROUTING_MODES:
+            raise ConfigError(
+                f"routing.mode must be one of {list(_VALID_ROUTING_MODES)}, got {self.mode!r}. "
+                f"Use 'full_cdc' for sources that emit deletes/updates (requires key_columns), "
+                f"'append_only' for insert-only sources (key_columns must be empty)."
+            )
+        if self.mode == "full_cdc" and not self.key_columns:
+            raise ConfigError(
+                "routing.mode='full_cdc' requires a non-empty routing.key_columns list "
+                "(the upsert join keys for the apply path)."
+            )
+        if self.mode == "append_only" and self.key_columns:
+            raise ConfigError(
+                "routing.mode='append_only' forbids routing.key_columns; the append path "
+                f"does not use them and a non-empty value indicates misconfiguration. "
+                f"Got key_columns={self.key_columns!r}; remove them or switch to mode='full_cdc'."
+            )
         if self.seed_mode not in ("scan", "earliest", "latest"):
             raise ConfigError(f"routing.seed_mode must be 'scan', 'earliest', or 'latest', got {self.seed_mode!r}")
 
@@ -135,25 +178,6 @@ class DestinationConfig:
     data_path: str
     table: str
     properties: dict[str, str] = field(default_factory=dict)
-    # Opt-in fast path for insert-only CDC: when true, _apply_changes uses
-    # tbl.append() instead of tbl.upsert() on batches that contain only
-    # change_type="insert" rows. Skips pyducklake's MERGE planning + the two
-    # bookkeeping count(*) scans.
-    #
-    # Semantic change to flag carefully: today the upsert path silently
-    # collapses upstream-CDC at-least-once duplicates because MERGE WHEN
-    # MATCHED reduces them to one destination row. The append path does NOT.
-    # Both upstream-redelivery duplicates AND apply-committed-but-cursor-
-    # not-advanced replay duplicates now physically materialize in the
-    # destination table — they don't stop at viaduck. Enable ONLY when every
-    # consumer of the destination table (queries, downstream pipelines,
-    # exports) can tolerate per-key duplicates, not just the immediate
-    # downstream consumer of viaduck.
-    #
-    # Mixed batches still fall through to upsert via a per-batch check
-    # (_is_pure_insert_batch), so a future CDC schema change that introduces
-    # update_postimage doesn't silently corrupt the destination.
-    append_at_least_once: bool = False
 
     @property
     def postgres_uri(self) -> str:
@@ -325,6 +349,7 @@ class ViaduckConfig:
         log.info("config: source.properties=%r", self.source.properties)
 
         log.info("config: routing.field=%r", self.routing.field)
+        log.info("config: routing.mode=%r", self.routing.mode)
         log.info("config: routing.key_columns=%r", self.routing.key_columns)
         log.info("config: routing.seed_mode=%r", self.routing.seed_mode)
         log.info("config: routing.seed_truncate=%s", self.routing.seed_truncate)
@@ -361,7 +386,6 @@ class ViaduckConfig:
             log.info("config: destinations[%d].data_path=%r", i, d.data_path)
             log.info("config: destinations[%d].table=%r", i, d.table)
             log.info("config: destinations[%d].properties=%r", i, d.properties)
-            log.info("config: destinations[%d].append_at_least_once=%s", i, d.append_at_least_once)
 
     def assigned_destination_ids(self) -> list[str]:
         """Return destination IDs assigned to this instance based on partition config."""
@@ -425,6 +449,10 @@ def load(path: str | Path) -> ViaduckConfig:
         raise ConfigError("routing.key_columns entries must all be strings")
     routing = RoutingConfig(
         field=_require_non_empty(rt.get("field", ""), "routing.field"),
+        # `or ""` so YAML `mode:` (key present, no value → Python None) routes
+        # to the "is required, no default" branch rather than the isinstance
+        # type-error branch (which would tell the operator to quote `None`).
+        mode=rt.get("mode") or "",
         key_columns=raw_key_cols,
         seed_mode=rt.get("seed_mode", "scan"),
         seed_truncate=bool(rt.get("seed_truncate", True)),
@@ -441,7 +469,6 @@ def load(path: str | Path) -> ViaduckConfig:
             _validate_string_dict(d.get("properties", {}), f"destinations[{i}].properties"),
             default_props,
         )
-        raw_aaolo = d.get("append_at_least_once", False)
         destinations.append(
             DestinationConfig(
                 id=_require_non_empty(str(d.get("id", "")), f"destinations[{i}].id"),
@@ -453,7 +480,6 @@ def load(path: str | Path) -> ViaduckConfig:
                 data_path=_require_non_empty(d.get("data_path", ""), f"destinations[{i}].data_path"),
                 table=d.get("table", source.table),
                 properties=dest_props,
-                append_at_least_once=_validate_bool(raw_aaolo, f"destinations[{i}].append_at_least_once"),
             )
         )
 

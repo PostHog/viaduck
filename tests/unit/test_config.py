@@ -26,6 +26,7 @@ source:
 
 routing:
   field: company
+  mode: append_only
 
 destinations:
   - id: quacksworth-lake
@@ -103,7 +104,7 @@ def test_load_no_destinations(tmp_path: Path):
     p = tmp_path / "bad.yaml"
     p.write_text(
         "source:\n  name: s\n  postgres_uri_env: X\n  data_path: s3://s/\n  table: t\n"
-        "routing:\n  field: x\ndestinations: []\n"
+        "routing:\n  field: x\n  mode: append_only\ndestinations: []\n"
     )
     with pytest.raises(ConfigError, match="At least one destination"):
         load(p)
@@ -148,58 +149,96 @@ def test_destination_custom_table(tmp_path: Path):
     assert cfg.destinations[0].table == "custom_events"
 
 
-def test_destination_append_at_least_once_defaults_false(config_file: Path):
-    """Field defaults to False — opt-in by destination."""
+def test_routing_mode_required(config_file: Path):
+    """Loading the MINIMAL_YAML (which sets mode: append_only) parses fine —
+    this is the baseline the matrix tests below mutate."""
     cfg = load(config_file)
-    assert cfg.destinations[0].append_at_least_once is False
+    assert cfg.routing.mode == "append_only"
 
 
-def test_destination_append_at_least_once_true(tmp_path: Path):
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        MINIMAL_YAML.replace(
-            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: true"
-        )
-    )
-    cfg = load(p)
-    assert cfg.destinations[0].append_at_least_once is True
+def test_routing_mode_unset_rejected(tmp_path: Path):
+    """No mode → ConfigError. We don't want to fall back to inferring from
+    key_columns presence; that was the old silent-misconfig hazard.
 
-
-def test_destination_append_at_least_once_false_explicit(tmp_path: Path):
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        MINIMAL_YAML.replace(
-            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: false"
-        )
-    )
-    cfg = load(p)
-    assert cfg.destinations[0].append_at_least_once is False
-
-
-def test_destination_append_at_least_once_rejects_string(tmp_path: Path):
-    """YAML scalar coercion is loose — an unquoted "true" might land as a bool
-    but a quoted "true" would land as a string. Reject non-bool loudly so a
-    config typo can't silently disable the optimization (or worse, enable it
-    on a destination that needs strict idempotency)."""
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        MINIMAL_YAML.replace(
-            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: 'true'"
-        )
-    )
-    with pytest.raises(ConfigError, match="append_at_least_once.*boolean"):
+    A missing key resolves to the dataclass default `mode=""`, which the
+    empty-case branch matches with a "required, no default" message."""
+    raw = MINIMAL_YAML.replace("\n  mode: append_only", "")
+    p = tmp_path / "no_mode.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match=r"routing.mode is required, no default"):
         load(p)
 
 
-def test_destination_append_at_least_once_rejects_int(tmp_path: Path):
-    """Reject `: 1` — Python's bool is an int subclass, but YAML 1 is an int."""
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        MINIMAL_YAML.replace(
-            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: 1"
-        )
-    )
-    with pytest.raises(ConfigError, match="append_at_least_once.*boolean"):
+def test_routing_mode_unknown_value_rejected(tmp_path: Path):
+    """Typos or stale legacy values fail loudly with the enum listed in the
+    error so the operator can self-correct without grepping source."""
+    raw = MINIMAL_YAML.replace("mode: append_only", "mode: cdc_replay")
+    p = tmp_path / "bad_mode.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match=r"routing.mode must be one of \['full_cdc', 'append_only'\]"):
+        load(p)
+
+
+def test_routing_mode_full_cdc_requires_key_columns(tmp_path: Path):
+    """The whole point of full_cdc is the upsert join keys — empty
+    key_columns is operator misconfig (the old derivation flipped silently
+    to append_only here)."""
+    raw = MINIMAL_YAML.replace("mode: append_only", "mode: full_cdc")
+    p = tmp_path / "full_cdc_no_keys.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match="full_cdc.*requires.*key_columns"):
+        load(p)
+
+
+def test_routing_mode_full_cdc_with_key_columns_ok(tmp_path: Path):
+    raw = MINIMAL_YAML.replace("mode: append_only", "mode: full_cdc\n  key_columns: [uuid]")
+    p = tmp_path / "full_cdc_with_keys.yaml"
+    p.write_text(raw)
+    cfg = load(p)
+    assert cfg.routing.mode == "full_cdc"
+    assert cfg.routing.key_columns == ["uuid"]
+
+
+def test_routing_mode_yaml_bool_coerced_rejected(tmp_path: Path):
+    """YAML 1.1 coerces `mode: yes` to Python True (PyYAML behavior). The
+    validator catches the type mismatch with a quote-hint before the enum
+    check fires with a confusing `got True` message."""
+    raw = MINIMAL_YAML.replace("mode: append_only", "mode: yes")
+    p = tmp_path / "yaml_bool.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match=r"routing.mode must be a string"):
+        load(p)
+
+
+def test_routing_mode_empty_string_distinguished_from_unknown(tmp_path: Path):
+    """`mode:` (empty value) is operator-omission, not a typo. Distinct
+    error message tells them to set it rather than guess the typo."""
+    raw = MINIMAL_YAML.replace("mode: append_only", "mode: ''")
+    p = tmp_path / "empty_mode.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match=r"routing.mode is required, no default"):
+        load(p)
+
+
+def test_routing_mode_null_value_routes_to_required_message(tmp_path: Path):
+    """`mode:` (key present, no value) parses to Python None via PyYAML.
+    The loader coerces None→"" before construction so the operator gets the
+    "is required" guidance instead of the isinstance "quote the value if
+    YAML coerced it" hint — which would point them at the wrong fix."""
+    raw = MINIMAL_YAML.replace("mode: append_only", "mode:")
+    p = tmp_path / "null_mode.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match=r"routing.mode is required, no default"):
+        load(p)
+
+
+def test_routing_mode_append_only_forbids_key_columns(tmp_path: Path):
+    """append_only's apply path doesn't use key_columns at all; a non-empty
+    list is misconfig the operator must clear or switch modes for."""
+    raw = MINIMAL_YAML.replace("mode: append_only", "mode: append_only\n  key_columns: [uuid]")
+    p = tmp_path / "append_only_with_keys.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match="append_only.*forbids.*key_columns"):
         load(p)
 
 
@@ -269,6 +308,7 @@ source:
   table: events
 routing:
   field: company
+  mode: append_only
 destinations:
   - id: a
     routing_value: acme
@@ -416,6 +456,7 @@ source:
 
 routing:
   field: company
+  mode: append_only
 
 destinations:
   - id: quacksworth-lake
@@ -465,33 +506,27 @@ def test_load_non_mapping_yaml(tmp_path: Path):
 
 
 def test_load_with_key_columns(tmp_path: Path):
-    """YAML with key_columns: [event_id, company] parses correctly."""
+    """YAML with key_columns: [event_id, company] parses correctly under full_cdc."""
     p = tmp_path / "cfg.yaml"
-    p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  key_columns: [event_id, company]"))
+    p.write_text(MINIMAL_YAML.replace("mode: append_only", "mode: full_cdc\n  key_columns: [event_id, company]"))
     cfg = load(p)
     assert cfg.routing.key_columns == ["event_id", "company"]
 
 
 def test_load_without_key_columns_defaults_empty(config_file: Path):
-    """YAML without key_columns defaults to []."""
+    """YAML without key_columns defaults to []. The MINIMAL_YAML config is
+    mode: append_only, so this implicitly also asserts append_only doesn't
+    require the field."""
     cfg = load(config_file)
-    assert cfg.routing.key_columns == []
-
-
-def test_load_key_columns_empty_list(tmp_path: Path):
-    """Explicit key_columns: [] is valid."""
-    p = tmp_path / "cfg.yaml"
-    p.write_text(MINIMAL_YAML.replace("  field: company", "  field: company\n  key_columns: []"))
-    cfg = load(p)
     assert cfg.routing.key_columns == []
 
 
 def test_routing_config_has_key_columns():
     """RoutingConfig dataclass has key_columns field."""
-    rc = RoutingConfig(field="company", key_columns=["event_id", "company"])
+    rc = RoutingConfig(field="company", mode="full_cdc", key_columns=["event_id", "company"])
     assert rc.key_columns == ["event_id", "company"]
 
-    rc_default = RoutingConfig(field="company")
+    rc_default = RoutingConfig(field="company", mode="append_only")
     assert rc_default.key_columns == []
 
 
@@ -500,30 +535,30 @@ def test_routing_config_has_key_columns():
 
 def test_seed_mode_default_is_scan():
     """RoutingConfig defaults seed_mode to 'scan'."""
-    rc = RoutingConfig(field="company")
+    rc = RoutingConfig(field="company", mode="append_only")
     assert rc.seed_mode == "scan"
 
 
 def test_seed_mode_earliest():
-    rc = RoutingConfig(field="company", seed_mode="earliest")
+    rc = RoutingConfig(field="company", mode="append_only", seed_mode="earliest")
     assert rc.seed_mode == "earliest"
 
 
 def test_seed_mode_latest():
-    rc = RoutingConfig(field="company", seed_mode="latest")
+    rc = RoutingConfig(field="company", mode="append_only", seed_mode="latest")
     assert rc.seed_mode == "latest"
 
 
 def test_seed_mode_invalid():
     """seed_mode='bogus' raises ConfigError."""
     with pytest.raises(ConfigError, match="seed_mode"):
-        RoutingConfig(field="company", seed_mode="bogus")
+        RoutingConfig(field="company", mode="append_only", seed_mode="bogus")
 
 
 def test_seed_mode_cdc_replay_invalid():
     """cdc_replay is no longer valid; use earliest or latest."""
     with pytest.raises(ConfigError, match="seed_mode"):
-        RoutingConfig(field="company", seed_mode="cdc_replay")
+        RoutingConfig(field="company", mode="append_only", seed_mode="cdc_replay")
 
 
 def test_load_with_seed_mode(tmp_path: Path):
@@ -653,21 +688,16 @@ def test_log_summary_destination_fields_per_index(config_file, caplog):
     assert "config: destinations.count=1" in lines
     assert any("config: destinations[0].id='quacksworth-lake'" == line for line in lines)
     assert any("config: destinations[0].routing_value='quacksworth'" == line for line in lines)
-    assert any("config: destinations[0].append_at_least_once=False" == line for line in lines)
 
 
-def test_log_summary_logs_append_at_least_once_true(tmp_path: Path, caplog):
-    """The flag value flows through verbatim — defends against a "redact bools"
-    refactor or a hardcoded False that would hide an enabled fast path."""
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        MINIMAL_YAML.replace(
-            "    data_path: s3://quacksworth/", "    data_path: s3://quacksworth/\n    append_at_least_once: true"
-        )
-    )
-    cfg = load(p)
+def test_log_summary_routing_mode_logged(config_file, caplog):
+    """The new routing.mode field must show up in the per-leaf log dump so
+    operators can grep `config: routing.mode=` to confirm what the live pod
+    is actually configured for. Defends against a future drop-from-log
+    refactor that hides the field that determines the entire pipeline shape."""
+    cfg = load(config_file)
     lines = _captured_log_lines(cfg, caplog)
-    assert any("config: destinations[0].append_at_least_once=True" == line for line in lines)
+    assert any("config: routing.mode='append_only'" == line for line in lines)
 
 
 def test_log_summary_does_not_log_resolved_postgres_uri(config_file, caplog, monkeypatch):
