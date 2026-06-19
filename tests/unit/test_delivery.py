@@ -11,7 +11,7 @@ import pyarrow as pa
 import pytest
 
 from viaduck import metrics
-from viaduck.config import DeliveryConfig
+from viaduck.config import ConfigError, DeliveryConfig
 from viaduck.delivery import DeliveryManager
 
 
@@ -49,13 +49,16 @@ def _recording_flush(mgr):
     return _fake, calls
 
 
-def _manager(dests=("d1",), cursors=None, **cfg_overrides):
+def _manager(dests=("d1",), cursors=None, mode="append_only", key_columns=None, **cfg_overrides):
+    """Default to append_only (key_columns=[]) since that's the production posthog
+    shape; tests that need the full_cdc path pass mode="full_cdc" and a
+    non-empty key_columns."""
     defaults = dict(workers=2, flush_interval_seconds=3600.0)
     defaults.update(cfg_overrides)
     cfg = DeliveryConfig(**defaults)
     sm = _state_mgr(cursors or {d: 0 for d in dests})
     pool = MagicMock()
-    mgr = DeliveryManager(cfg, sm, pool, [], list(dests))
+    mgr = DeliveryManager(cfg, sm, pool, key_columns or [], list(dests), mode=mode)
     return mgr, sm, pool
 
 
@@ -272,14 +275,11 @@ def test_flush_failure_then_recovery():
 def test_full_cdc_flush_concats_buffered_reads():
     """Multiple buffered reads are concatenated before Phase 2 — cross-read
     conflicts resolve exactly like within-read ones."""
-    mgr, _, _ = _manager(flush_interval_seconds=0.0)
-    mgr._full_cdc = True
-    mgr._key_columns = ["value"]
+    mgr, _, _ = _manager(flush_interval_seconds=0.0, mode="full_cdc", key_columns=["value"])
     captured = {}
 
-    def fake_apply(pool, dest, batch, key_columns, append_at_least_once=False):
+    def fake_apply(pool, dest, batch, key_columns):
         captured["rows"] = batch.num_rows
-        captured["aalo"] = append_at_least_once
         return batch.num_rows
 
     with patch("viaduck.delivery.apply_full_cdc", side_effect=fake_apply):
@@ -290,142 +290,16 @@ def test_full_cdc_flush_concats_buffered_reads():
     assert captured["rows"] == 5
 
 
-def test_full_cdc_flush_threads_append_at_least_once_per_destination():
-    """Per-destination flags survive the buffer → worker → apply path,
-    keyed by dest_id. Two destinations with different flag values must
-    each see their own value at apply time."""
-    cfg = DeliveryConfig(workers=2, flush_interval_seconds=0.0)
-    sm = _state_mgr({"d-fast": 0, "d-slow": 0})
-    pool = MagicMock()
-    mgr = DeliveryManager(
-        cfg,
-        sm,
-        pool,
-        ["value"],
-        ["d-fast", "d-slow"],
-        append_at_least_once_by_dest={"d-fast": True, "d-slow": False},
-    )
-
-    seen: dict[str, bool] = {}
-
-    def fake_apply(pool, dest, batch, key_columns, append_at_least_once=False):
-        seen[dest] = append_at_least_once
-        return batch.num_rows
-
-    with patch("viaduck.delivery.apply_full_cdc", side_effect=fake_apply):
-        mgr.buffer("d-fast", _table(2), 5)
-        mgr.buffer("d-slow", _table(2), 5)
-        mgr.maybe_flush()
-        assert mgr.wait_idle()
-
-    assert seen == {"d-fast": True, "d-slow": False}
-
-
-def test_full_cdc_flush_defaults_append_at_least_once_to_false():
-    """No append_at_least_once_by_dest arg → every destination behaves as
-    before. Defends against accidentally flipping default behaviour for
-    every existing deployment."""
-    cfg = DeliveryConfig(workers=1, flush_interval_seconds=0.0)
+def test_delivery_manager_rejects_unknown_mode():
+    """The mode arg is a closed enum at the DeliveryManager layer too.
+    Operators interact with the YAML config (which goes through
+    RoutingConfig.__post_init__'s enum check); this guard catches direct-
+    instantiation misuse in tests / future call sites."""
+    cfg = DeliveryConfig(workers=1, flush_interval_seconds=3600.0)
     sm = _state_mgr({"d1": 0})
     pool = MagicMock()
-    mgr = DeliveryManager(cfg, sm, pool, ["value"], ["d1"])  # no kwarg
-
-    seen: dict[str, bool] = {}
-
-    def fake_apply(pool, dest, batch, key_columns, append_at_least_once=False):
-        seen[dest] = append_at_least_once
-        return batch.num_rows
-
-    with patch("viaduck.delivery.apply_full_cdc", side_effect=fake_apply):
-        mgr.buffer("d1", _table(2), 5)
-        mgr.maybe_flush()
-        assert mgr.wait_idle()
-
-    assert seen == {"d1": False}
-
-
-def test_apply_mode_gauge_set_for_each_destination_at_init():
-    """The dest_apply_mode gauge is the operator-visible answer to "is this
-    dest on the fast path?". Verify both states (on/off) are reflected per
-    destination at constructor time, before any flush runs.
-
-    Mock keys on .labels() returning a single shared child mock, so the .set()
-    calls land on it regardless of which destination label was passed in. We
-    then read the two .set() args and verify both 0 and 1 appeared (some
-    destination got each)."""
-    cfg = DeliveryConfig(workers=1, flush_interval_seconds=3600.0)
-    sm = _state_mgr({"d-fast": 0, "d-slow": 0})
-    pool = MagicMock()
-
-    with patch("viaduck.delivery.metrics.dest_apply_mode") as gauge:
-        DeliveryManager(
-            cfg,
-            sm,
-            pool,
-            ["value"],
-            ["d-fast", "d-slow"],
-            append_at_least_once_by_dest={"d-fast": True, "d-slow": False},
-        )
-
-    gauge.labels.assert_any_call(destination="d-fast")
-    gauge.labels.assert_any_call(destination="d-slow")
-    assert gauge.labels.call_count == 2
-
-    set_values = [c.args[0] for c in gauge.labels.return_value.set.call_args_list]
-    assert sorted(set_values) == [0, 1]
-
-
-def test_init_logs_for_fast_path_destinations(caplog):
-    """A startup log line per fast-path destination so the operator-visible
-    signal is plain in the deploy log, not just in /metrics."""
-    cfg = DeliveryConfig(workers=1, flush_interval_seconds=3600.0)
-    sm = _state_mgr({"d-fast": 0, "d-slow": 0})
-    pool = MagicMock()
-
-    with caplog.at_level("INFO", logger="viaduck.delivery"):
-        DeliveryManager(
-            cfg,
-            sm,
-            pool,
-            ["value"],
-            ["d-fast", "d-slow"],
-            append_at_least_once_by_dest={"d-fast": True, "d-slow": False},
-        )
-
-    fast_path_log_lines = [r.message for r in caplog.records if "append_at_least_once" in r.message]
-    assert any("d-fast" in m for m in fast_path_log_lines)
-    assert not any("d-slow" in m for m in fast_path_log_lines)
-
-
-def test_full_cdc_flush_unknown_destination_defaults_to_false():
-    """A destination present in assigned_ids but absent from the per-dest
-    flag dict must default to False — never promote to fast path on a
-    missing key. Catches future plumbing bugs where a new destination
-    is added but the dict isn't kept in sync."""
-    cfg = DeliveryConfig(workers=1, flush_interval_seconds=0.0)
-    sm = _state_mgr({"d1": 0})
-    pool = MagicMock()
-    mgr = DeliveryManager(
-        cfg,
-        sm,
-        pool,
-        ["value"],
-        ["d1"],
-        append_at_least_once_by_dest={"some-other-dest": True},
-    )
-
-    seen: dict[str, bool] = {}
-
-    def fake_apply(pool, dest, batch, key_columns, append_at_least_once=False):
-        seen[dest] = append_at_least_once
-        return batch.num_rows
-
-    with patch("viaduck.delivery.apply_full_cdc", side_effect=fake_apply):
-        mgr.buffer("d1", _table(2), 5)
-        mgr.maybe_flush()
-        assert mgr.wait_idle()
-
-    assert seen == {"d1": False}
+    with pytest.raises(ConfigError, match="must be 'full_cdc' or 'append_only'"):
+        DeliveryManager(cfg, sm, pool, [], ["d1"], mode="weird")
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +461,7 @@ def test_on_flush_success_fires_for_data_not_for_idle_persists():
     hits = []
     cfg = DeliveryConfig(workers=1, flush_interval_seconds=0.0)
     sm = _state_mgr({"d1": 0})
-    mgr = DeliveryManager(cfg, sm, MagicMock(), [], ["d1"], on_flush_success=lambda: hits.append(1))
+    mgr = DeliveryManager(cfg, sm, MagicMock(), [], ["d1"], mode="append_only", on_flush_success=lambda: hits.append(1))
 
     # Idle position-only persist: no success signal.
     mgr.advance_position("d1", 3)

@@ -99,7 +99,9 @@ def _read_dest(pool: DestinationPool, dest_id: str) -> pa.Table:
 def test_buffered_flush_end_to_end(tmp_path, state):
     pool = _make_pool(tmp_path, ["d1"])
     state.initialize_destinations(["d1"])
-    mgr = DeliveryManager(DeliveryConfig(workers=2, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=2, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"], mode="full_cdc"
+    )
 
     # Two buffered reads over adjacent ranges, flushed as one batch.
     mgr.buffer("d1", _cdc_batch("acme", [1, 2]), through_snapshot=7)
@@ -124,7 +126,9 @@ def test_cross_read_conflict_resolution_at_flush(tmp_path, state):
     the row never appears in the destination."""
     pool = _make_pool(tmp_path, ["d1"])
     state.initialize_destinations(["d1"])
-    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"], mode="full_cdc"
+    )
 
     mgr.buffer("d1", _cdc_batch("acme", [1, 2], "insert"), through_snapshot=7)
     mgr.buffer("d1", _cdc_batch("acme", [2], "delete"), through_snapshot=8)
@@ -141,7 +145,9 @@ def test_flush_failure_leaves_cursor_and_recovers(tmp_path, state):
     pool = _make_pool(tmp_path, ["d-bad"], broken={"d-bad"})
     state.initialize_destinations(["d-bad"])
     state.advance_cursor("d-bad", snapshot_id=3)
-    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d-bad"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d-bad"], mode="full_cdc"
+    )
 
     mgr.buffer("d-bad", _cdc_batch("acme", [1]), through_snapshot=7)
     mgr.maybe_flush()
@@ -160,7 +166,9 @@ def test_concurrent_multi_destination_flushes(tmp_path, state):
     dest_ids = [f"d{i}" for i in range(6)]
     pool = _make_pool(tmp_path, dest_ids)
     state.initialize_destinations(dest_ids)
-    mgr = DeliveryManager(DeliveryConfig(workers=4, flush_interval_seconds=0.0), state, pool, ["event_id"], dest_ids)
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=4, flush_interval_seconds=0.0), state, pool, ["event_id"], dest_ids, mode="full_cdc"
+    )
 
     for i, d in enumerate(dest_ids):
         mgr.buffer(d, _cdc_batch(d, list(range(1, 4 + i))), through_snapshot=5)
@@ -180,7 +188,9 @@ def test_drain_flushes_buffered_data_on_shutdown(tmp_path, state):
     pool = _make_pool(tmp_path, ["d1"])
     state.initialize_destinations(["d1"])
     # Hour-long interval: nothing would flush without the shutdown trigger.
-    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=3600.0), state, pool, ["event_id"], ["d1"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=1, flush_interval_seconds=3600.0), state, pool, ["event_id"], ["d1"], mode="full_cdc"
+    )
 
     mgr.buffer("d1", _cdc_batch("acme", [1, 2]), through_snapshot=4)
     mgr.drain(timeout_s=60)
@@ -196,7 +206,9 @@ def test_multi_update_window_no_duplicate_keys(tmp_path, state):
     not duplicate rows from a duplicate-join-key upsert."""
     pool = _make_pool(tmp_path, ["d1"])
     state.initialize_destinations(["d1"])
-    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"], mode="full_cdc"
+    )
 
     insert = _cdc_batch("acme", [1])
     update1 = pa.table(
@@ -236,7 +248,9 @@ def test_phantom_heal_after_commit_cursor_gap(tmp_path, state):
 
     pool = _make_pool(tmp_path, ["d1"])
     state.initialize_destinations(["d1"])
-    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"], mode="full_cdc"
+    )
 
     # Normal flush through snapshot 7: row 1 delivered, cursor = 7.
     mgr.buffer("d1", _cdc_batch("acme", [1]), through_snapshot=7)
@@ -289,7 +303,9 @@ def test_phantom_heal_with_key_reuse_in_replay(tmp_path, state):
 
     pool = _make_pool(tmp_path, ["d1"])
     state.initialize_destinations(["d1"])
-    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"], mode="full_cdc"
+    )
 
     crashed = pa.table(
         {
@@ -328,7 +344,9 @@ def test_applied_counters_accumulate_by_change_type(tmp_path, state):
     and cumulative buffered rows accumulate on successful flushes."""
     pool = _make_pool(tmp_path, ["d1"])
     state.initialize_destinations(["d1"])
-    mgr = DeliveryManager(DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d1"], mode="full_cdc"
+    )
 
     mgr.buffer("d1", _cdc_batch("acme", [1, 2]), through_snapshot=7)  # 2 inserts
     mgr.buffer("d1", _cdc_batch("acme", [2], "delete"), through_snapshot=8)  # 1 delete

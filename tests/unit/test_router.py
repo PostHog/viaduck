@@ -11,7 +11,7 @@ from viaduck.router import Router, RoutingError
 
 @pytest.fixture()
 def router() -> Router:
-    return Router(RoutingConfig(field="company"))
+    return Router(RoutingConfig(field="company", mode="append_only"))
 
 
 @pytest.fixture()
@@ -65,7 +65,7 @@ def test_split_string_preserves_columns(router: Router, sample_table: pa.Table):
 
 
 def test_split_integer_basic(int_table: pa.Table):
-    router = Router(RoutingConfig(field="team_id"))
+    router = Router(RoutingConfig(field="team_id", mode="append_only"))
     routed, unrouted = router.split_and_count(int_table, ["123", "456"])
     assert routed["123"].num_rows == 2
     assert routed["456"].num_rows == 2
@@ -74,7 +74,7 @@ def test_split_integer_basic(int_table: pa.Table):
 
 def test_split_integer_auto_detects_type(int_table: pa.Table):
     """Router should auto-detect integer column and cast routing values."""
-    router = Router(RoutingConfig(field="team_id"))
+    router = Router(RoutingConfig(field="team_id", mode="append_only"))
     routed, _ = router.split_and_count(int_table, ["123"])
     assert routed["123"].num_rows == 2
 
@@ -167,7 +167,7 @@ def test_split_all_routed(router: Router, sample_table: pa.Table):
 
 def test_split_invalid_integer_routing_value(int_table: pa.Table):
     """Non-numeric routing value for integer column should raise RoutingError."""
-    router = Router(RoutingConfig(field="team_id"))
+    router = Router(RoutingConfig(field="team_id", mode="append_only"))
     with pytest.raises(RoutingError, match="Cannot convert"):
         router.split_and_count(int_table, ["not_a_number"])
 
@@ -175,7 +175,7 @@ def test_split_invalid_integer_routing_value(int_table: pa.Table):
 def test_split_invalid_float_routing_value():
     """Non-numeric routing value for float column should raise RoutingError."""
     table = pa.table({"score": pa.array([1.5, 2.5], type=pa.float64())})
-    router = Router(RoutingConfig(field="score"))
+    router = Router(RoutingConfig(field="score", mode="append_only"))
     with pytest.raises(RoutingError, match="Cannot convert"):
         router.split_and_count(table, ["not_a_float"])
 
@@ -190,7 +190,7 @@ def test_split_float_column():
             "value": [1, 2, 3, 4],
         }
     )
-    router = Router(RoutingConfig(field="score"))
+    router = Router(RoutingConfig(field="score", mode="append_only"))
     routed, unrouted = router.split_and_count(table, ["0.5", "1.5"])
     assert routed["0.5"].num_rows == 2
     assert routed["1.5"].num_rows == 1

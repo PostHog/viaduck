@@ -249,7 +249,7 @@ def test_resolve_conflicts_equivalence(seed):
 def test_split_and_count_equivalence(seed, with_nulls):
     rng = random.Random(seed + 2000)
     batch = _random_batch(rng, 200, with_mutations=True, with_nulls=with_nulls)
-    router = Router(RoutingConfig(field="company", key_columns=["val"], seed_mode="scan"))
+    router = Router(RoutingConfig(field="company", mode="full_cdc", key_columns=["val"], seed_mode="scan"))
     actual_routed, actual_unrouted = router.split_and_count(batch, ROUTING_VALUES)
     expected_routed, expected_unrouted = _oracle_split_and_count(router, batch, ROUTING_VALUES)
     assert actual_unrouted == expected_unrouted
@@ -369,7 +369,7 @@ def test_mutation_direction_null_asymmetry():
 )
 def test_split_and_count_typed_columns_equivalence(column, values):
     table = pa.table({"company": column, "v": pa.array(range(len(column)), type=pa.int64())})
-    router = Router(RoutingConfig(field="company", key_columns=[], seed_mode="scan"))
+    router = Router(RoutingConfig(field="company", mode="append_only", key_columns=[], seed_mode="scan"))
     actual_routed, actual_unrouted = router.split_and_count(table, values)
     expected_routed, expected_unrouted = _oracle_split_and_count(router, table, values)
     assert actual_unrouted == expected_unrouted
@@ -385,7 +385,7 @@ def test_split_and_count_rejects_converted_value_collision():
     from viaduck.router import RoutingError as RErr
 
     table = pa.table({"company": pa.array([1, 2], type=pa.int64())})
-    router = Router(RoutingConfig(field="company", key_columns=[], seed_mode="scan"))
+    router = Router(RoutingConfig(field="company", mode="append_only", key_columns=[], seed_mode="scan"))
     with pytest.raises(RErr, match="collide"):
         router.split_and_count(table, ["1", "01"])
 

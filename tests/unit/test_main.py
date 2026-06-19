@@ -13,6 +13,7 @@ from viaduck.apply import (
     _build_delete_filter,
     _resolve_conflicts,
     _write_with_retry,
+    append_only,
 )
 from viaduck.main import (
     _derive_dest_status,
@@ -196,7 +197,7 @@ def test_poll_cycle_no_snapshots():
     cfg = _make_cfg([])
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=None):
-        _poll_cycle(MagicMock(), delivery, MagicMock(), router, cfg, [], {}, key_columns=[], full_cdc=False)
+        _poll_cycle(MagicMock(), delivery, MagicMock(), router, cfg, [], {}, key_columns=[], mode="append_only")
 
     delivery.read_plan.assert_not_called()
     delivery.maybe_flush.assert_called_once()
@@ -218,7 +219,7 @@ def test_poll_cycle_all_caught_up():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     router.build_filter_expr.assert_not_called()
@@ -249,7 +250,7 @@ def test_poll_cycle_routes_and_buffers():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
@@ -277,7 +278,7 @@ def test_poll_cycle_empty_changeset_advances_positions():
             ["dest-1", "dest-2"],
             {"a": "dest-1", "b": "dest-2"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     assert delivery.advance_position.call_count == 2
@@ -309,7 +310,7 @@ def test_poll_cycle_routing_error_breaks_gracefully():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     delivery.buffer.assert_not_called()
@@ -346,7 +347,7 @@ def test_poll_cycle_chunks_large_range():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     assert read_calls == [(0, 5), (5, 10)], f"expected two chunk reads, got {read_calls}"
@@ -390,7 +391,7 @@ def test_poll_cycle_chunk_end_not_current_id():
             ["dest-1", "dest-2"],
             {"a": "dest-1", "b": "dest-2"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     # First chunk (0→3): dest-1 buffered at 3, dest-2 advanced to 3
@@ -424,7 +425,7 @@ def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     # cursor advanced to each chunk_end incrementally, not directly to 10
@@ -457,7 +458,7 @@ def test_poll_cycle_advances_no_data_destinations():
             ["dest-1", "dest-2"],
             {"a": "dest-1", "b": "dest-2"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
@@ -483,7 +484,7 @@ def test_poll_cycle_pauses_reads_at_watermark():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     delivery.read_plan.assert_not_called()
@@ -516,7 +517,7 @@ def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     # chunk 0→5 completed: cursor advanced and flushed
@@ -541,7 +542,7 @@ def test_poll_cycle_snapshot_at_zero():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     router.build_filter_expr.assert_not_called()
@@ -1054,7 +1055,7 @@ def test_apply_changes_empty():
     catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
     batch = _cdc_table([])
     counts = _apply_changes(catalog, dest_table, batch, ["company"])
-    assert counts == {"deleted": 0, "upserted": 0, "upsert_matched": 0, "used_append": False}
+    assert counts == {"deleted": 0, "upserted": 0, "upsert_matched": 0}
     catalog.begin_transaction.assert_not_called()
 
 
@@ -1102,336 +1103,66 @@ def test_apply_changes_strips_metadata():
 
 
 # ---------------------------------------------------------------------------
-# _apply_changes: append_at_least_once fast path
+# append_only: boundary check for accidentally-routed CDC batches
 # ---------------------------------------------------------------------------
 
 
-def test_apply_changes_aalo_flag_off_uses_upsert_on_pure_insert_batch():
-    """Default (flag off): pure-insert batch still goes through tbl.upsert(),
-    proving the fast path is opt-in."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
-        ]
-    )
-    counts = _apply_changes(catalog, dest_table, batch, ["value"])
-    txn_table.upsert.assert_called_once()
-    txn_table.append.assert_not_called()
-    assert counts["upserted"] == 2
-
-
-def test_apply_changes_aalo_flag_on_pure_insert_uses_append():
-    """Flag on + every row is an insert: tbl.append() instead of tbl.upsert().
-    Validates the (a) branch of the fast-path decision.
-
-    Also asserts append is called with no kwargs — a future refactor that
-    accidentally passes join_cols= to append() would silently work in tests
-    that only check assert_called_once(). Locking the call shape catches it."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
-        ]
-    )
-    counts = _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
-    txn_table.append.assert_called_once()
-    assert txn_table.append.call_args.kwargs == {}, "append must NOT receive join_cols= or other kwargs"
-    assert len(txn_table.append.call_args.args) == 1, "append takes the Arrow table positionally; nothing else"
-    txn_table.upsert.assert_not_called()
-    txn_table.delete.assert_not_called()
-    # No "matched" concept on append — the counter source stays 0 so the
-    # dest_upsert_matched_total gauge in apply_full_cdc never gets incremented.
-    assert counts == {"deleted": 0, "upserted": 2, "upsert_matched": 0, "used_append": True}
-
-
-def test_apply_changes_aalo_flag_on_with_delete_falls_back_to_upsert():
-    """Flag on + any delete row: must NOT use append (append can't delete).
-    Verifies the per-batch safety net rejects mixed batches even when the
-    upsert candidates within them are pure inserts."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "delete", "snapshot_id": 1, "rowid": 100},
-            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
-        ]
-    )
-    counts = _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
-    txn_table.delete.assert_called_once()
-    txn_table.upsert.assert_called_once()
-    txn_table.append.assert_not_called()
-    assert counts["deleted"] == 1
-    assert counts["upserted"] == 1
-
-
-def test_apply_changes_aalo_flag_on_with_update_postimage_falls_back_to_upsert():
-    """Flag on + any update_postimage row: must NOT use append. Updates need
-    MERGE-WHEN-MATCHED to overwrite the existing row; append would create
-    a duplicate at the key. This is the future-proofing case — a schema
-    change that introduces an update_postimage path must NOT silently
-    corrupt the destination."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-            {"company": "acme", "value": 2, "change_type": "update_postimage", "snapshot_id": 1, "rowid": 200},
-        ]
-    )
-    counts = _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
-    txn_table.upsert.assert_called_once()
-    txn_table.append.assert_not_called()
-    assert counts["upserted"] == 2
-
-
-def test_apply_changes_aalo_flag_on_within_batch_dupe_keys_still_deduped():
-    """Within-batch duplicate keys (same key, multiple snapshot IDs) must be
-    collapsed to last-write-wins even on the append path; otherwise the
-    flag promotes "duplicates only on retry" to "duplicates within a single
-    apply", which is a stronger break than the contract advertises."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 2, "rowid": 100},
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 3, "rowid": 100},
-        ]
-    )
-    counts = _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
-    txn_table.append.assert_called_once()
-    written_table = txn_table.append.call_args[0][0]
-    assert written_table.num_rows == 1  # 3 candidates collapsed to 1 winner
-    assert counts["upserted"] == 1
-
-
-def test_apply_changes_aalo_flag_on_empty_batch_is_noop():
-    """Empty batch + flag on: still a no-op (no transaction opened)."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    batch = _cdc_table([])
-    counts = _apply_changes(catalog, dest_table, batch, ["company"], append_at_least_once=True)
-    assert counts == {"deleted": 0, "upserted": 0, "upsert_matched": 0, "used_append": False}
-    catalog.begin_transaction.assert_not_called()
-
-
-def test_apply_changes_aalo_flag_on_uses_transaction():
-    """Even on the fast path the write goes through begin_transaction —
-    a future caller that adds more work inside the txn must stay atomic."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-        ]
-    )
-    _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
-    catalog.begin_transaction.assert_called_once()
-
-
-def test_apply_changes_aalo_flag_on_append_raises_propagates():
-    """Symmetric to test_apply_changes_transaction_rollback_on_failure (upsert
-    path): if tbl.append() raises inside the transaction context, the
-    exception propagates so the context manager can roll back. Defends
-    against a future change that wraps the append in try/except (silently
-    swallowing failures and leaving the destination in inconsistent state
-    relative to the cursor)."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    txn_table.append.side_effect = Exception("append write error")
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-        ]
-    )
-    with pytest.raises(Exception, match="append write error"):
-        _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
-    txn_table.upsert.assert_not_called()
-
-
-def test_apply_changes_aalo_flag_on_strips_metadata():
-    """change_type, snapshot_id, rowid stripped from the append payload too."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-        ]
-    )
-    _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
-    written_table = txn_table.append.call_args[0][0]
-    assert "change_type" not in written_table.column_names
-    assert "snapshot_id" not in written_table.column_names
-    assert "rowid" not in written_table.column_names
-    assert "company" in written_table.column_names
-    assert "value" in written_table.column_names
-
-
-def test_is_pure_insert_batch_pure_insert_true():
-    """Helper: all inserts → True."""
-    from viaduck.apply import _is_pure_insert_batch
-
-    batch = _cdc_table(
-        [
-            {"company": "a", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 1},
-            {"company": "a", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 2},
-        ]
-    )
-    assert _is_pure_insert_batch(batch) is True
-
-
-def test_is_pure_insert_batch_with_delete_false():
-    from viaduck.apply import _is_pure_insert_batch
-
-    batch = _cdc_table(
-        [
-            {"company": "a", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 1},
-            {"company": "a", "value": 2, "change_type": "delete", "snapshot_id": 1, "rowid": 2},
-        ]
-    )
-    assert _is_pure_insert_batch(batch) is False
-
-
-def test_is_pure_insert_batch_with_update_postimage_false():
-    from viaduck.apply import _is_pure_insert_batch
-
-    batch = _cdc_table(
-        [
-            {"company": "a", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 1},
-            {"company": "a", "value": 2, "change_type": "update_postimage", "snapshot_id": 1, "rowid": 2},
-        ]
-    )
-    assert _is_pure_insert_batch(batch) is False
-
-
-def test_is_pure_insert_batch_empty_false():
-    """Empty batch is not "pure insert" — there's nothing to insert. Returning
-    True here would push an empty batch into the fast path, which is harmless
-    today but couples the helper's meaning to a downstream branch's tolerance
-    of empty input."""
-    from viaduck.apply import _is_pure_insert_batch
-
-    batch = _cdc_table([])
-    assert _is_pure_insert_batch(batch) is False
-
-
-def test_is_pure_insert_batch_with_null_change_type_false():
-    """Null change_type must force False — defends against a regression of the
-    null-aware gate. With pc.all's default skip_nulls=True, a batch like
-    [insert, NULL, insert] silently returns True; the null-typed row would
-    then be dropped by tbl.append's column projection without any operator-
-    visible signal. The gate must trip the safety net into upsert fallback."""
-    from viaduck.apply import _is_pure_insert_batch
-
+def test_append_only_accepts_insert_only_batch():
+    """The expected source.read_cdc shape (ducklake_table_insertions output)
+    has no `change_type` column — those rows flow straight through to
+    tbl.append(). Sanity-check that the defensive guard doesn't reject the
+    happy path."""
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
     batch = pa.table(
         {
-            "company": ["a", "a", "a"],
-            "value": [1, 2, 3],
-            "change_type": pa.array(["insert", None, "insert"]),
-            "snapshot_id": [1, 1, 1],
-            "rowid": [1, 2, 3],
+            "company": ["acme"],
+            "value": [1],
+            # NOTE: snapshot_id/rowid are present (read_cdc returns them) but
+            # `change_type` is NOT — that's the insert-only contract from
+            # ducklake_table_insertions.
+            "snapshot_id": [1],
+            "rowid": [100],
         }
     )
-    assert _is_pure_insert_batch(batch) is False
+    written = append_only(pool, "dest-1", batch)
+    assert written == 1
 
 
-def test_is_pure_insert_batch_all_null_change_type_false():
-    """A batch where every change_type is NULL is degenerate but must still
-    return False — refusing to fast-path is the safe choice (the upsert
-    path would also drop these rows, but at least it doesn't claim "every
-    row is an insert")."""
-    from viaduck.apply import _is_pure_insert_batch
-
+def test_append_only_rejects_batch_with_change_type_column():
+    """If a future viaduck change accidentally routes a ducklake_table_changes
+    batch (which carries `change_type`) into the append path, the destination
+    would silently land deletes and update_postimages as plain inserts. The
+    boundary guard catches this and refuses to write."""
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
     batch = pa.table(
         {
-            "company": ["a", "a"],
+            "company": ["acme", "acme"],
             "value": [1, 2],
-            "change_type": pa.array([None, None], type=pa.string()),
+            "change_type": ["insert", "delete"],
             "snapshot_id": [1, 1],
-            "rowid": [1, 2],
+            "rowid": [100, 200],
         }
     )
-    assert _is_pure_insert_batch(batch) is False
+    with pytest.raises(RuntimeError, match="change_type"):
+        append_only(pool, "dest-1", batch)
 
 
-def test_apply_changes_aalo_flag_on_with_null_change_type_falls_back_to_upsert():
-    """End-to-end: flag on + a null change_type row in the batch must NOT
-    take the append path. The null row gets dropped by upsert_mask too, but
-    the remaining inserts must land via tbl.upsert (idempotent on retry),
-    not tbl.append (duplicates on retry)."""
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
+def test_append_only_empty_batch_is_noop_even_with_change_type():
+    """The fast no-op exit for empty batches runs BEFORE the boundary check.
+    An empty batch with a `change_type` column (degenerate but possible from
+    a filter that masked everything) is still a no-op rather than a noisy
+    error — nothing to misclassify, nothing to write."""
+    pool = MagicMock()
     batch = pa.table(
         {
-            "company": ["a", "a"],
-            "value": [1, 2],
-            "change_type": pa.array(["insert", None], type=pa.string()),
-            "snapshot_id": pa.array([1, 1], type=pa.int64()),
-            "rowid": pa.array([1, 2], type=pa.int64()),
+            "company": pa.array([], type=pa.string()),
+            "change_type": pa.array([], type=pa.string()),
         }
     )
-    _apply_changes(catalog, dest_table, batch, ["value"], append_at_least_once=True)
-    txn_table.upsert.assert_called_once()
-    txn_table.append.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# apply_full_cdc: metric increments on the fast path
-# ---------------------------------------------------------------------------
-
-
-def test_apply_full_cdc_fast_path_increments_fast_path_counter():
-    """When apply_full_cdc takes the fast path, the per-batch counter
-    increments and the upsert-matched counter does NOT (the latter is silent
-    by design). Asserts the documented metric implication directly so a
-    refactor that silently disables either signal fails loudly."""
-    from unittest.mock import patch
-
-    from viaduck.apply import apply_full_cdc
-
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    pool = MagicMock()
-    pool.get.return_value = (catalog, dest_table)
-
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-            {"company": "acme", "value": 2, "change_type": "insert", "snapshot_id": 1, "rowid": 200},
-        ]
-    )
-
-    with (
-        patch("viaduck.apply.metrics.dest_apply_fast_path_batches_total") as fast_path_counter,
-        patch("viaduck.apply.metrics.dest_upsert_matched_total") as matched_counter,
-        patch("viaduck.apply.metrics.dest_rows_upserted_total") as upserted_counter,
-    ):
-        ops = apply_full_cdc(pool, "team-2", batch, ["value"], append_at_least_once=True)
-
-    assert ops == 2
-    fast_path_counter.labels.assert_called_once_with(destination="team-2")
-    fast_path_counter.labels.return_value.inc.assert_called_once_with()
-    matched_counter.labels.assert_not_called()  # silent on fast path
-    upserted_counter.labels.assert_called_once_with(destination="team-2")
-    upserted_counter.labels.return_value.inc.assert_called_once_with(2)
-
-
-def test_apply_full_cdc_upsert_path_does_not_increment_fast_path_counter():
-    """Counterpoint: flag off (default) → fast-path counter stays silent
-    even on a pure-insert batch. Defends against an accidental
-    inc() in the upsert branch."""
-    from unittest.mock import patch
-
-    from viaduck.apply import apply_full_cdc
-
-    catalog, dest_table, txn, txn_table = _mock_catalog_and_table()
-    pool = MagicMock()
-    pool.get.return_value = (catalog, dest_table)
-
-    batch = _cdc_table(
-        [
-            {"company": "acme", "value": 1, "change_type": "insert", "snapshot_id": 1, "rowid": 100},
-        ]
-    )
-
-    with patch("viaduck.apply.metrics.dest_apply_fast_path_batches_total") as fast_path_counter:
-        apply_full_cdc(pool, "team-2", batch, ["value"])
-
-    fast_path_counter.labels.assert_not_called()
+    assert append_only(pool, "dest-1", batch) == 0
+    pool.get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1439,14 +1170,20 @@ def test_apply_full_cdc_upsert_path_does_not_increment_fast_path_counter():
 # ---------------------------------------------------------------------------
 
 
-def _make_real_delivery(state_mgr, dest_pool, key_columns, assigned_ids):
+def _make_real_delivery(state_mgr, dest_pool, key_columns, assigned_ids, *, mode):
     """Real DeliveryManager in flush-every-cycle mode so end-to-end poll
-    tests keep their write coverage. wait_idle() joins the single worker."""
+    tests keep their write coverage. wait_idle() joins the single worker.
+
+    mode is keyword-only and required — the helper deliberately does NOT
+    derive it from key_columns presence (that was the silent-misconfig
+    hazard this PR removes from production; allowing it back in via a test
+    helper would let a future "test the validation matrix" use case sneak
+    through inverted)."""
     from viaduck.config import DeliveryConfig
     from viaduck.delivery import DeliveryManager
 
     dcfg = DeliveryConfig(workers=1, flush_interval_seconds=0.0)
-    return DeliveryManager(dcfg, state_mgr, dest_pool, key_columns, assigned_ids)
+    return DeliveryManager(dcfg, state_mgr, dest_pool, key_columns, assigned_ids, mode=mode)
 
 
 def _txn_catalog():
@@ -1498,7 +1235,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
     mock_dest_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
-    delivery = _make_real_delivery(state_mgr, dest_pool, ["value"], ["dest-1"])
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["value"], ["dest-1"], mode="full_cdc")
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
@@ -1512,7 +1249,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=["value"],
-            full_cdc=True,
+            mode="full_cdc",
         )
     assert delivery.wait_idle()
 
@@ -1536,7 +1273,7 @@ def test_poll_cycle_append_only_unchanged():
     mock_dest_table = MagicMock()
     dest_pool.get.return_value = (MagicMock(), mock_dest_table)
 
-    delivery = _make_real_delivery(state_mgr, dest_pool, [], ["dest-1"])
+    delivery = _make_real_delivery(state_mgr, dest_pool, [], ["dest-1"], mode="append_only")
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data) as mock_read_cdc,
@@ -1551,7 +1288,7 @@ def test_poll_cycle_append_only_unchanged():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
     assert delivery.wait_idle()
 
@@ -1585,7 +1322,7 @@ def test_poll_cycle_cdc_delete_only_changeset():
     mock_dest_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
-    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"])
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"], mode="full_cdc")
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
@@ -1599,7 +1336,7 @@ def test_poll_cycle_cdc_delete_only_changeset():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=["company"],
-            full_cdc=True,
+            mode="full_cdc",
         )
     assert delivery.wait_idle()
 
@@ -1634,7 +1371,7 @@ def test_poll_cycle_cdc_write_failure_isolation():
     mock_dest_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
-    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"])
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"], mode="full_cdc")
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
@@ -1649,7 +1386,7 @@ def test_poll_cycle_cdc_write_failure_isolation():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=["company"],
-            full_cdc=True,
+            mode="full_cdc",
         )
     assert delivery.wait_idle()
 
@@ -1698,7 +1435,7 @@ def test_poll_cycle_cdc_routing_value_mutation():
     mock_dest_table.scan.return_value.count.return_value = 0  # empty dest: no truncate
     dest_pool.get.return_value = (mock_catalog, mock_dest_table)
 
-    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1", "dest-2"])
+    delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1", "dest-2"], mode="full_cdc")
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=raw_data),
@@ -1712,7 +1449,7 @@ def test_poll_cycle_cdc_routing_value_mutation():
             ["dest-1", "dest-2"],
             {"quacksworth": "dest-1", "mallardine": "dest-2"},
             key_columns=["company"],
-            full_cdc=True,
+            mode="full_cdc",
         )
     assert delivery.wait_idle()
 
@@ -1745,7 +1482,7 @@ def test_poll_cycle_branches_on_key_columns():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
         mock_read_cdc.assert_called_once()
         mock_read_changes.assert_not_called()
@@ -1771,7 +1508,7 @@ def test_poll_cycle_branches_on_key_columns():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=["company"],
-            full_cdc=True,
+            mode="full_cdc",
         )
         mock_read_changes2.assert_called_once()
         mock_read_cdc2.assert_not_called()
@@ -2007,7 +1744,7 @@ def test_cdc_batch_rows_metric_observed():
             ["dest-1"],
             {"quacksworth": "dest-1"},
             key_columns=[],
-            full_cdc=False,
+            mode="append_only",
         )
 
     mock_batch_metric.observe.assert_called_once_with(3)

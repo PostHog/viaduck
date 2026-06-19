@@ -702,7 +702,7 @@ def run(cfg: config.ViaduckConfig) -> None:
         _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids)
 
     key_columns = cfg.routing.key_columns
-    full_cdc = len(key_columns) > 0
+    mode = cfg.routing.mode
 
     # Buffered delivery: per-destination buffers + flush worker pool
     # (constructed AFTER seeding so positions initialize from the
@@ -714,8 +714,8 @@ def run(cfg: config.ViaduckConfig) -> None:
         dest_pool,
         key_columns,
         assigned_ids,
+        mode=mode,
         on_flush_success=health.record_replication,
-        append_at_least_once_by_dest={d.id: d.append_at_least_once for d in cfg.destinations},
     )
 
     log.info(
@@ -723,7 +723,7 @@ def run(cfg: config.ViaduckConfig) -> None:
         cfg.source.name,
         cfg.source.table,
         cfg.routing.field,
-        "full_cdc" if full_cdc else "append_only",
+        mode,
         len(assigned_ids),
         cfg.instance.id,
     )
@@ -740,7 +740,7 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     while not shutdown:
         try:
-            _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, full_cdc)
+            _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, mode)
         except Exception:
             log.exception("Fatal error in poll cycle")
             break
@@ -769,7 +769,11 @@ def run(cfg: config.ViaduckConfig) -> None:
     log.info("Shutdown complete")
 
 
-def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, full_cdc):
+def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, mode):
+    # Local boolean so the existing branch sites stay terse. Threading mode
+    # (not full_cdc) through the call signature avoids reconstructing the
+    # original config value from a derived bool later (status payload).
+    full_cdc = mode == "full_cdc"
     """One poll cycle: read CDC from each position group into buffers,
     advance in-memory positions, evaluate flush triggers.
 
@@ -948,7 +952,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
     status.update(
         source_table=f"{cfg.source.name}.{cfg.source.table}",
         source_snapshot=snap_now,
-        mode="full_cdc" if full_cdc else "append_only",
+        mode=mode,
         poll_interval=cfg.poll.interval_seconds,
         flush_interval=cfg.delivery.flush_interval_seconds,
         delivery_config={

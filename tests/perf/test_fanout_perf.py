@@ -133,7 +133,7 @@ def _make_conflict_batch(num_rows: int, conflict_pct: float = 0.05) -> pa.Table:
 @pytest.mark.perf
 def test_router_split_100_destinations(perf_timer):
     """10K rows, 100 routing values."""
-    cfg = RoutingConfig(field="company")
+    cfg = RoutingConfig(field="company", mode="append_only")
     router = Router(cfg)
     table = _make_routing_table(10_000, 100)
     routing_values = [f"dest_{i}" for i in range(100)]
@@ -149,7 +149,7 @@ def test_router_split_100_destinations(perf_timer):
 @pytest.mark.perf
 def test_router_split_1000_destinations(perf_timer):
     """100K rows, 1000 routing values."""
-    cfg = RoutingConfig(field="company")
+    cfg = RoutingConfig(field="company", mode="append_only")
     router = Router(cfg)
     table = _make_routing_table(100_000, 1000)
     routing_values = [f"dest_{i}" for i in range(1000)]
@@ -165,7 +165,7 @@ def test_router_split_1000_destinations(perf_timer):
 @pytest.mark.perf
 def test_router_split_1m_rows_10k_destinations(perf_timer):
     """1M rows, 10K routing values (production scale)."""
-    cfg = RoutingConfig(field="company")
+    cfg = RoutingConfig(field="company", mode="append_only")
     router = Router(cfg)
     table = _make_routing_table(1_000_000, 10_000)
     routing_values = [f"dest_{i}" for i in range(10_000)]
@@ -375,6 +375,7 @@ def test_delivery_fanout(perf_timer, tmp_path, n_dests):
         pool,
         ["event_id"],
         dest_ids,
+        mode="full_cdc",
     )
 
     for d in dest_ids:
