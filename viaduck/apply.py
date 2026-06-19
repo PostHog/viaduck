@@ -368,15 +368,32 @@ def append_only(dest_pool, dest_id: str, batch: pa.Table) -> int:
     """Append-only mode (mode=append_only): one tbl.append() per flush.
 
     Precondition: the operator declared the source insert-only via
-    `routing.mode=append_only`. There is no per-batch defensive check —
-    if the source CDC stream ever emits deletes or update_postimages,
-    those rows land in the destination as plain inserts (silent
-    misclassification). The explicit-mode model trusts the operator's
-    source-shape declaration; misconfiguration belongs at the
-    `routing.mode` config layer, not in this hot path.
+    `routing.mode=append_only`. The batch is expected to come from
+    `source.read_cdc` (which calls `ducklake_table_insertions`) and is
+    therefore structurally insert-only — `ducklake_table_insertions` does
+    NOT synthesize a `change_type` column, so the boundary check below
+    treats the presence of that column as proof that the batch came from
+    `read_cdc_changes` / `ducklake_table_changes` instead (a viaduck
+    routing bug that would otherwise silently misclassify deletes and
+    update_postimages as inserts in the destination).
+
+    The check is cheap (O(1) — just a column-name lookup) and runs once
+    per flush. It does NOT catch the case where DuckLake's
+    `ducklake_table_insertions` macro itself starts returning a
+    `change_type` column — that's a contract change we'd want to know
+    about anyway.
     """
     if batch.num_rows == 0:
         return 0
+    if "change_type" in batch.column_names:
+        raise RuntimeError(
+            f"append_only got a batch with a 'change_type' column for destination {dest_id!r}; "
+            "this batch came from ducklake_table_changes (CDC stream including deletes / update_*) "
+            "rather than ducklake_table_insertions. mode=append_only assumes the source-read path "
+            "is insert-only — either the dispatch in _poll_cycle is routing the wrong batch into "
+            "append_only(), or DuckLake's table_insertions contract changed. Refusing to write "
+            "potentially-misclassified rows."
+        )
     _write_with_retry(dest_pool, dest_id, lambda cat, tbl, b=batch: tbl.append(b))
     metrics.dest_rows_written_total.labels(destination=dest_id).inc(batch.num_rows)
     return batch.num_rows

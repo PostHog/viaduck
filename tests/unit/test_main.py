@@ -13,6 +13,7 @@ from viaduck.apply import (
     _build_delete_filter,
     _resolve_conflicts,
     _write_with_retry,
+    append_only,
 )
 from viaduck.main import (
     _derive_dest_status,
@@ -1099,6 +1100,69 @@ def test_apply_changes_strips_metadata():
     assert "rowid" not in written_table.column_names
     assert "company" in written_table.column_names
     assert "value" in written_table.column_names
+
+
+# ---------------------------------------------------------------------------
+# append_only: boundary check for accidentally-routed CDC batches
+# ---------------------------------------------------------------------------
+
+
+def test_append_only_accepts_insert_only_batch():
+    """The expected source.read_cdc shape (ducklake_table_insertions output)
+    has no `change_type` column — those rows flow straight through to
+    tbl.append(). Sanity-check that the defensive guard doesn't reject the
+    happy path."""
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    batch = pa.table(
+        {
+            "company": ["acme"],
+            "value": [1],
+            # NOTE: snapshot_id/rowid are present (read_cdc returns them) but
+            # `change_type` is NOT — that's the insert-only contract from
+            # ducklake_table_insertions.
+            "snapshot_id": [1],
+            "rowid": [100],
+        }
+    )
+    written = append_only(pool, "dest-1", batch)
+    assert written == 1
+
+
+def test_append_only_rejects_batch_with_change_type_column():
+    """If a future viaduck change accidentally routes a ducklake_table_changes
+    batch (which carries `change_type`) into the append path, the destination
+    would silently land deletes and update_postimages as plain inserts. The
+    boundary guard catches this and refuses to write."""
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    batch = pa.table(
+        {
+            "company": ["acme", "acme"],
+            "value": [1, 2],
+            "change_type": ["insert", "delete"],
+            "snapshot_id": [1, 1],
+            "rowid": [100, 200],
+        }
+    )
+    with pytest.raises(RuntimeError, match="change_type"):
+        append_only(pool, "dest-1", batch)
+
+
+def test_append_only_empty_batch_is_noop_even_with_change_type():
+    """The fast no-op exit for empty batches runs BEFORE the boundary check.
+    An empty batch with a `change_type` column (degenerate but possible from
+    a filter that masked everything) is still a no-op rather than a noisy
+    error — nothing to misclassify, nothing to write."""
+    pool = MagicMock()
+    batch = pa.table(
+        {
+            "company": pa.array([], type=pa.string()),
+            "change_type": pa.array([], type=pa.string()),
+        }
+    )
+    assert append_only(pool, "dest-1", batch) == 0
+    pool.get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
