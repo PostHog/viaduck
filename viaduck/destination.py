@@ -218,6 +218,7 @@ class DestinationPool:
                 properties=with_connection_defaults(dest_cfg.resolved_properties()),
             )
             table = catalog.create_table_if_not_exists(dest_cfg.table, schema)
+            _ensure_partition_spec(table, dest_cfg, destination_id)
             log.info(
                 "Connected to destination %s (catalog=%s, table=%s)", destination_id, dest_cfg.name, dest_cfg.table
             )
@@ -229,3 +230,199 @@ class DestinationPool:
                 except Exception:
                     pass
             raise
+
+
+# SQL metacharacters that should never appear in a pyducklake-returned
+# fully_qualified_name. A presence indicates either pyducklake's quoting
+# contract is broken or operator-controlled config has injected SQL — either
+# way, we refuse to probe rather than interpolate into the SELECT.
+_FQN_FORBIDDEN_CHARS = (";", "--", "/*", "*/", "\n", "\r")
+
+
+def _table_has_data(table: Table) -> bool:
+    """Return True if the destination table has any rows committed.
+
+    Used to gate the populated-table ALTER risk: a fresh, just-created
+    table is always safe to ALTER (no files to mis-align); a table with
+    existing data needs explicit operator opt-in per QE review.
+
+    Uses a `SELECT 1 ... LIMIT 1` probe rather than COUNT(*) so the cost
+    is bounded regardless of table size. Catalog-backend portable — does
+    not depend on inspecting catalog tables directly.
+
+    SQL safety: `fully_qualified_name` is interpolated directly into the
+    probe — pyducklake is expected to return a properly-quoted identifier
+    (its own internal SQL uses the same pattern, see partitioning.py
+    UpdateSpec.commit). We add a defensive SQL-metacharacter check as a
+    sharp-edge guard against either a pyducklake contract change or a
+    misconfigured destination whose `table` field somehow leaks meta-chars.
+    Suspicious fqn → refuse to probe → treat as populated (conservative).
+
+    A failure to probe (network blip, transient ducklake error, permission
+    denied, suspicious fqn) is treated as "has data" — conservative default;
+    if we can't prove the table is empty, refuse to ALTER. The pod will
+    retry on next cold-connect. The log is ERROR (not WARNING) because
+    every call site here is in a context where partition_by is configured,
+    so this directly causes a refusal that the operator needs to act on.
+    """
+    fqn = table.fully_qualified_name
+    if any(c in fqn for c in _FQN_FORBIDDEN_CHARS):
+        log.error(
+            "Refusing to probe table with suspicious fully_qualified_name %r "
+            "(contains SQL meta-character); treating as populated for safety",
+            fqn,
+        )
+        return True
+    try:
+        result = table.catalog.connection.execute(f"SELECT 1 FROM {fqn} LIMIT 1").fetchone()
+    except Exception as e:
+        log.error(
+            "Failed to probe table %s for emptiness; treating as populated for safety. "
+            "Will refuse to ALTER until probe succeeds on next cold-connect. Error: %s",
+            fqn,
+            e,
+        )
+        return True
+    return result is not None
+
+
+def _get_transform_map() -> dict[str, object]:
+    """Thin wrapper around `viaduck.partition_transforms.get_transform_map()`.
+
+    The shared module owns the caching (via `@functools.cache`); we keep
+    this wrapper to localize the import + give a single seam for tests
+    to mock if they ever need to.
+    """
+    from viaduck.partition_transforms import get_transform_map
+
+    return get_transform_map()
+
+
+def _ensure_partition_spec(table: Table, dest_cfg: DestinationConfig, destination_id: str) -> None:
+    """Apply `dest_cfg.partition_by` to `table` if the table is currently
+    unpartitioned.
+
+    Behavior matrix:
+      - config empty + table unpartitioned → no-op
+      - config empty + table partitioned   → no-op (leave existing spec alone)
+      - config set   + table unpartitioned → ALTER TABLE SET PARTITIONED BY (...)
+      - config set   + table partitioned   → compare spec to config:
+          - matches → silent no-op
+          - differs → log WARNING (we don't reconcile; operator decides)
+
+    Concurrency model: N viaduck pods may cold-connect to the same
+    destination simultaneously and all reach this function. We use an
+    optimistic catch-verify pattern rather than an advisory lock:
+
+      1. If the table is unpartitioned, attempt the ALTER.
+      2. On any exception from `commit()`, refresh the table state and
+         check whether a peer pod has applied the spec we wanted. If
+         yes, treat as success (we lost the race, not a failure). If
+         no, re-raise — the ALTER genuinely failed (column missing,
+         RDS down, etc.).
+
+    This works regardless of catalog backend (PG/sqlite/etc.) and doesn't
+    require infrastructure beyond pyducklake's existing connection. The
+    downside is we catch broadly because pyducklake doesn't currently
+    surface a typed conflict exception (`CommitFailedError` is declared
+    but not raised by `UpdateSpec.commit()` in the source).
+    """
+    if not dest_cfg.partition_by:
+        metrics.partition_spec_total.labels(destination=destination_id, outcome="skipped_no_config").inc()
+        return
+
+    transforms = _get_transform_map()
+    expected = tuple((column, transforms[tname]) for tname, column in dest_cfg.partition_by)
+
+    # `spec` and `is_unpartitioned` are @property in pyducklake — NOT methods.
+    # Calling them with () TypeErrors at runtime; MagicMock makes them callable
+    # so unit tests can't catch this. The existing _get_source_schema has the
+    # same landmine documented at the top of this file — keep an eye out.
+    if not table.spec.is_unpartitioned:
+        _verify_or_warn_partition_spec(table, expected, dest_cfg, destination_id)
+        return
+
+    # Populated-table safety gate. ALTER TABLE SET PARTITIONED BY on a
+    # non-empty DuckLake table has not been verified at scale; the failure
+    # mode we want to avoid is the mixed-layout state where existing files
+    # have NULL partition_id and new writes have a valid partition_id, which
+    # reproduces the megaduck compactor breakage from 2026-06-24..28
+    # (line-546 hive-path assertion). Default-deny; operator must opt in
+    # AFTER verifying behavior on a throwaway copy AND coordinating a
+    # destination-compactor pause.
+    if not dest_cfg.partition_by_allow_alter_populated and _table_has_data(table):
+        log.error(
+            "Refusing to ALTER destination %s: table has existing data and "
+            "partition_by_allow_alter_populated is false. Leaving unpartitioned. "
+            "Set the flag to true ONLY after verifying ALTER behavior on a copy "
+            "and pausing the destination compactor.",
+            destination_id,
+        )
+        metrics.partition_spec_total.labels(destination=destination_id, outcome="refused_populated").inc()
+        return
+
+    spec = table.update_spec()
+    for column_name, transform in expected:
+        spec.add_field(column_name, transform)
+    try:
+        spec.commit()
+        log.info(
+            "Applied partition spec to destination %s table: %s",
+            destination_id,
+            dest_cfg.partition_by,
+        )
+        metrics.partition_spec_total.labels(destination=destination_id, outcome="applied").inc()
+        return
+    except Exception as e:
+        # Could be: peer pod won an ALTER race, OR a real failure (missing
+        # column, RDS hiccup, etc.). Re-read to disambiguate.
+        try:
+            table.refresh()
+        except Exception:
+            # Refresh itself failed — definitely a real error path.
+            log.error("ALTER on destination %s failed and refresh also failed: %s", destination_id, e)
+            raise e from None
+        if table.spec.is_unpartitioned:
+            # No peer applied a spec; this was a genuine failure.
+            log.error(
+                "ALTER on destination %s failed and table is still unpartitioned: %s",
+                destination_id,
+                e,
+            )
+            raise
+        log.info(
+            "ALTER on destination %s lost a race to a peer pod; verifying applied spec matches config",
+            destination_id,
+        )
+        metrics.partition_spec_total.labels(destination=destination_id, outcome="applied_by_peer").inc()
+        _verify_or_warn_partition_spec(table, expected, dest_cfg, destination_id)
+
+
+def _verify_or_warn_partition_spec(
+    table: Table,
+    expected: tuple[tuple[str, object], ...],
+    dest_cfg: DestinationConfig,
+    destination_id: str,
+) -> None:
+    """Compare the table's current partition spec against `expected`. Silent
+    if they match, WARNING if they don't (we don't auto-reconcile spec drift;
+    operator decides whether to ALTER manually).
+
+    Called from two paths:
+      1. The table was already partitioned at first observation
+      2. We lost an ALTER race to a peer pod
+    Both paths want the same "matches → ok, differs → operator-visible
+    warning" outcome.
+    """
+    actual = tuple((f.source_column, f.transform) for f in table.spec.fields)
+    if actual == expected:
+        metrics.partition_spec_total.labels(destination=destination_id, outcome="skipped_matches").inc()
+        return
+    log.warning(
+        "Destination %s has partition spec %s but config specifies %s; leaving in place. "
+        "Use ALTER TABLE manually to change.",
+        destination_id,
+        actual,
+        dest_cfg.partition_by,
+    )
+    metrics.partition_spec_total.labels(destination=destination_id, outcome="skipped_diverges").inc()

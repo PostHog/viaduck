@@ -19,10 +19,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+from viaduck.partition_transforms import TRANSFORM_NAMES as _PARTITION_TRANSFORMS
 
 
 class ConfigError(Exception):
@@ -82,6 +85,72 @@ def _require_non_empty(value: str, field_name: str) -> str:
     if not value or not value.strip():
         raise ConfigError(f"{field_name!r} must be a non-empty string")
     return value
+
+
+# Allowed transform names for `partition_by` entries live in
+# viaduck/partition_transforms.py — single source of truth shared with
+# destination.py's apply path (see imports at the top of this module).
+_PARTITION_ENTRY_RE = re.compile(r"^([a-z_][a-z0-9_]*)\(([a-z_][a-z0-9_]*)\)$", re.IGNORECASE)
+_PARTITION_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$", re.IGNORECASE)
+
+
+def _validate_partition_by(value: object, ctx: str) -> tuple[tuple[str, str], ...]:
+    """Validate and parse a `partition_by` config entry into a tuple of
+    `(transform_name, column_name)` pairs.
+
+    Accepts:
+      - A YAML list of strings: `["team_id", "year(_inserted_at)", ...]`
+      - Each entry is either a bare column name (identity transform) or
+        `func(col)` where func ∈ {year, month, day, hour}
+
+    Returns:
+      tuple of (transform_name, column_name) — transform_name is "" for
+      identity. The actual pyducklake.Transform mapping happens at apply
+      time in destination.py so config.py stays free of pyducklake imports.
+
+    Identifier normalization:
+      Column names are lowercase-normalized on parse. This matches
+      DuckDB's case-folding behavior for unquoted identifiers: a column
+      created as `_inserted_at` is stored case-folded; if config says
+      `Year(_Inserted_At)` we normalize to `_inserted_at` so the ALTER
+      doesn't fail because pyducklake quotes the name verbatim (and a
+      quoted `"_Inserted_At"` is a different column than an unquoted
+      `_inserted_at` to DuckDB). Tables created with explicitly quoted
+      mixed-case columns need raw-SQL ALTER (not this config path).
+
+    Raises ConfigError on:
+      - non-list YAML
+      - non-string entries
+      - malformed entries (unbalanced parens, illegal identifier chars)
+      - unknown transform functions
+    """
+    if value is None or value == []:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"{ctx} must be a list of strings (got {type(value).__name__})")
+    out: list[tuple[str, str]] = []
+    for i, entry in enumerate(value):
+        if not isinstance(entry, str):
+            raise ConfigError(f"{ctx}[{i}] must be a string (got {type(entry).__name__})")
+        entry_stripped = entry.strip()
+        if not entry_stripped:
+            raise ConfigError(f"{ctx}[{i}] is empty")
+        if "(" in entry_stripped or ")" in entry_stripped:
+            m = _PARTITION_ENTRY_RE.match(entry_stripped)
+            if not m:
+                raise ConfigError(f"{ctx}[{i}] = {entry!r} must be 'col' or 'func(col)' where col is an identifier")
+            func, col = m.group(1).lower(), m.group(2).lower()
+            if func not in _PARTITION_TRANSFORMS:
+                raise ConfigError(
+                    f"{ctx}[{i}] uses unknown transform {func!r}; "
+                    f"supported: {_PARTITION_TRANSFORMS} (or omit for identity)"
+                )
+            out.append((func, col))
+        else:
+            if not _PARTITION_IDENT_RE.match(entry_stripped):
+                raise ConfigError(f"{ctx}[{i}] = {entry!r} is not a valid column identifier")
+            out.append(("", entry_stripped.lower()))
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -178,6 +247,24 @@ class DestinationConfig:
     data_path: str
     table: str
     properties: dict[str, str] = field(default_factory=dict)
+    # Optional partition spec applied at table-creation time. Each entry is
+    # `(transform_name, column_name)` where transform_name is "" for identity
+    # (bare column) or one of {year, month, day, hour}. Empty tuple means
+    # the destination table is created (or left) unpartitioned.
+    # See destination.py for how this is applied via pyducklake's UpdateSpec.
+    partition_by: tuple[tuple[str, str], ...] = ()
+    # Safety gate: refuse to ALTER a destination table that already has
+    # data files committed. False (default) protects against accidental
+    # post-fact partitioning of a populated table — DuckLake's behavior
+    # on `ALTER TABLE SET PARTITIONED BY` against a non-empty table is
+    # not fully verified at scale and reproducing the mixed-layout
+    # compactor breakage we hit on megaduck (2026-06-24..28) is the
+    # specific risk we want to gate behind operator opt-in.
+    # Set to True only after verifying ALTER behavior on a throwaway
+    # copy of the destination AND coordinating a pause of the
+    # destination compactor (it groups files by partition_id and trips
+    # the line-546 hive-prefix assertion on mixed layouts).
+    partition_by_allow_alter_populated: bool = False
 
     @property
     def postgres_uri(self) -> str:
@@ -386,6 +473,12 @@ class ViaduckConfig:
             log.info("config: destinations[%d].data_path=%r", i, d.data_path)
             log.info("config: destinations[%d].table=%r", i, d.table)
             log.info("config: destinations[%d].properties=%r", i, d.properties)
+            log.info("config: destinations[%d].partition_by=%r", i, d.partition_by)
+            log.info(
+                "config: destinations[%d].partition_by_allow_alter_populated=%r",
+                i,
+                d.partition_by_allow_alter_populated,
+            )
 
     def assigned_destination_ids(self) -> list[str]:
         """Return destination IDs assigned to this instance based on partition config."""
@@ -469,6 +562,12 @@ def load(path: str | Path) -> ViaduckConfig:
             _validate_string_dict(d.get("properties", {}), f"destinations[{i}].properties"),
             default_props,
         )
+        allow_alter_raw = d.get("partition_by_allow_alter_populated", False)
+        if not isinstance(allow_alter_raw, bool):
+            raise ConfigError(
+                f"destinations[{i}].partition_by_allow_alter_populated must be a boolean "
+                f"(got {type(allow_alter_raw).__name__})"
+            )
         destinations.append(
             DestinationConfig(
                 id=_require_non_empty(str(d.get("id", "")), f"destinations[{i}].id"),
@@ -480,6 +579,8 @@ def load(path: str | Path) -> ViaduckConfig:
                 data_path=_require_non_empty(d.get("data_path", ""), f"destinations[{i}].data_path"),
                 table=d.get("table", source.table),
                 properties=dest_props,
+                partition_by=_validate_partition_by(d.get("partition_by"), f"destinations[{i}].partition_by"),
+                partition_by_allow_alter_populated=allow_alter_raw,
             )
         )
 
