@@ -14,6 +14,7 @@ from viaduck.config import (
     _require_non_empty,
     _resolve_env_properties,
     _stable_hash,
+    _validate_partition_by,
     load,
 )
 
@@ -736,3 +737,131 @@ def test_log_summary_does_not_log_resolved_s3_credentials(tmp_path, caplog, monk
     assert "RESOLVED_S3_SECRET_SHOULD_NOT_APPEAR" not in joined
     # The env-var names themselves are fine — they're just identifiers.
     assert any("s3_access_key_id_env" in line and "S3_KEY" in line for line in lines)
+
+
+# ----------------------------------------------------------------------
+# partition_by parsing
+# ----------------------------------------------------------------------
+
+
+def test_validate_partition_by_none_returns_empty_tuple():
+    assert _validate_partition_by(None, "destinations[0].partition_by") == ()
+
+
+def test_validate_partition_by_empty_list_returns_empty_tuple():
+    assert _validate_partition_by([], "destinations[0].partition_by") == ()
+
+
+def test_validate_partition_by_identity_columns():
+    result = _validate_partition_by(["team_id", "shard"], "ctx")
+    assert result == (("", "team_id"), ("", "shard"))
+
+
+def test_validate_partition_by_transforms():
+    result = _validate_partition_by(
+        ["year(_inserted_at)", "month(_inserted_at)", "day(_inserted_at)", "hour(_inserted_at)"],
+        "ctx",
+    )
+    assert result == (
+        ("year", "_inserted_at"),
+        ("month", "_inserted_at"),
+        ("day", "_inserted_at"),
+        ("hour", "_inserted_at"),
+    )
+
+
+def test_validate_partition_by_mixed_identity_and_transforms():
+    result = _validate_partition_by(
+        ["team_id", "year(_inserted_at)", "month(_inserted_at)"],
+        "ctx",
+    )
+    assert result == (("", "team_id"), ("year", "_inserted_at"), ("month", "_inserted_at"))
+
+
+def test_validate_partition_by_case_insensitive_transform_name():
+    """Mixed casing on the function name (YEAR, Year) is normalized to lowercase."""
+    result = _validate_partition_by(["YEAR(ts)", "Month(ts)"], "ctx")
+    assert result == (("year", "ts"), ("month", "ts"))
+
+
+def test_validate_partition_by_lowercases_column_identifiers():
+    """Mixed-case column identifiers are normalized to lowercase so the
+    downstream pyducklake quoting (`"X"`) matches DuckDB's case-folded
+    storage of unquoted identifiers. Regression for the SWE-review H4
+    landmine — a config of `year(Inserted_At)` would have failed at
+    ALTER time because the actual column is `inserted_at` (case-folded
+    at table creation).
+    """
+    result = _validate_partition_by(
+        ["Team_Id", "Year(Inserted_At)", "Month(InsertedAt)"],
+        "ctx",
+    )
+    assert result == (
+        ("", "team_id"),
+        ("year", "inserted_at"),
+        ("month", "insertedat"),
+    )
+
+
+def test_validate_partition_by_unknown_transform_rejected():
+    with pytest.raises(ConfigError, match="unknown transform 'bucket'"):
+        _validate_partition_by(["bucket(id)"], "ctx")
+
+
+def test_validate_partition_by_non_list_rejected():
+    with pytest.raises(ConfigError, match="must be a list"):
+        _validate_partition_by("year(ts)", "ctx")
+
+
+def test_validate_partition_by_non_string_entry_rejected():
+    with pytest.raises(ConfigError, match=r"\[0\] must be a string"):
+        _validate_partition_by([42], "ctx")
+
+
+def test_validate_partition_by_empty_string_entry_rejected():
+    with pytest.raises(ConfigError, match=r"\[1\] is empty"):
+        _validate_partition_by(["team_id", ""], "ctx")
+
+
+def test_validate_partition_by_malformed_parens_rejected():
+    with pytest.raises(ConfigError, match="must be 'col' or 'func"):
+        _validate_partition_by(["year(ts"], "ctx")
+
+
+def test_validate_partition_by_invalid_identifier_rejected():
+    with pytest.raises(ConfigError, match="not a valid column identifier"):
+        _validate_partition_by(["team-id"], "ctx")  # hyphen, not allowed
+
+
+def test_load_destination_partition_by_from_yaml(tmp_path: Path):
+    """YAML round-trip — destinations[i].partition_by parses into DestinationConfig.partition_by."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        MINIMAL_YAML
+        + """
+destinations:
+  - id: team-2
+    routing_value: "2"
+    name: team-2
+    postgres_uri_env: DEST_PG
+    data_path: s3://dest/
+    table: posthog.events_nrt
+    partition_by:
+      - team_id
+      - year(_inserted_at)
+      - month(_inserted_at)
+"""
+    )
+    cfg = load(p)
+    assert cfg.destinations[0].partition_by == (
+        ("", "team_id"),
+        ("year", "_inserted_at"),
+        ("month", "_inserted_at"),
+    )
+
+
+def test_load_destination_partition_by_defaults_to_empty(config_file):
+    """Destinations without partition_by parse to empty tuple — backwards compatible."""
+    cfg = load(config_file)
+    for dest in cfg.destinations:
+        assert dest.partition_by == ()

@@ -322,3 +322,358 @@ def test_pool_all_pinned_overshoots_instead_of_deadlock():
         assert pool.size == 2
     pool.release("a")
     pool.release("b")
+
+
+# ----------------------------------------------------------------------
+# Partition spec application — _ensure_partition_spec
+# ----------------------------------------------------------------------
+
+
+def _make_dest_cfg(partition_by=(), partition_by_allow_alter_populated: bool = True):
+    """Build a minimal DestinationConfig-like for _ensure_partition_spec tests.
+
+    Defaults `partition_by_allow_alter_populated=True` so the bulk of tests
+    don't have to think about the populated gate — they're testing the
+    spec-application logic. The gate has dedicated tests.
+    """
+    cfg = MagicMock()
+    cfg.partition_by = partition_by
+    cfg.partition_by_allow_alter_populated = partition_by_allow_alter_populated
+    return cfg
+
+
+def _make_table(
+    *,
+    is_unpartitioned: bool,
+    fields: tuple | None = None,
+    has_data: bool = False,
+):
+    """Build a mock pyducklake Table with `spec` and `is_unpartitioned` as
+    PROPERTIES (matching the real pyducklake API).
+
+    The previous mock setup used `table.spec.return_value` / `.is_unpartitioned.return_value`
+    which made them callable — masking the production bug where the implementation
+    called them as methods (`table.spec()`) and TypeError'd at runtime. PropertyMock
+    enforces the property contract so tests fail loudly if the code regresses.
+
+    `has_data` controls what `_table_has_data` sees when it probes via
+    `catalog.connection.execute(...).fetchone()` — True returns a row, False
+    returns None.
+    """
+    from unittest.mock import PropertyMock
+
+    table = MagicMock()
+    spec_obj = MagicMock()
+    # `is_unpartitioned` is a property on PartitionSpec
+    type(spec_obj).is_unpartitioned = PropertyMock(return_value=is_unpartitioned)
+    if fields is not None:
+        spec_obj.fields = fields
+    # `spec` is a property on Table
+    type(table).spec = PropertyMock(return_value=spec_obj)
+    # Wire the catalog.connection.execute().fetchone() chain for _table_has_data
+    table.fully_qualified_name = "test.test_table"
+    table.catalog.connection.execute.return_value.fetchone.return_value = (1,) if has_data else None
+    return table
+
+
+def test_ensure_partition_spec_noop_when_config_empty():
+    """No partition_by in config → no calls into pyducklake at all (don't
+    interrogate the table; saves a round-trip)."""
+    from viaduck.destination import _ensure_partition_spec
+
+    table = MagicMock()
+    _ensure_partition_spec(table, _make_dest_cfg(partition_by=()), "team-2")
+    # Neither the property nor update_spec should be touched
+    table.update_spec.assert_not_called()
+
+
+def test_ensure_partition_spec_applies_when_table_unpartitioned():
+    """Config has partition_by + table is currently unpartitioned →
+    UpdateSpec().add_field(...).commit() with correct transform mapping."""
+    from pyducklake.partitioning import HOUR, IDENTITY, YEAR
+
+    from viaduck.destination import _ensure_partition_spec
+
+    table = _make_table(is_unpartitioned=True)
+    update_spec = MagicMock()
+    table.update_spec.return_value = update_spec
+
+    cfg = _make_dest_cfg(
+        partition_by=(
+            ("", "team_id"),
+            ("year", "_inserted_at"),
+            ("hour", "_inserted_at"),
+        )
+    )
+    _ensure_partition_spec(table, cfg, "team-2")
+
+    assert update_spec.add_field.call_count == 3
+    call_args = [(c.args[0], c.args[1]) for c in update_spec.add_field.call_args_list]
+    assert call_args == [
+        ("team_id", IDENTITY),
+        ("_inserted_at", YEAR),
+        ("_inserted_at", HOUR),
+    ]
+    update_spec.commit.assert_called_once()
+
+
+def test_ensure_partition_spec_skips_already_partitioned_matching_table():
+    """Config has partition_by + table is already partitioned with the SAME
+    spec → silent no-op. No ALTER, no warning (matches is the happy path)."""
+    from pyducklake.partitioning import IDENTITY, YEAR
+
+    from viaduck.destination import _ensure_partition_spec
+
+    matching_fields = (
+        MagicMock(source_column="team_id", transform=IDENTITY),
+        MagicMock(source_column="_inserted_at", transform=YEAR),
+    )
+    table = _make_table(is_unpartitioned=False, fields=matching_fields)
+    cfg = _make_dest_cfg(
+        partition_by=(
+            ("", "team_id"),
+            ("year", "_inserted_at"),
+        )
+    )
+    _ensure_partition_spec(table, cfg, "team-2")
+    table.update_spec.assert_not_called()
+
+
+def test_ensure_partition_spec_warns_on_divergent_existing_spec(caplog):
+    """Config has partition_by + table is already partitioned with a DIFFERENT
+    spec → WARNING logged, no ALTER. Operator decides whether to reconcile."""
+    import logging
+
+    from pyducklake.partitioning import IDENTITY, MONTH
+
+    from viaduck.destination import _ensure_partition_spec
+
+    # Existing spec on the table is (team_id, month(_inserted_at)) but config
+    # wants (team_id, year(_inserted_at)).
+    diverging_fields = (
+        MagicMock(source_column="team_id", transform=IDENTITY),
+        MagicMock(source_column="_inserted_at", transform=MONTH),
+    )
+    table = _make_table(is_unpartitioned=False, fields=diverging_fields)
+    cfg = _make_dest_cfg(
+        partition_by=(
+            ("", "team_id"),
+            ("year", "_inserted_at"),
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="viaduck.destination"):
+        _ensure_partition_spec(table, cfg, "team-2")
+
+    table.update_spec.assert_not_called()
+    assert any("has partition spec" in r.message and "config specifies" in r.message for r in caplog.records)
+
+
+def test_ensure_partition_spec_catch_verify_lost_race_to_peer():
+    """Race scenario: we observed the table as unpartitioned, attempted ALTER,
+    but a peer pod committed first. Our commit() raises; we refresh and find
+    the spec applied; we verify it matches; we treat as success."""
+    from unittest.mock import PropertyMock
+
+    from pyducklake.partitioning import IDENTITY, YEAR
+
+    from viaduck.destination import _ensure_partition_spec
+
+    table = MagicMock()
+    spec_obj = MagicMock()
+    # First .spec.is_unpartitioned read: True (so we attempt the ALTER).
+    # After refresh: False (a peer has applied the spec we wanted).
+    # `side_effect=[True, False]` over a list (not a generator-with-lambda)
+    # gives a legible StopIteration with traceback if the implementation
+    # ever does a third read — keeps the test brittle in a useful way
+    # rather than masking a regression.
+    type(spec_obj).is_unpartitioned = PropertyMock(side_effect=[True, False])
+    # spec.fields used by _verify_or_warn after refresh
+    spec_obj.fields = (
+        MagicMock(source_column="team_id", transform=IDENTITY),
+        MagicMock(source_column="_inserted_at", transform=YEAR),
+    )
+    type(table).spec = PropertyMock(return_value=spec_obj)
+
+    failing_update = MagicMock()
+    failing_update.commit.side_effect = RuntimeError("peer raced us")
+    table.update_spec.return_value = failing_update
+
+    cfg = _make_dest_cfg(
+        partition_by=(
+            ("", "team_id"),
+            ("year", "_inserted_at"),
+        )
+    )
+
+    # Should NOT raise — the catch-verify path recognizes the spec is now applied
+    _ensure_partition_spec(table, cfg, "team-2")
+
+    failing_update.commit.assert_called_once()
+    table.refresh.assert_called_once()
+
+
+def test_ensure_partition_spec_catch_verify_genuine_failure_reraises():
+    """If commit() fails AND the post-refresh spec is still unpartitioned, that's
+    not a race — it's a real error (e.g., column missing). Re-raise so the pod
+    startup fails loudly."""
+    from unittest.mock import PropertyMock
+
+    from viaduck.destination import _ensure_partition_spec
+
+    table = MagicMock()
+    spec_obj = MagicMock()
+    # Always unpartitioned, before and after refresh — no peer rescued us
+    type(spec_obj).is_unpartitioned = PropertyMock(return_value=True)
+    type(table).spec = PropertyMock(return_value=spec_obj)
+
+    failing_update = MagicMock()
+    failing_update.commit.side_effect = RuntimeError("column does not exist")
+    table.update_spec.return_value = failing_update
+
+    cfg = _make_dest_cfg(partition_by=(("", "nonexistent_column"),))
+
+    with pytest.raises(RuntimeError, match="column does not exist"):
+        _ensure_partition_spec(table, cfg, "team-2")
+
+    table.refresh.assert_called_once()
+
+
+def test_ensure_partition_spec_refuses_alter_when_table_has_data_and_gate_off(caplog):
+    """The populated-table safety gate: if the destination table has
+    existing data AND partition_by_allow_alter_populated is False (default),
+    refuse the ALTER and log an ERROR. The table is left unpartitioned and
+    the pod startup continues — operator must explicitly opt in."""
+    import logging
+
+    from viaduck.destination import _ensure_partition_spec
+
+    table = _make_table(is_unpartitioned=True, has_data=True)
+    cfg = _make_dest_cfg(
+        partition_by=(("", "team_id"),),
+        partition_by_allow_alter_populated=False,
+    )
+    with caplog.at_level(logging.ERROR, logger="viaduck.destination"):
+        _ensure_partition_spec(table, cfg, "team-2")
+
+    table.update_spec.assert_not_called()
+    assert any("Refusing to ALTER destination" in r.message for r in caplog.records)
+
+
+def test_ensure_partition_spec_proceeds_when_table_empty_regardless_of_gate():
+    """A fresh, empty destination table is always safe to ALTER — the gate
+    only applies when there's actual data to risk corrupting."""
+    from viaduck.destination import _ensure_partition_spec
+
+    table = _make_table(is_unpartitioned=True, has_data=False)
+    update_spec = MagicMock()
+    table.update_spec.return_value = update_spec
+    cfg = _make_dest_cfg(
+        partition_by=(("", "team_id"),),
+        partition_by_allow_alter_populated=False,  # gate is OFF
+    )
+
+    _ensure_partition_spec(table, cfg, "team-2")
+
+    # Empty table → gate doesn't block → ALTER proceeds
+    update_spec.commit.assert_called_once()
+
+
+def test_ensure_partition_spec_proceeds_on_populated_when_gate_on():
+    """Operator opt-in: with the gate flipped True, ALTER proceeds even
+    against a populated table. This is the path that ships the actual
+    posthog.events_nrt migration once we've verified ALTER behavior."""
+    from viaduck.destination import _ensure_partition_spec
+
+    table = _make_table(is_unpartitioned=True, has_data=True)
+    update_spec = MagicMock()
+    table.update_spec.return_value = update_spec
+    cfg = _make_dest_cfg(
+        partition_by=(("", "team_id"),),
+        partition_by_allow_alter_populated=True,  # operator opt-in
+    )
+
+    _ensure_partition_spec(table, cfg, "team-2")
+    update_spec.commit.assert_called_once()
+
+
+def test_ensure_partition_spec_treats_probe_failure_as_populated(caplog):
+    """If the SELECT-1 probe raises (network, ducklake transient), we
+    conservatively treat the table as populated — refuse to ALTER until
+    we can verify emptiness on a future cold-connect."""
+    import logging
+
+    from viaduck.destination import _ensure_partition_spec
+
+    table = _make_table(is_unpartitioned=True, has_data=False)
+    # Override execute to raise — simulates a transient catalog failure
+    table.catalog.connection.execute.side_effect = RuntimeError("transient catalog read failed")
+    cfg = _make_dest_cfg(
+        partition_by=(("", "team_id"),),
+        partition_by_allow_alter_populated=False,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="viaduck.destination"):
+        _ensure_partition_spec(table, cfg, "team-2")
+
+    table.update_spec.assert_not_called()
+    assert any("Failed to probe" in r.message for r in caplog.records)
+
+
+def test_table_has_data_refuses_fqn_with_sql_metachar(caplog):
+    """Defensive guard: if pyducklake's `fully_qualified_name` ever leaks a
+    semicolon, comment marker, or newline, we refuse to interpolate it
+    into the probe SELECT and treat the table as populated. This catches
+    a pyducklake contract regression OR an exotic operator-controlled
+    table name that smuggles SQL meta-chars."""
+    import logging
+
+    from viaduck.destination import _table_has_data
+
+    table = MagicMock()
+    table.fully_qualified_name = "evil; DROP TABLE x;--"
+    with caplog.at_level(logging.ERROR, logger="viaduck.destination"):
+        assert _table_has_data(table) is True
+    # The catalog connection must NOT have been touched.
+    table.catalog.connection.execute.assert_not_called()
+    assert any("suspicious fully_qualified_name" in r.message for r in caplog.records)
+
+
+def test_ensure_partition_spec_metric_counts_each_outcome():
+    """Smoke test that each outcome label increments `partition_spec_total`.
+
+    Doesn't try to verify exact label combinations across the full matrix —
+    that's brittle to mock. Verifies the metric is wired into each branch
+    so a regression that drops the inc() will show up as zero traffic on
+    a label that should be present."""
+    from viaduck import metrics
+    from viaduck.destination import _ensure_partition_spec
+
+    metrics.init("test-partition-metric")
+    counter = metrics.partition_spec_total
+
+    # skipped_no_config branch
+    before = counter.labels(destination="d", outcome="skipped_no_config")._value.get()
+    _ensure_partition_spec(MagicMock(), _make_dest_cfg(partition_by=()), "d")
+    assert counter.labels(destination="d", outcome="skipped_no_config")._value.get() == before + 1
+
+    # applied branch
+    table = _make_table(is_unpartitioned=True, has_data=False)
+    table.update_spec.return_value = MagicMock()
+    before = counter.labels(destination="d", outcome="applied")._value.get()
+    _ensure_partition_spec(
+        table,
+        _make_dest_cfg(partition_by=(("", "team_id"),), partition_by_allow_alter_populated=True),
+        "d",
+    )
+    assert counter.labels(destination="d", outcome="applied")._value.get() == before + 1
+
+    # refused_populated branch
+    table = _make_table(is_unpartitioned=True, has_data=True)
+    before = counter.labels(destination="d", outcome="refused_populated")._value.get()
+    _ensure_partition_spec(
+        table,
+        _make_dest_cfg(partition_by=(("", "team_id"),), partition_by_allow_alter_populated=False),
+        "d",
+    )
+    assert counter.labels(destination="d", outcome="refused_populated")._value.get() == before + 1

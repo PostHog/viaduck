@@ -158,6 +158,25 @@ _delivery_buffers_dropped_total = Counter(
     ["pipeline", "destination"],
 )
 
+# Partition-spec outcomes from `_ensure_partition_spec` (destination.py).
+# Operators need to verify across N destinations after a deploy that
+# turns on `partition_by` — without this counter, that verification is
+# grep-the-logs. Outcomes:
+#   applied             — we ran the ALTER successfully
+#   applied_by_peer     — we lost the race; a peer pod's spec is what we wanted
+#   refused_populated   — table has data + gate is off (covers true-populated
+#                          AND probe-failure-treat-as-populated paths; the
+#                          distinguishing signal is the ERROR log line in
+#                          _table_has_data); left unpartitioned
+#   skipped_matches     — table already partitioned with the spec we'd apply
+#   skipped_diverges    — table partitioned with a DIFFERENT spec (operator must reconcile)
+#   skipped_no_config   — partition_by empty in config (default — no-op)
+_partition_spec_total = Counter(
+    "viaduck_partition_spec_total",
+    "Outcomes from _ensure_partition_spec by destination + outcome label",
+    ["pipeline", "destination", "outcome"],
+)
+
 # --- Public names (replaced by init() with pipeline-bound instances) ---
 
 polls_total = _polls_total
@@ -194,6 +213,8 @@ delivery_flushes_total = _delivery_flushes_total
 delivery_flush_seconds = _delivery_flush_seconds
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 
+partition_spec_total = _partition_spec_total
+
 
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
@@ -208,6 +229,7 @@ def init(pipeline: str):
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
+    global partition_spec_total
 
     # Metrics with additional labels — wrap so .labels() auto-injects pipeline
     dest_write_seconds = _AutoPipelineLabels(_dest_write_seconds, pipeline)
@@ -222,6 +244,7 @@ def init(pipeline: str):
     errors_total = _AutoPipelineLabels(_errors_total, pipeline)
     dest_rows_deleted_total = _AutoPipelineLabels(_dest_rows_deleted_total, pipeline)
     dest_rows_upserted_total = _AutoPipelineLabels(_dest_rows_upserted_total, pipeline)
+    partition_spec_total = _AutoPipelineLabels(_partition_spec_total, pipeline)
     dest_upsert_matched_total = _AutoPipelineLabels(_dest_upsert_matched_total, pipeline)
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
