@@ -7,7 +7,7 @@ import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
-from viaduck import metrics
+from viaduck import metrics, schema_projection
 from viaduck.source import with_connection_defaults
 
 if TYPE_CHECKING:
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from pyducklake.schema import Schema
 
     from viaduck.config import DestinationConfig, ViaduckConfig
+    from viaduck.schema_projection import ProjectionPlan
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,12 @@ class DestinationPool:
         self._creating: set[str] = set()  # reserved slots; created outside the lock
         self._zombies: dict[str, list[Catalog]] = {}  # evicted-while-pinned, closed on release
         self._source_schema: Schema | None = None
+        # Per-destination projection plan. Populated in _create() when the
+        # destination has schema_projection_enabled=True. Callers read via
+        # projection_for(destination_id); identity projections and disabled
+        # destinations both return None so callers can skip .apply() on the
+        # hot path.
+        self._projections: dict[str, ProjectionPlan] = {}
 
     @property
     def size(self) -> int:
@@ -100,6 +107,7 @@ class DestinationPool:
                     )
                     break
                 evict_cat, _ = self._pool.pop(evict_id)
+                self._projections.pop(evict_id, None)
                 to_close.append((evict_id, evict_cat))
                 metrics.pool_evictions_total.inc()
                 log.debug("Evicted connection for destination %s", evict_id)
@@ -113,7 +121,7 @@ class DestinationPool:
                 log.warning("Error closing evicted connection for %s", evict_id)
 
         try:
-            catalog, table = self._create(destination_id)
+            catalog, table, plan = self._create(destination_id)
         except Exception:
             with self._lock:
                 self._creating.discard(destination_id)
@@ -122,6 +130,16 @@ class DestinationPool:
         with self._lock:
             self._creating.discard(destination_id)
             self._pool[destination_id] = (catalog, table)
+            # Store projection under the same lock that owns _pool mutation.
+            # Otherwise a concurrent evict() of this destination (LRU pressure
+            # from a peer worker) could pop _projections[dest] in between our
+            # projection build and our pool insert, leaving _pool populated
+            # but _projections empty → projection_for(dest) returns None →
+            # identity fall-through → positional insert into a misshaped
+            # target. This is the silent-slot-corruption class the module
+            # exists to prevent.
+            if plan is not None:
+                self._projections[destination_id] = plan
             self._pins[destination_id] = self._pins.get(destination_id, 0) + 1
             metrics.pool_creates_total.inc()
             metrics.pool_open_connections.set(len(self._pool))
@@ -150,6 +168,7 @@ class DestinationPool:
             entry = self._pool.pop(destination_id, None)
             if entry is None:
                 return
+            self._projections.pop(destination_id, None)
             cat, _ = entry
             if self._pins.get(destination_id, 0) > 0:
                 self._zombies.setdefault(destination_id, []).append(cat)
@@ -170,6 +189,7 @@ class DestinationPool:
                 except Exception:
                     log.warning("Error closing connection for %s", dest_id)
             self._pool.clear()
+            self._projections.clear()
             for dest_id, cats in self._zombies.items():
                 for cat in cats:
                     try:
@@ -202,8 +222,78 @@ class DestinationPool:
             src_catalog.close()
         return self._source_schema
 
-    def _create(self, destination_id: str) -> tuple[Catalog, Table]:
-        """Create a new Catalog and load/create the destination table."""
+    def projection_for(self, destination_id: str) -> ProjectionPlan | None:
+        """Return the cached ProjectionPlan for a destination, or None when the
+        destination is identity-shaped (or projection is disabled). Callers
+        should apply the plan on the write path before invoking `tbl.append`
+        / `tbl.upsert`.
+
+        Reads under `self._lock` — a `_projections.get()` racing an `evict()`
+        `pop()` is safe in CPython (GIL guards individual dict ops), but
+        pairing the read with `_pool` requires ordering to reason about,
+        and callers pull this immediately before invoking `tbl.append` /
+        `tbl.upsert` on the pool entry.
+        """
+        with self._lock:
+            plan = self._projections.get(destination_id)
+        if plan is None or plan.is_identity:
+            return None
+        return plan
+
+    def _maybe_build_projection(
+        self,
+        destination_id: str,
+        dest_cfg: DestinationConfig,
+        *,
+        source_schema: Schema,
+        table: Table,
+    ) -> ProjectionPlan | None:
+        """Build the ProjectionPlan for this destination when opted in.
+
+        Called from `_create()` after the destination table exists; runs
+        OUTSIDE `self._lock` (same as the catalog connect). The caller stores
+        the returned plan into `self._projections` under `self._lock`, so
+        every mutation of `_projections` happens with the pool lock held
+        (avoids torn reads with concurrent `evict()`/`close_all()`).
+
+        Raises `SchemaProjectionError` on unresolvable schema drift — that's
+        the whole point of the module; silent shape drift is exactly what
+        got us here.
+        """
+        if not dest_cfg.schema_projection_enabled:
+            return None
+
+        # `source_schema` here is a pyducklake Schema; convert to Arrow via
+        # Schema.as_arrow() so the projection module can work with pa.Schema
+        # directly. Same conversion the source read path applies before
+        # sending batches to destinations, so source_schema.as_arrow() is
+        # exactly the shape batches arrive in at write time. `Table.schema`
+        # is a property; call as_arrow() on the returned Schema.
+        src_arrow = source_schema.as_arrow()
+        tgt_arrow = table.schema.as_arrow()
+
+        plan = schema_projection.build(
+            src_arrow,
+            tgt_arrow,
+            drop_allow=set(dest_cfg.drop_source_columns),
+            key_columns=tuple(self._config.routing.key_columns),
+            routing_field=self._config.routing.field,
+        )
+        log.info(
+            "Schema projection built for destination %s: %s",
+            destination_id,
+            plan.describe(),
+        )
+        return plan
+
+    def _create(self, destination_id: str) -> tuple[Catalog, Table, ProjectionPlan | None]:
+        """Create a new Catalog and load/create the destination table.
+
+        Returns `(catalog, table, plan)`. `plan` is None when the destination
+        has schema projection disabled; the caller stores it into
+        `self._projections` under `self._lock` — every `_projections` mutation
+        must happen with the pool lock held.
+        """
         from pyducklake import Catalog
 
         dest_cfg: DestinationConfig = self._config.destination_by_id(destination_id)
@@ -219,10 +309,11 @@ class DestinationPool:
             )
             table = catalog.create_table_if_not_exists(dest_cfg.table, schema)
             _ensure_partition_spec(table, dest_cfg, destination_id)
+            plan = self._maybe_build_projection(destination_id, dest_cfg, source_schema=schema, table=table)
             log.info(
                 "Connected to destination %s (catalog=%s, table=%s)", destination_id, dest_cfg.name, dest_cfg.table
             )
-            return catalog, table
+            return catalog, table, plan
         except Exception:
             if catalog is not None:
                 try:

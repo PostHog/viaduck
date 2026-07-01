@@ -114,6 +114,32 @@ def test_write_with_retry_exhausted():
             _write_with_retry(pool, "dest-1", op)
 
 
+def test_write_with_retry_fails_fast_on_schema_projection_error():
+    """A SchemaProjectionError raised out of pool.get() (via _create →
+    _maybe_build_projection → schema_projection.build) is permanent: the
+    source/target schemas don't change between attempts. Retrying wastes
+    exponential backoff and logs misleading "Write to X failed" for what is
+    a build-time drift error. Must fail fast, not retry."""
+    from viaduck.schema_projection import SchemaProjectionError
+
+    pool = MagicMock()
+    pool.get.side_effect = SchemaProjectionError("unknown source column 'stowaway'")
+
+    attempts = {"count": 0}
+
+    def op(catalog, table):
+        attempts["count"] += 1
+
+    with patch("viaduck.apply.time.sleep") as mock_sleep:
+        with pytest.raises(SchemaProjectionError, match="stowaway"):
+            _write_with_retry(pool, "dest-1", op)
+
+    assert attempts["count"] == 0, "operation should not even be called on projection build error"
+    assert pool.get.call_count == 1, "must not retry on SchemaProjectionError"
+    mock_sleep.assert_not_called()
+    pool.evict.assert_not_called()
+
+
 def test_write_with_retry_logs_exception_message():
     """Retry should log the actual exception message."""
     pool = MagicMock()
@@ -130,6 +156,173 @@ def test_write_with_retry_logs_exception_message():
 
     warning_call = mock_log.warning.call_args
     assert "connection refused" in str(warning_call)
+
+
+def test_apply_full_cdc_projection_resolved_per_attempt():
+    """After a failed attempt, the retry rebuilds the destination via
+    pool.get() → _create → _maybe_build_projection. If projection is captured
+    outside the retry loop, a schema drift between attempts is written with
+    the STALE plan → silent off-by-one slot corruption (the exact bug class
+    schema_projection was written to prevent). Verify projection_for is called
+    once per attempt.
+    """
+    import pyarrow as pa
+
+    from viaduck.apply import apply_full_cdc
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    # Track how many times projection_for is queried across attempts.
+    pool.projection_for.return_value = None
+
+    # A CDC-shaped batch that survives _resolve_conflicts (one insert row).
+    batch = pa.table(
+        {
+            "change_type": ["insert"],
+            "rowid": [pa.scalar(1, type=pa.uint64())],
+            "_snapshot_id": [pa.scalar(1, type=pa.uint64())],
+            "id": ["a"],
+            "val": ["x"],
+        }
+    )
+
+    attempts = {"count": 0}
+
+    def _apply_side_effect(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("first attempt fails")
+        return {"deleted": 0, "upserted": 1, "upsert_matched": 0}
+
+    with patch("viaduck.apply._apply_changes", side_effect=_apply_side_effect), patch("viaduck.apply.time.sleep"):
+        apply_full_cdc(pool, "dest-1", batch, ["id"])
+
+    # Each attempt must independently query projection_for; capture-outside
+    # would show exactly 1.
+    assert pool.projection_for.call_count == attempts["count"] == 2, (
+        f"projection_for should fire once per attempt (got {pool.projection_for.call_count} for "
+        f"{attempts['count']} attempts) — closure capture bug is back"
+    )
+
+
+def test_append_only_fallback_metric_not_double_counted_on_retry():
+    """The null-fallback metric is the drift-alarm signal for operators. If
+    projection.apply runs inside the retry lambda (H2), a transient write
+    failure would cause the callback to fire once per attempt for the SAME
+    bad rows — reporting 2× or 3× the real drift. Verify the counter
+    increments exactly ONCE per completed flush regardless of retry count.
+    """
+    import pyarrow as pa
+
+    from viaduck import metrics
+    from viaduck.apply import append_only
+
+    metrics.init("test_fallback_no_double_count")
+
+    # Real projection with a real fallback trigger (varchar → tz-UTC with
+    # one bad row).
+    from viaduck.schema_projection import build
+
+    src = pa.schema([pa.field("t", pa.string())])
+    tgt = pa.schema([pa.field("t", pa.timestamp("us", tz="UTC"), nullable=True)])
+    plan = build(src, tgt)
+
+    pool = MagicMock()
+    pool.projection_for.return_value = plan
+    mock_table = MagicMock()
+    pool.get.return_value = (MagicMock(), mock_table)
+
+    batch = pa.table({"t": ["not-a-date", "2026-06-30 12:00:00"]}, schema=src)
+
+    # First attempt fails, second succeeds — projection runs twice, but the
+    # metric should only tick once.
+    attempts = {"count": 0}
+
+    def _append_side_effect(_b):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("first attempt fails")
+
+    mock_table.append.side_effect = _append_side_effect
+
+    counter = metrics._projection_cast_null_fallback_total.labels(
+        pipeline="test_fallback_no_double_count", destination="dest-1", column="t"
+    )
+    before = counter._value.get()
+
+    with patch("viaduck.apply.time.sleep"):
+        append_only(pool, "dest-1", batch)
+
+    after = counter._value.get()
+
+    assert attempts["count"] == 2, "sanity: retry actually happened"
+    assert after - before == 1, f"fallback metric double-counted across retries: {after - before} (want 1)"
+
+
+def test_apply_changes_delete_path_skips_projection():
+    """Optimization: `_build_delete_filter` only consumes key_columns, and
+    B2 guarantees key columns pass through the projection unchanged. So the
+    delete path narrows to `key_columns` and does NOT call projection.apply()
+    — projection.apply() is only invoked on the upsert path. Regression
+    guard: reintroducing projection on delete_rows would trigger cast
+    fallback on payload columns for values we discard.
+    """
+    import pyarrow as pa
+
+    from viaduck.apply import _apply_changes
+
+    projection = MagicMock()
+    projection.apply.side_effect = lambda batch, on_null_fallback=None: batch
+
+    batch = pa.table(
+        {
+            "change_type": ["delete"],
+            "rowid": pa.array([1], type=pa.uint64()),
+            "snapshot_id": pa.array([1], type=pa.uint64()),
+            "id": ["a"],
+            "val": ["v-a"],
+        }
+    )
+
+    catalog = MagicMock()
+    dest_table = MagicMock()
+    catalog.begin_transaction.return_value.__enter__.return_value.load_table.return_value = MagicMock()
+
+    _apply_changes(catalog, dest_table, batch, ["id"], projection=projection)
+
+    assert projection.apply.call_count == 0, "delete-only batch should not invoke projection"
+
+
+def test_append_only_projection_resolved_per_attempt():
+    """Same as apply_full_cdc: append_only must call projection_for inside the
+    retry lambda so evict+rebuild picks up the fresh plan.
+    """
+    import pyarrow as pa
+
+    from viaduck.apply import append_only
+
+    pool = MagicMock()
+    mock_table = MagicMock()
+    pool.get.return_value = (MagicMock(), mock_table)
+    pool.projection_for.return_value = None
+
+    batch = pa.table({"a": [1], "b": ["x"]})
+
+    attempts = {"count": 0}
+
+    def _append_side_effect(_b):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("first attempt fails")
+
+    mock_table.append.side_effect = _append_side_effect
+
+    with patch("viaduck.apply.time.sleep"):
+        append_only(pool, "dest-1", batch)
+
+    assert pool.projection_for.call_count == attempts["count"] == 2, (
+        "append_only closure must also resolve projection per attempt"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1307,7 @@ def test_append_only_accepts_insert_only_batch():
     happy path."""
     pool = MagicMock()
     pool.get.return_value = (MagicMock(), MagicMock())
+    pool.projection_for.return_value = None  # no schema projection for this destination
     batch = pa.table(
         {
             "company": ["acme"],
@@ -1214,6 +1408,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
     (conflict resolution + apply on the worker), advance cursor."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
+    dest_pool.projection_for.return_value = None
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
     cfg.routing.field = "company"
@@ -1261,6 +1456,7 @@ def test_poll_cycle_append_only_unchanged():
     """Append-only mode uses read_cdc and table.append (on the worker)."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
+    dest_pool.projection_for.return_value = None
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
 
@@ -1302,6 +1498,7 @@ def test_poll_cycle_cdc_delete_only_changeset():
     """CDC mode with only deletes flows through the flush worker."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
+    dest_pool.projection_for.return_value = None
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
     cfg.routing.field = "company"
@@ -1402,6 +1599,7 @@ def test_poll_cycle_cdc_routing_value_mutation():
     both destinations flush and advance."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
+    dest_pool.projection_for.return_value = None
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth"), ("dest-2", "mallardine")])
     cfg.routing.field = "company"

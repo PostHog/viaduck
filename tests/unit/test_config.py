@@ -233,6 +233,27 @@ def test_routing_mode_null_value_routes_to_required_message(tmp_path: Path):
         load(p)
 
 
+def test_drop_source_columns_without_projection_flag_rejected(tmp_path: Path):
+    """`drop_source_columns` is a no-op if `schema_projection_enabled=false` —
+    the write path skips projection entirely. Reject at load rather than
+    silently ignore the drop and let positional-insert scramble the target."""
+    raw = MINIMAL_YAML + "    drop_source_columns: [captured_at]\n"
+    p = tmp_path / "drop_without_flag.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match="drop_source_columns.*schema_projection_enabled=false"):
+        load(p)
+
+
+def test_drop_source_columns_with_projection_flag_ok(tmp_path: Path):
+    """Same drop is legal when the flag is on."""
+    raw = MINIMAL_YAML + "    schema_projection_enabled: true\n    drop_source_columns: [captured_at]\n"
+    p = tmp_path / "drop_with_flag.yaml"
+    p.write_text(raw)
+    cfg = load(p)
+    assert cfg.destinations[0].schema_projection_enabled
+    assert cfg.destinations[0].drop_source_columns == ("captured_at",)
+
+
 def test_routing_mode_append_only_forbids_key_columns(tmp_path: Path):
     """append_only's apply path doesn't use key_columns at all; a non-empty
     list is misconfig the operator must clear or switch modes for."""

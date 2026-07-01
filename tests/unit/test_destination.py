@@ -31,7 +31,7 @@ def test_pool_get_creates_connection(pool):
     mock_catalog = MagicMock()
     mock_table = MagicMock()
 
-    with patch.object(pool, "_create", return_value=(mock_catalog, mock_table)):
+    with patch.object(pool, "_create", return_value=(mock_catalog, mock_table, None)):
         cat, tbl = pool.get("team-123")
 
     assert cat is mock_catalog
@@ -43,7 +43,7 @@ def test_pool_get_returns_cached(pool):
     mock_catalog = MagicMock()
     mock_table = MagicMock()
 
-    with patch.object(pool, "_create", return_value=(mock_catalog, mock_table)):
+    with patch.object(pool, "_create", return_value=(mock_catalog, mock_table, None)):
         pool.get("team-123")
         cat2, tbl2 = pool.get("team-123")
 
@@ -61,7 +61,7 @@ def test_pool_evicts_lru_when_full(pool):
         cat = MagicMock()
         tbl = MagicMock()
         catalogs[dest_id] = cat
-        return cat, tbl
+        return cat, tbl, None
 
     with patch.object(pool, "_create", side_effect=mock_create):
         for d in ("a", "b", "c"):
@@ -83,7 +83,7 @@ def test_pool_lru_order_updated_on_access(pool):
         cat = MagicMock()
         tbl = MagicMock()
         catalogs[dest_id] = cat
-        return cat, tbl
+        return cat, tbl, None
 
     with patch.object(pool, "_create", side_effect=mock_create):
         for d in ("a", "b", "c", "a", "d"):
@@ -100,7 +100,7 @@ def test_pool_lru_order_updated_on_access(pool):
 def test_pool_evict_removes_connection(pool):
     mock_catalog = MagicMock()
 
-    with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock())):
+    with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock(), None)):
         pool.get("team-123")
         pool.release("team-123")
 
@@ -120,7 +120,7 @@ def test_pool_close_all(pool):
     def mock_create(dest_id):
         cat = MagicMock()
         catalogs[dest_id] = cat
-        return cat, MagicMock()
+        return cat, MagicMock(), None
 
     with patch.object(pool, "_create", side_effect=mock_create):
         pool.get("a")
@@ -149,7 +149,7 @@ def test_pool_max_open_one_works():
     def mock_create(dest_id):
         cat = MagicMock()
         catalogs[dest_id] = cat
-        return cat, MagicMock()
+        return cat, MagicMock(), None
 
     with patch.object(pool, "_create", side_effect=mock_create):
         pool.get("a")
@@ -180,7 +180,7 @@ def test_pool_eviction_close_failure_continues(pool):
         if dest_id == "a":
             cat.close.side_effect = RuntimeError("close failed")
         calls.append(dest_id)
-        return cat, MagicMock()
+        return cat, MagicMock(), None
 
     with patch.object(pool, "_create", side_effect=mock_create):
         for d in ("a", "b", "c"):
@@ -262,7 +262,7 @@ def test_pool_lru_correctness_at_scale():
     pool = DestinationPool(MagicMock(), max_open=10)
     mock_catalog = MagicMock()
 
-    with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock())):
+    with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock(), None)):
         for i in range(100):
             pool.get(f"dest-{i}")
             pool.release(f"dest-{i}")
@@ -286,7 +286,7 @@ def test_pool_pinned_entry_not_lru_evicted():
     def mock_create(dest_id):
         cat = MagicMock()
         catalogs[dest_id] = cat
-        return cat, MagicMock()
+        return cat, MagicMock(), None
 
     with patch.object(pool, "_create", side_effect=mock_create):
         pool.get("pinned")  # NOT released — a worker mid-transaction
@@ -305,7 +305,7 @@ def test_pool_evict_while_pinned_defers_close():
     pool = DestinationPool(MagicMock(), max_open=3)
     cat = MagicMock()
 
-    with patch.object(pool, "_create", return_value=(cat, MagicMock())):
+    with patch.object(pool, "_create", return_value=(cat, MagicMock(), None)):
         pool.get("d1")  # pinned
 
     pool.evict("d1")
@@ -314,9 +314,139 @@ def test_pool_evict_while_pinned_defers_close():
     cat.close.assert_called_once()  # closed at final release
 
 
+def test_pool_projection_stored_with_pool_entry(pool):
+    """When _create returns a projection plan, it must be stored into
+    _projections in the same critical section as the _pool insert. Otherwise
+    a concurrent evict() between the two mutations leaves _pool populated but
+    _projections empty → identity fall-through → positional-insert corruption.
+    """
+    from viaduck.schema_projection import ProjectionPlan
+
+    fake_plan = ProjectionPlan(
+        target_schema=MagicMock(),
+        source_column_order=("a", "b"),
+        passthrough_columns=("a", "b"),
+    )
+    with patch.object(pool, "_create", return_value=(MagicMock(), MagicMock(), fake_plan)):
+        pool.get("d1")
+    assert pool._projections["d1"] is fake_plan
+    pool.release("d1")
+
+
+def test_pool_projection_dropped_on_evict(pool):
+    """evict() must pop _projections alongside _pool so a subsequent _create
+    for the same dest rebuilds the plan against the current schema."""
+    from viaduck.schema_projection import ProjectionPlan
+
+    fake_plan = ProjectionPlan(
+        target_schema=MagicMock(),
+        source_column_order=("a",),
+        passthrough_columns=("a",),
+    )
+    with patch.object(pool, "_create", return_value=(MagicMock(), MagicMock(), fake_plan)):
+        pool.get("d1")
+        pool.release("d1")
+    assert "d1" in pool._projections
+
+    pool.evict("d1")
+    assert "d1" not in pool._projections
+
+
+def test_pool_projection_dropped_on_lru_eviction(pool):
+    """LRU-eviction path in get() also pops _projections for the victim."""
+    from viaduck.schema_projection import ProjectionPlan
+
+    def _mk_plan():
+        return ProjectionPlan(
+            target_schema=MagicMock(),
+            source_column_order=("a",),
+            passthrough_columns=("a",),
+        )
+
+    def mock_create(dest_id):
+        return MagicMock(), MagicMock(), _mk_plan()
+
+    with patch.object(pool, "_create", side_effect=mock_create):
+        for d in ("a", "b", "c"):
+            pool.get(d)
+            pool.release(d)
+        for d in ("a", "b", "c"):
+            assert d in pool._projections
+
+        pool.get("d")  # evicts "a"
+        pool.release("d")
+
+    assert "a" not in pool._projections
+    for d in ("b", "c", "d"):
+        assert d in pool._projections
+
+
+def test_pool_projection_cleared_on_close_all(pool):
+    from viaduck.schema_projection import ProjectionPlan
+
+    fake_plan = ProjectionPlan(
+        target_schema=MagicMock(),
+        source_column_order=("a",),
+        passthrough_columns=("a",),
+    )
+    with patch.object(pool, "_create", return_value=(MagicMock(), MagicMock(), fake_plan)):
+        pool.get("d1")
+        pool.release("d1")
+    assert pool._projections
+
+    pool.close_all()
+    assert not pool._projections
+
+
+def test_pool_projection_stress_concurrent_get_release(pool):
+    """Threaded stress: N workers hammering get/release across M destinations
+    with plans attached. `projection_for()` must never return None for a dest
+    whose pool entry we just acquired (the H3 race — mutating _projections
+    outside the lock could drop a plan mid-flight)."""
+    import threading
+
+    from viaduck.schema_projection import ProjectionPlan
+
+    def _mk_plan():
+        return ProjectionPlan(
+            target_schema=MagicMock(),
+            source_column_order=("a",),
+            passthrough_columns=("a",),
+        )
+
+    def mock_create(dest_id):
+        return MagicMock(), MagicMock(), _mk_plan()
+
+    errors: list[str] = []
+    stop = threading.Event()
+
+    def worker(i):
+        try:
+            for _ in range(50):
+                if stop.is_set():
+                    return
+                dest = f"d{i % 5}"
+                pool.get(dest)
+                if pool.projection_for(dest) is None:
+                    errors.append(f"plan missing for {dest}")
+                pool.release(dest)
+        except Exception as e:
+            errors.append(str(e))
+
+    with patch.object(pool, "_create", side_effect=mock_create):
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+    stop.set()
+    assert not errors, f"race conditions observed: {errors[:5]}"
+
+
 def test_pool_all_pinned_overshoots_instead_of_deadlock():
     pool = DestinationPool(MagicMock(), max_open=1)
-    with patch.object(pool, "_create", side_effect=lambda d: (MagicMock(), MagicMock())):
+    with patch.object(pool, "_create", side_effect=lambda d: (MagicMock(), MagicMock(), None)):
         pool.get("a")  # pinned
         pool.get("b")  # capacity exceeded but "a" is pinned -> overshoot
         assert pool.size == 2
