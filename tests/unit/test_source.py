@@ -124,6 +124,7 @@ def test_connect():
                     "arrow_large_buffer_size": "true",
                     "enable_progress_bar": "true",
                     "enable_progress_bar_print": "false",
+                    "enable_external_file_cache": "false",
                 },
             )
 
