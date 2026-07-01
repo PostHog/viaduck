@@ -45,6 +45,27 @@ _CONNECTION_DEFAULTS = {
     "arrow_large_buffer_size": "true",
     "enable_progress_bar": "true",
     "enable_progress_bar_print": "false",
+    # Disable DuckDB's external_file_cache. viaduck is a CDC streamer — the
+    # source connection reads a forward-moving snapshot range every poll, and
+    # each range touches a fresh set of parquet files (new source snapshots
+    # produce new files). The cache is pure dead weight: it retains every
+    # row-group range ever fetched but nothing ever re-reads them.
+    #
+    # Left at the default (unlimited), it climbed at ~5 GiB/h on the events_nrt
+    # pipeline and hit the container's 48 GiB limit in ~8h — confirmed via
+    # [MEMTRACE] on prod (EXTERNAL_FILE_CACHE was the entire duckdb_memory()
+    # footprint at 14+ GiB and still climbing).
+    #
+    # Applies to both source and destination via with_connection_defaults().
+    # On the destination the cache could help on upsert (DuckLake reads the
+    # target row groups to resolve conflicts), but today there's only one
+    # destination per viaduck deployment so the pool never evicts it — and
+    # even so, unbounded is unbounded. Once we run many destinations per
+    # viaduck we should split the defaults and give destinations a bounded
+    # cap (e.g. `external_file_cache_size=256MB`) rather than off; for now,
+    # off keeps the memory picture symmetric with the source and easy to
+    # reason about.
+    "enable_external_file_cache": "false",
 }
 
 
