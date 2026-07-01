@@ -73,11 +73,25 @@ def load_table(catalog: Catalog, table_name: str) -> Table:
 
 
 def current_snapshot_id(table: Table) -> int | None:
-    """Get the current snapshot ID, or None if no snapshots exist."""
-    snap = table.current_snapshot()
-    if snap is None:
+    """Get the current (max) snapshot ID, or None if no snapshots exist.
+
+    Queries MAX(snapshot_id) directly rather than delegating to pyducklake's
+    Table.current_snapshot(), which loads every snapshot row via
+    Table.snapshots() and returns the last. On a catalog with hundreds of
+    thousands of snapshots, that materializes the whole table into DuckDB's
+    sort pipeline + Python Snapshot objects on every call — the source
+    connection's allocator arenas retain the freed extents and the process
+    RSS climbs linearly per poll cycle. Same fix pattern as
+    earliest_snapshot_id below.
+    """
+    catalog_name = table._catalog.name
+    meta_schema = f"__ducklake_metadata_{catalog_name}".replace('"', '""')
+    row = table._catalog.connection.execute(
+        f'SELECT MAX(snapshot_id) FROM "{meta_schema}".ducklake_snapshot'
+    ).fetchone()
+    if row is None or row[0] is None:
         return None
-    return snap.snapshot_id
+    return int(row[0])
 
 
 def earliest_snapshot_id(table: Table) -> int | None:

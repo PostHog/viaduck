@@ -30,27 +30,12 @@ def test_pyducklake_table_schema_is_a_property():
     )
 
 
-def test_pyducklake_table_current_snapshot_is_callable():
-    """`Table.current_snapshot()` must be callable — viaduck invokes it in source.py."""
-    from pyducklake.table import Table
-
-    descriptor = inspect.getattr_static(Table, "current_snapshot")
-    assert not isinstance(descriptor, property), (
-        "pyducklake.Table.current_snapshot became a @property. viaduck/source.py "
-        "calls it as a method — drop the parens."
-    )
-    assert callable(descriptor)
-
-
-def test_pyducklake_table_snapshots_is_callable():
-    """`Table.snapshots()` must be callable — viaduck invokes it transitively
-    via `current_snapshot()`.
-    """
-    from pyducklake.table import Table
-
-    descriptor = inspect.getattr_static(Table, "snapshots")
-    assert not isinstance(descriptor, property)
-    assert callable(descriptor)
+# Note: viaduck no longer calls `Table.current_snapshot()` or `Table.snapshots()`.
+# Those pyducklake methods materialize every snapshot row into Python and were
+# leaking memory on large catalogs. `source.current_snapshot_id` now queries
+# MAX(snapshot_id) directly (mirroring `earliest_snapshot_id`). If either
+# pyducklake method is reintroduced anywhere in viaduck, restore the
+# corresponding assumption test here.
 
 
 def test_pyducklake_catalog_load_table_is_callable():

@@ -14,27 +14,32 @@ def setup_module():
     metrics.init("test")
 
 
-def test_current_snapshot_id_returns_id():
-    table = MagicMock()
-    snap = MagicMock()
-    snap.snapshot_id = 42
-    table.current_snapshot.return_value = snap
-    assert current_snapshot_id(table) == 42
-
-
-def test_current_snapshot_id_returns_none():
-    table = MagicMock()
-    table.current_snapshot.return_value = None
-    assert current_snapshot_id(table) is None
-
-
-def _make_table_with_catalog(catalog_name: str, min_snapshot: int | None):
-    """Build a mock Table whose catalog connection returns min_snapshot from MIN query."""
+def _make_table_with_catalog(catalog_name: str, snapshot_agg: int | None):
+    """Build a mock Table whose catalog connection returns snapshot_agg from any snapshot-aggregate query."""
     table = MagicMock()
     table._catalog.name = catalog_name
-    row = (min_snapshot,) if min_snapshot is not None else (None,)
+    row = (snapshot_agg,) if snapshot_agg is not None else (None,)
     table._catalog.connection.execute.return_value.fetchone.return_value = row
     return table
+
+
+def test_current_snapshot_id_returns_max():
+    table = _make_table_with_catalog("megaduck-mw-prod-us", 5_000_042)
+    result = current_snapshot_id(table)
+    assert result == 5_000_042
+    sql = table._catalog.connection.execute.call_args[0][0]
+    assert "MAX(snapshot_id)" in sql
+    # Must NOT delegate to pyducklake's Table.current_snapshot() — that path loads every snapshot
+    # row into memory and produced a per-poll-cycle allocator leak on large catalogs.
+    table.current_snapshot.assert_not_called()
+    # Schema name must be double-quoted so hyphens in catalog names are valid identifiers
+    assert '"__ducklake_metadata_megaduck-mw-prod-us"' in sql
+
+
+def test_current_snapshot_id_returns_none_on_empty_catalog():
+    table = _make_table_with_catalog("empty-cat", None)
+    assert current_snapshot_id(table) is None
+    table.current_snapshot.assert_not_called()
 
 
 def test_earliest_snapshot_id_returns_min():
