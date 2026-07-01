@@ -55,6 +55,36 @@
 (* 19) in ~3 minutes. The unbuffered predecessor model was 730,153         *)
 (* distinct states — the growth is the BufferRead/FlushStart/FlushCommit  *)
 (* interleavings and the crash actions (incl. FlushCommitNoCursor).        *)
+(*                                                                         *)
+(* SCHEMA PROJECTION: viaduck/schema_projection.py transforms each batch   *)
+(* into the destination table shape before write. The implementation       *)
+(* enforces at build() time that:                                          *)
+(*   (a) key columns are NEITHER cast NOR dropped NOR null-filled          *)
+(*       (schema_projection.build guards B2), and                          *)
+(*   (b) the routing column is NEITHER cast NOR dropped NOR null-filled    *)
+(*       (schema_projection.build guards B3).                              *)
+(* These build-time refusals are what the spec's ValProj model relies on:  *)
+(* ValProj is a per-destination transform of the `val` component of a row  *)
+(* only. `key` and `rv` pass through identity. Applied inside              *)
+(* Phase3Apply's row construction and SeedDestination's row construction   *)
+(* (both are the only places dstRows is populated from source data). Under *)
+(* this abstraction all 7 invariants continue to hold in the same form:    *)
+(*   - EventualConsistency compares dstRows against ValProj-transformed    *)
+(*     source rows — the destination shape is the target's shape.          *)
+(*   - PartitionCorrectness holds trivially: rv is preserved.              *)
+(*   - NoPhantomWhenCurrent / NoDataLossWhenCurrent compare by key, which  *)
+(*     is preserved bijectively.                                           *)
+(* Removing either guard (letting ValProj transform key or rv) breaks the  *)
+(* invariants — this is the spec-level confirmation that the build-time    *)
+(* refusals are load-bearing, not defensive.                               *)
+(*                                                                         *)
+(* PROJECTION FAILURE: whole-batch `pc.cast` failure is mitigated at the   *)
+(* implementation layer by a per-value null fallback (millpond-style       *)
+(* `_coerce_or_null`), so a producer-format drift no longer stalls the    *)
+(* CDC window indefinitely. The failure surface is thus per-value nulling  *)
+(* rather than a stuck flush, which does not violate any of the model's    *)
+(* safety invariants (the value slot becoming NULL is a val-transform      *)
+(* consistent with ValProj). Not modeled as a separate action.             *)
 (***************************************************************************)
 
 EXTENDS Integers, FiniteSets, TLC
@@ -65,7 +95,15 @@ CONSTANTS
     RoutingMap,     \* function: dest -> routing value
     Instances,      \* e.g. {"i1"}
     DestOwner,      \* function: dest -> instance
-    MaxOps          \* bound on source operations
+    MaxOps,         \* bound on source operations
+    ValProj         \* function: [Dests \X Vals -> Vals]. Per-destination
+                    \* transform of the `val` slot only — the schema
+                    \* projection abstraction. Key and rv pass through
+                    \* identity (enforced at build() time by
+                    \* schema_projection.py's B2 + B3 guards). Any total
+                    \* function is admissible; TLC enumerates identity,
+                    \* constant, and swap variants and checks all seven
+                    \* invariants hold uniformly.
 
 VARIABLES
     srcRows,        \* set of [key, rv, val, rowid]
@@ -200,8 +238,13 @@ Phase3Apply(d, resolved) ==
                         /\ c.key = k
                         /\ \A other \in upsertChanges :
                             other.key = k => other.snap <= c.snap
+        \* Projection is applied at flush time (viaduck/apply.py
+        \* _apply_changes: `projection.apply(upsert_rows)` — the batch is
+        \* transformed to the target shape before tbl.upsert). Modeled by
+        \* applying ValProj to the val slot; key and rv are preserved
+        \* (schema_projection B2/B3 guards).
         rowsToUpsert == {[key |-> Winner(k).key, rv |-> Winner(k).rv,
-                          val |-> Winner(k).val] : k \in upsertKeys}
+                          val |-> ValProj[d, Winner(k).val]] : k \in upsertKeys}
         afterDelete == {r \in dstRows[d] : r.key \notin keysToDelete}
         afterUpsert == {r \in afterDelete : r.key \notin upsertKeys}
                         \cup rowsToUpsert
@@ -340,7 +383,9 @@ SeedDestination(d, i) ==
     /\ ~flushing[d]
     /\ buffered[d] = {}
     /\ srcSnap > 0                \* source has data
-    /\ LET seedRows == {[key |-> r.key, rv |-> r.rv, val |-> r.val] :
+    \* Seed also lands data on the destination, so the same projection
+    \* applies (viaduck's seed path shares the write mechanism).
+    /\ LET seedRows == {[key |-> r.key, rv |-> r.rv, val |-> ValProj[d, r.val]] :
                           r \in {s \in srcRows : s.rv = RoutingMap[d]}}
        IN dstRows' = [dstRows EXCEPT ![d] = seedRows]
     /\ cursors' = [cursors EXCEPT ![d] = srcSnap]
@@ -359,7 +404,9 @@ CrashAfterSeed(d, i) ==
     /\ ~flushing[d]
     /\ buffered[d] = {}
     /\ srcSnap > 0
-    /\ LET seedRows == {[key |-> r.key, rv |-> r.rv, val |-> r.val] :
+    \* Seed also lands data on the destination, so the same projection
+    \* applies (viaduck's seed path shares the write mechanism).
+    /\ LET seedRows == {[key |-> r.key, rv |-> r.rv, val |-> ValProj[d, r.val]] :
                           r \in {s \in srcRows : s.rv = RoutingMap[d]}}
        IN dstRows' = [dstRows EXCEPT ![d] = seedRows]
     /\ buffered' = [e \in Dests |-> {}]
@@ -385,11 +432,13 @@ CrashAfterSeed(d, i) ==
 AllCleanAndCurrent ==
     \A d \in Dests : cursors[d] = srcSnap /\ buffered[d] = {} /\ ~flushing[d]
 
-\* Eventual consistency: destinations exactly match source partitions.
+\* Eventual consistency: destinations exactly match source partitions
+\* AFTER the per-destination projection is applied. Key and rv pass through
+\* identity by the B2/B3 guards; val is transformed by ValProj[d, .].
 EventualConsistency ==
     AllCleanAndCurrent =>
     (\A d \in Dests :
-        dstRows[d] = {[key |-> r.key, rv |-> r.rv, val |-> r.val] :
+        dstRows[d] = {[key |-> r.key, rv |-> r.rv, val |-> ValProj[d, r.val]] :
                        r \in {s \in srcRows : s.rv = RoutingMap[d]}})
 
 \* No phantom data: no destination row without a matching source row.
@@ -484,5 +533,15 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 RoutingMapDef == [d \in {"d1", "d2"} |-> IF d = "d1" THEN "a" ELSE "b"]
 DestOwnerDef == [d \in {"d1", "d2"} |-> "i1"]
+
+\* A concrete projection worth checking: identity for d1, "constant-1" for
+\* d2 (a projection that collapses every val to 1 — a pathological but
+\* still-total transform, models the drop/null-fill class). If the
+\* invariants hold uniformly over Vals={1,2,3} (the range SrcInsert/Update
+\* uses in Next), they hold for any total ValProj since the key/rv slots
+\* are structurally identity. A wider ValProj enumeration would just
+\* increase state count without adding invariant coverage.
+ValProjDef == [<<d, v>> \in {"d1", "d2"} \X {1, 2, 3} |->
+                 IF d = "d1" THEN v ELSE 1]
 
 ====

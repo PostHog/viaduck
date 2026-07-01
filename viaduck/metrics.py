@@ -177,6 +177,17 @@ _partition_spec_total = Counter(
     ["pipeline", "destination", "outcome"],
 )
 
+# Per-value cast fallbacks in schema_projection._cast_column. The whole-batch
+# `pc.cast` is all-or-nothing; on ArrowInvalid we fall back per-value and null
+# the unparseable values, mirroring millpond's `_coerce_or_null`. This counter
+# is the alarm signal: if this ever ticks in prod it means a producer format
+# drift is silently nulling data — one row per null.
+_projection_cast_null_fallback_total = Counter(
+    "viaduck_projection_cast_null_fallback_total",
+    "Values nulled by per-value fallback in schema_projection._cast_column",
+    ["pipeline", "destination", "column"],
+)
+
 # --- Public names (replaced by init() with pipeline-bound instances) ---
 
 polls_total = _polls_total
@@ -214,6 +225,7 @@ delivery_flush_seconds = _delivery_flush_seconds
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 
 partition_spec_total = _partition_spec_total
+projection_cast_null_fallback_total = _projection_cast_null_fallback_total
 
 
 def init(pipeline: str):
@@ -229,7 +241,7 @@ def init(pipeline: str):
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
-    global partition_spec_total
+    global partition_spec_total, projection_cast_null_fallback_total
 
     # Metrics with additional labels — wrap so .labels() auto-injects pipeline
     dest_write_seconds = _AutoPipelineLabels(_dest_write_seconds, pipeline)
@@ -245,6 +257,7 @@ def init(pipeline: str):
     dest_rows_deleted_total = _AutoPipelineLabels(_dest_rows_deleted_total, pipeline)
     dest_rows_upserted_total = _AutoPipelineLabels(_dest_rows_upserted_total, pipeline)
     partition_spec_total = _AutoPipelineLabels(_partition_spec_total, pipeline)
+    projection_cast_null_fallback_total = _AutoPipelineLabels(_projection_cast_null_fallback_total, pipeline)
     dest_upsert_matched_total = _AutoPipelineLabels(_dest_upsert_matched_total, pipeline)
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()

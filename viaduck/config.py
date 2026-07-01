@@ -265,6 +265,18 @@ class DestinationConfig:
     # destination compactor (it groups files by partition_id and trips
     # the line-546 hive-prefix assertion on mixed layouts).
     partition_by_allow_alter_populated: bool = False
+    # Schema projection: when writing into a destination whose Arrow schema
+    # doesn't match the source (canonical `posthog.events` — DLT-backfilled
+    # timestamptz shape — vs the raw-Kafka `events_nrt` shape millpond
+    # emits), build a projection at pool-open time and apply it before each
+    # write. See viaduck/schema_projection.py. Off by default; identity is
+    # the historical behavior.
+    schema_projection_enabled: bool = False
+    # Source columns to silently drop as part of the projection. Empty by
+    # default — the projection raises `SchemaProjectionError` at pool-open
+    # time on any source column not in the target and not in this list.
+    # Typical entries: `captured_at` when writing to canonical events.
+    drop_source_columns: tuple[str, ...] = ()
 
     @property
     def postgres_uri(self) -> str:
@@ -568,6 +580,26 @@ def load(path: str | Path) -> ViaduckConfig:
                 f"destinations[{i}].partition_by_allow_alter_populated must be a boolean "
                 f"(got {type(allow_alter_raw).__name__})"
             )
+        schema_proj_raw = d.get("schema_projection_enabled", False)
+        if not isinstance(schema_proj_raw, bool):
+            raise ConfigError(
+                f"destinations[{i}].schema_projection_enabled must be a boolean (got {type(schema_proj_raw).__name__})"
+            )
+        drop_cols_raw = d.get("drop_source_columns", [])
+        if not isinstance(drop_cols_raw, list) or not all(isinstance(c, str) for c in drop_cols_raw):
+            raise ConfigError(
+                f"destinations[{i}].drop_source_columns must be a list of strings (got {type(drop_cols_raw).__name__})"
+            )
+        # Interlock: `drop_source_columns` is meaningless without projection,
+        # and reading as a no-op is a silent-corruption footgun — the operator
+        # thinks the drop is happening but the shipped write path is still
+        # positional over the source schema. Refuse at load time.
+        if drop_cols_raw and not schema_proj_raw:
+            raise ConfigError(
+                f"destinations[{i}].drop_source_columns={drop_cols_raw!r} is non-empty but "
+                f"schema_projection_enabled=false; the drop would be silently ignored. "
+                f"Set schema_projection_enabled=true or remove drop_source_columns."
+            )
         destinations.append(
             DestinationConfig(
                 id=_require_non_empty(str(d.get("id", "")), f"destinations[{i}].id"),
@@ -581,6 +613,8 @@ def load(path: str | Path) -> ViaduckConfig:
                 properties=dest_props,
                 partition_by=_validate_partition_by(d.get("partition_by"), f"destinations[{i}].partition_by"),
                 partition_by_allow_alter_populated=allow_alter_raw,
+                schema_projection_enabled=schema_proj_raw,
+                drop_source_columns=tuple(drop_cols_raw),
             )
         )
 

@@ -18,6 +18,7 @@ import pyarrow.compute as pc
 from viaduck import metrics
 from viaduck.arrowutil import row_indices
 from viaduck.router import RoutingError
+from viaduck.schema_projection import SchemaProjectionError
 from viaduck.source import strip_meta
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,13 @@ def _write_with_retry(dest_pool, destination_id, operation):
                 return operation(catalog, table)
             finally:
                 dest_pool.release(destination_id)
+        except SchemaProjectionError:
+            # Permanent by construction — the source/target schemas don't
+            # change between attempts, so retrying wastes exponential backoff
+            # (up to 3s here) and logs misleading "Write to X failed"
+            # messages for what is actually a build-time schema-drift error.
+            # Fail fast, surface the projection error to the caller.
+            raise
         except Exception as exc:
             if attempt == _WRITE_MAX_RETRIES - 1:
                 raise
@@ -282,7 +290,14 @@ def _dedupe_upserts_last_write_wins(upsert_rows: pa.Table, key_columns: list[str
     return ordered.take(winners.column("__idx_max")).drop(["__idx"])
 
 
-def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str]) -> dict[str, int]:
+def _apply_changes(
+    catalog,
+    dest_table,
+    batch: pa.Table,
+    key_columns: list[str],
+    projection=None,
+    on_null_fallback=None,
+) -> dict[str, int]:
     """Apply CDC changes to a destination table atomically.
 
     Deletes are applied first, then upserts, within a single catalog transaction.
@@ -312,6 +327,19 @@ def _apply_changes(catalog, dest_table, batch: pa.Table, key_columns: list[str])
     )
     # Winner(k) BEFORE stripping meta — the dedup orders by snapshot_id/rowid.
     upsert_rows = strip_meta(_dedupe_upserts_last_write_wins(batch.filter(upsert_mask), key_columns))
+
+    # `_build_delete_filter` only consumes `key_columns`, and B2 guards
+    # guarantee key columns pass through the projection untouched. So skip
+    # projection on delete_rows entirely and narrow the batch to key columns
+    # only — avoids running (potentially per-value fallback) casts on payload
+    # columns whose values we're about to discard anyway.
+    if delete_rows.num_rows > 0:
+        delete_rows = delete_rows.select(key_columns)
+
+    # Upsert rows still need the full projection: tbl.upsert writes every
+    # column into the destination shape.
+    if projection is not None and upsert_rows.num_rows > 0:
+        upsert_rows = projection.apply(upsert_rows, on_null_fallback=on_null_fallback)
 
     counts = {"deleted": 0, "upserted": 0, "upsert_matched": 0}
 
@@ -350,11 +378,37 @@ def apply_full_cdc(dest_pool, dest_id: str, batch: pa.Table, key_columns: list[s
     resolved = _resolve_conflicts(batch)
     if resolved.num_rows == 0:
         return 0
+
+    # Accumulate per-column fallback counts across retry attempts. Overwrite
+    # per column: projection.apply is deterministic on the same batch, so
+    # each attempt reproduces the same count — overwriting is idempotent
+    # under retry, and .inc() runs exactly once after the write commits. A
+    # per-attempt .inc() would inflate `viaduck_projection_cast_null_fallback_total`
+    # by up to `_WRITE_MAX_RETRIES`, drowning the drift alarm signal in
+    # retry noise.
+    fallback_counts: dict[str, int] = {}
+
+    def _null_fallback(column: str, count: int) -> None:
+        fallback_counts[column] = count
+
+    # Resolve projection INSIDE the lambda: `_write_with_retry` may evict
+    # and reopen the destination between attempts (destination.py:_projections
+    # is repopulated by `_create()`), so capturing the plan outside the loop
+    # would keep a stale reference across schema-drift-triggered retries.
     counts = _write_with_retry(
         dest_pool,
         dest_id,
-        lambda cat, tbl: _apply_changes(cat, tbl, resolved, key_columns),
+        lambda cat, tbl: _apply_changes(
+            cat,
+            tbl,
+            resolved,
+            key_columns,
+            projection=dest_pool.projection_for(dest_id),
+            on_null_fallback=_null_fallback,
+        ),
     )
+    for column, count in fallback_counts.items():
+        metrics.projection_cast_null_fallback_total.labels(destination=dest_id, column=column).inc(count)
     if counts["deleted"] > 0:
         metrics.dest_rows_deleted_total.labels(destination=dest_id).inc(counts["deleted"])
     if counts["upserted"] > 0:
@@ -394,6 +448,23 @@ def append_only(dest_pool, dest_id: str, batch: pa.Table) -> int:
             "append_only(), or DuckLake's table_insertions contract changed. Refusing to write "
             "potentially-misclassified rows."
         )
-    _write_with_retry(dest_pool, dest_id, lambda cat, tbl, b=batch: tbl.append(b))
+
+    # See comment in apply_full_cdc: accumulate per-column fallback counts
+    # and emit exactly once post-commit so retries don't inflate the drift
+    # alarm signal.
+    fallback_counts: dict[str, int] = {}
+
+    def _null_fallback(column: str, count: int) -> None:
+        fallback_counts[column] = count
+
+    def _apply(cat, tbl):
+        # Resolve INSIDE the retry lambda — see comment in apply_full_cdc.
+        projection = dest_pool.projection_for(dest_id)
+        b = batch if projection is None else projection.apply(batch, on_null_fallback=_null_fallback)
+        tbl.append(b)
+
+    _write_with_retry(dest_pool, dest_id, _apply)
+    for column, count in fallback_counts.items():
+        metrics.projection_cast_null_fallback_total.labels(destination=dest_id, column=column).inc(count)
     metrics.dest_rows_written_total.labels(destination=dest_id).inc(batch.num_rows)
     return batch.num_rows
