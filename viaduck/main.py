@@ -48,7 +48,9 @@ Phases:
 """
 
 import argparse
+import gc
 import logging
+import os
 import signal
 import threading
 import time
@@ -985,6 +987,68 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
             cycle_secs,
         )
 
+    # Temporary leak diagnostic: log DuckDB's own memory tracker + OS RSS every
+    # poll cycle. duckdb_memory() reports process-wide DuckDB buffer-manager
+    # tags but NOT extension `malloc` / `std::vector` allocations, so "flat
+    # tracker" does not prove the leak is outside DuckDB — it could still be
+    # inside the DuckLake extension. Grep-anchor `[MEMTRACE]`. REMOVE once the
+    # OOM leak is diagnosed.
+    _log_memory_stats(src_table.catalog.connection)
+
+
+_MEM_STATS_FAILURES = 0
+_MEM_STATS_LOG_EVERY_NTH_FAILURE = 100
+
+
+def log_startup_memory() -> None:
+    """One-shot at process start so on-call can slice memory-since-boot."""
+    try:
+        rss_kb = 0
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"):
+                rss_kb = int(line.split()[1])
+                break
+        log.info("[MEMTRACE] startup pid=%d rss=%.2fGiB", os.getpid(), rss_kb / 1024 / 1024)
+    except Exception:
+        log.warning("[MEMTRACE] startup log failed", exc_info=True)
+
+
+def _log_memory_stats(conn) -> None:
+    """Log OS RSS, DuckDB per-tag memory tracker, and Python object count in one line.
+
+    Best-effort; failures are rate-limited (log every 100th) to avoid a log
+    storm if this consistently breaks. Must never kill the CDC loop.
+    """
+    global _MEM_STATS_FAILURES
+    try:
+        rss_kb = vms_kb = 0
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"):
+                rss_kb = int(line.split()[1])
+            elif line.startswith("VmSize:"):
+                vms_kb = int(line.split()[1])
+        rows = conn.execute(
+            "SELECT tag, memory_usage_bytes, temporary_storage_bytes "
+            "FROM duckdb_memory() ORDER BY memory_usage_bytes DESC"
+        ).fetchall()
+        total_used = sum(r[1] for r in rows)
+        total_temp = sum(r[2] for r in rows)
+        top = ", ".join(f"{tag}={used / 1024 / 1024:.0f}MB" for tag, used, _ in rows[:5])
+        py_objs = len(gc.get_objects())
+        log.info(
+            "[MEMTRACE] rss=%.2fGiB vms=%.2fGiB duckdb_used=%.2fGiB duckdb_temp=%.2fGiB py_objs=%d top5={%s}",
+            rss_kb / 1024 / 1024,
+            vms_kb / 1024 / 1024,
+            total_used / 1024 / 1024 / 1024,
+            total_temp / 1024 / 1024 / 1024,
+            py_objs,
+            top,
+        )
+    except Exception:
+        _MEM_STATS_FAILURES += 1
+        if _MEM_STATS_FAILURES == 1 or _MEM_STATS_FAILURES % _MEM_STATS_LOG_EVERY_NTH_FAILURE == 0:
+            log.warning("[MEMTRACE] logging failed (occurrence #%d)", _MEM_STATS_FAILURES, exc_info=True)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Viaduck — DuckLake to DuckLake CDC replication")
@@ -997,6 +1061,7 @@ def main():
     except ImportError:
         __version__ = "unknown"
     log.info("viaduck %s starting", __version__)
+    log_startup_memory()
     cfg = config.load(args.config)
     run(cfg)
 
