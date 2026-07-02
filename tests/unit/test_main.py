@@ -619,7 +619,8 @@ def _make_delivery(positions: dict[str, int]):
     delivery = MagicMock()
     delivery.positions.return_value = dict(positions)
     delivery.read_plan.return_value = {d: (snap, 0) for d, snap in positions.items()}
-    delivery.should_pause_reads.return_value = False
+    delivery.should_pause_all_reads.return_value = False
+    delivery.should_pause_reads_for.return_value = False
     delivery.maybe_flush.return_value = 0
     delivery.status_snapshot.return_value = {
         d: DestDeliveryStatus(
@@ -914,10 +915,10 @@ def test_poll_cycle_advances_no_data_destinations():
 
 
 def test_poll_cycle_pauses_reads_at_watermark():
-    """When the global buffer watermark is hit with all flushes in flight,
-    the cycle skips reads but still evaluates triggers."""
+    """When every destination is at its buffer cap, the cycle skips reads
+    entirely but still evaluates flush triggers."""
     delivery = _make_delivery({"dest-1": 5})
-    delivery.should_pause_reads.return_value = True
+    delivery.should_pause_all_reads.return_value = True
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
 
@@ -948,8 +949,9 @@ def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
     empty = pa.table({"company": pa.array([], type=pa.string())})
     router.build_filter_expr.return_value = None
 
-    # outer check: False; inner chunk-1 check: False; inner chunk-2 check: True (pause)
-    delivery.should_pause_reads.side_effect = [False, False, True]
+    # One cap check per destination per chunk iteration:
+    # chunk-1 check False (read 0→5); chunk-2 check True (pause).
+    delivery.should_pause_reads_for.side_effect = [False, True]
 
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
@@ -990,11 +992,11 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
     cfg = _make_cfg([("dest-caughtup", "cup"), ("dest-lagging", "lag")])
     cfg.poll.cdc_chunk_snapshots = 200
 
-    # Watermark trips after the FIRST chunk read: outer check False; inner
-    # check for the first group False (allows one read); inner check for
-    # the second group True (skips it). Whichever group iterates first
-    # gets the read.
-    delivery.should_pause_reads.side_effect = [False, False, True, True]
+    # One cap check per destination per chunk iteration. Caps trip after
+    # the FIRST chunk read: lagging group's chunk-1 check False (one read),
+    # chunk-2 check True (cap filled); the caught-up group's chunk-1 check
+    # True (also at cap). Whichever group iterates first gets the only read.
+    delivery.should_pause_reads_for.side_effect = [False, True, True]
 
     read_calls: list[tuple[int, int]] = []
 
@@ -1027,6 +1029,113 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
     assert read_calls[0][0] == 100, (
         f"lagging cursor should have read first; instead read started at {read_calls[0][0]} "
         f"(the config-order-first, caught-up destination)"
+    )
+
+
+def test_poll_cycle_stuck_destination_at_cap_does_not_block_healthy_peer():
+    """The tonight-in-prod regression this whole change exists for: a
+    lagging destination whose queue is pinned at its per-destination cap
+    (failing flushes hold its in-flight bytes) must NOT prevent a healthy
+    peer's group from reading. Under the old GLOBAL watermark, the stuck
+    destination's bytes tripped the shared check and the healthy peer's
+    first chunk check bounced it out with zero reads — team-2's cursor
+    froze for 1.5h while team-50689 held ~250MB in flight.
+    """
+    delivery = _make_delivery({"dest-stuck": 100, "dest-healthy": 900})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-stuck", "stk"), ("dest-healthy", "ok")])
+    cfg.poll.cdc_chunk_snapshots = 200
+
+    # dest-stuck is at ITS cap (queue full, flush failing); dest-healthy
+    # has headroom. Per-destination gating: stuck's group skips, healthy's
+    # group reads.
+    delivery.should_pause_reads_for.side_effect = lambda d: d == "dest-stuck"
+
+    read_calls: list[tuple[int, int]] = []
+
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+        read_calls.append((after_snapshot, end_snapshot))
+        return pa.table({"company": pa.array([], type=pa.string())})
+
+    router.build_filter_expr.return_value = None
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=1000),
+        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-stuck", "dest-healthy"],
+            {"stk": "dest-stuck", "ok": "dest-healthy"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    # The healthy destination read its range; the stuck one was skipped.
+    assert read_calls == [(900, 1000)], (
+        f"healthy peer must read while the stuck destination sits at its cap, got {read_calls}"
+    )
+
+
+def test_poll_cycle_mixed_group_reads_only_members_with_headroom():
+    """QE must-fix #2 + both principal-SWE HIGHs: two destinations share a
+    cursor group; one is at its cap (slow/hung flush holding its in-flight
+    bytes), the other has headroom. The chunk read must proceed for the
+    healthy member ONLY: the at-cap member's routing value is excluded from
+    the CDC filter and its position stays frozen (it splits into its own
+    group next cycle). Under the earlier all()-gate + unconditional
+    buffer(), the at-cap member kept receiving its split slice on the
+    peer's headroom — unbounded growth for as long as its flush hung,
+    with no global watermark left to backstop it.
+    """
+    delivery = _make_delivery({"dest-full": 100, "dest-ok": 100})  # same cursor → one group
+    router = MagicMock()
+    cfg = _make_cfg([("dest-full", "full"), ("dest-ok", "ok")])
+    cfg.poll.cdc_chunk_snapshots = 200
+
+    delivery.should_pause_reads_for.side_effect = lambda d: d == "dest-full"
+
+    arrow_data = pa.table({"company": ["ok"], "value": [1]})
+    router.split_and_count.return_value = ({"ok": arrow_data}, 0)
+
+    filter_calls: list[list[str]] = []
+
+    def fake_filter(routing_values):
+        filter_calls.append(list(routing_values))
+        return "company IN (...)"
+
+    router.build_filter_expr.side_effect = fake_filter
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=300),
+        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-full", "dest-ok"],
+            {"full": "dest-full", "ok": "dest-ok"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    # The CDC filter only ever asked for the healthy member's rows.
+    assert filter_calls and all(c == ["ok"] for c in filter_calls), (
+        f"at-cap member's routing value must be excluded from the read filter, got {filter_calls}"
+    )
+    # Healthy member buffered; at-cap member neither buffered nor advanced.
+    buffered_dests = {c.args[0] for c in delivery.buffer.call_args_list}
+    assert buffered_dests == {"dest-ok"}
+    advanced_dests = {c.args[0] for c in delivery.advance_position.call_args_list}
+    assert "dest-full" not in advanced_dests, (
+        "at-cap member's position must stay frozen so it forms its own skippable group"
     )
 
 

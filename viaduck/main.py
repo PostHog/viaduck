@@ -803,11 +803,10 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
     if current_id is not None:
         metrics.source_snapshot_id.set(current_id)
 
-        if delivery.should_pause_reads():
-            # Global buffer watermark exceeded and every buffering
-            # destination is already in flight — reading more only grows
-            # memory. Skip reads; flushes in flight will relieve it.
-            _log_watermark_paused("all flushes in flight")
+        if delivery.should_pause_all_reads():
+            # Every destination's queue is at its per-destination cap —
+            # no read anywhere would help. Flushes in flight will relieve.
+            _log_watermark_paused("all destinations at buffer cap")
         else:
             _log_watermark_cleared()
             plan = delivery.read_plan()
@@ -834,11 +833,6 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
             for start_snap, dest_ids in sorted(groups.items()):
                 if start_snap >= current_id:
                     continue  # already read through the current snapshot
-                cycle_groups_processed += 1
-
-                # Map dest_ids to their routing values for filter/split
-                routing_values = [cfg.destination_by_id(d).routing_value for d in dest_ids]
-                filter_expr = router.build_filter_expr(routing_values)
 
                 # Read CDC in snapshot chunks to bound memory use.
                 # Each chunk is read, routed, and buffered before the next is fetched.
@@ -846,11 +840,29 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                 chunk_start = start_snap
                 routing_error = False
                 chunks_this_group = 0
+                group_read_anything = False
                 while chunk_start < current_id and chunks_this_group < _MAX_CHUNKS_PER_GROUP_PER_CYCLE:
                     chunks_this_group += 1
-                    if delivery.should_pause_reads():
-                        _log_watermark_paused("mid-chunk")
+                    # Per-destination backpressure, recomputed every chunk:
+                    # only members with queue headroom participate in this
+                    # chunk's read — the filter excludes an at-cap member's
+                    # rows and its position stays frozen, so it splits into
+                    # its own cursor group next cycle and is skipped until
+                    # a flush drains it. A destination that crosses its cap
+                    # mid-cycle therefore overshoots by AT MOST ONE chunk.
+                    # Both principal-SWE reviews flagged the earlier
+                    # group-level all() gate here: an at-cap member kept
+                    # receiving its split slice on a healthy groupmate's
+                    # headroom, unbounded for as long as the member's flush
+                    # was slow or hung — with the global watermark gone,
+                    # that was an OOM path, not just an overshoot.
+                    readable = [d for d in dest_ids if not delivery.should_pause_reads_for(d)]
+                    if not readable:
+                        log.debug("Pausing reads for group at %d: all destinations at buffer cap", start_snap)
                         break
+                    routing_values = [cfg.destination_by_id(d).routing_value for d in readable]
+                    filter_expr = router.build_filter_expr(routing_values)
+                    group_read_anything = True
                     chunk_end = min(chunk_start + chunk_size, current_id)
                     snap_range = f"{chunk_start}→{chunk_end}"
                     chunk_t0 = time.monotonic()
@@ -881,7 +893,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                         cycle_rows_read += raw_data.num_rows
 
                         if raw_data.num_rows == 0:
-                            for did in dest_ids:
+                            for did in readable:
                                 delivery.advance_position(did, chunk_end, epoch=epochs[did])
                             log.info(
                                 "CDC chunk %s: 0 rows in %.1fs, %d snapshots remaining",
@@ -923,7 +935,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                             routed_dest_ids.add(dest_id)
                             if batch.num_rows > 0:
                                 delivery.buffer(dest_id, batch, chunk_end, epoch=epochs[dest_id])
-                        for did in dest_ids:
+                        for did in readable:
                             if did not in routed_dest_ids:
                                 delivery.advance_position(did, chunk_end, epoch=epochs[did])
 
@@ -941,6 +953,8 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                     finally:
                         _hb.set()
 
+                if group_read_anything:
+                    cycle_groups_processed += 1
                 if routing_error:
                     break
 
@@ -990,6 +1004,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
             "flush_max_rows": cfg.delivery.flush_max_rows,
             "flush_max_bytes": cfg.delivery.flush_max_bytes,
             "buffer_total_max_bytes": cfg.delivery.buffer_total_max_bytes,
+            "buffer_max_bytes_per_destination": cfg.delivery.buffer_max_bytes_per_destination,
             "pool_max_open": cfg.delivery.pool_max_open,
         },
         destinations=dest_statuses,

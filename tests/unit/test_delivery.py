@@ -307,18 +307,89 @@ def test_delivery_manager_rejects_unknown_mode():
 # ---------------------------------------------------------------------------
 
 
-def test_should_pause_reads_only_when_saturated():
-    mgr, _, _ = _manager(buffer_total_max_bytes=1)
-    assert not mgr.should_pause_reads()  # under watermark
-    mgr.buffer("d1", _table(10), 5)
-    # Over watermark but flushable -> no pause (maybe_flush will relieve).
-    assert not mgr.should_pause_reads()
+def test_should_pause_reads_for_is_destination_local():
+    """A destination at its cap pauses ITS reads only; a peer with headroom
+    keeps reading. This locality is the whole point of per-destination
+    backpressure — the old global watermark let one destination's full
+    queue pause everyone."""
+    mgr, _, _ = _manager(dests=("d1", "d2"), buffer_total_max_bytes=2)
+    # Auto-derived per-dest cap: 2 // 2 = 1 byte each.
+    assert mgr._per_dest_cap == 1
+    assert not mgr.should_pause_reads_for("d1")
+    assert not mgr.should_pause_reads_for("d2")
+
+    mgr.buffer("d1", _table(10), 5)  # d1's queue is now over its cap
+    assert mgr.should_pause_reads_for("d1")
+    assert not mgr.should_pause_reads_for("d2"), "peer with headroom must keep reading"
+    assert not mgr.should_pause_all_reads()
+
+    mgr.buffer("d2", _table(10), 5)  # now both are at cap
+    assert mgr.should_pause_all_reads()
+
+
+def test_should_pause_all_reads_false_with_zero_destinations():
+    """A partitioned instance can own zero destinations; vacuous all() must
+    not report it permanently wedged (the poll loop would sit in the
+    watermark-WARN branch every cycle forever)."""
+    mgr, _, _ = _manager(dests=())
+    assert not mgr.should_pause_all_reads()
+
+
+def test_flush_failure_clears_cap_and_reads_resume():
+    """QE must-fix #1: `_inflight_bytes` zeroing lives in _flush's finally.
+    If it moved to the success-only branch, a destination that fails ONE
+    flush would sit at cap forever with its reads paused — the exact prod
+    wedge shape. Pin the failure path: after a failed flush, the queue
+    drains (buffer dropped + inflight zeroed) and reads resume."""
+    mgr, _, pool = _manager(
+        dests=("d1",),
+        buffer_max_bytes_per_destination=1,
+        flush_interval_seconds=0.0,
+        workers=1,
+    )
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("dest down")):
+        mgr.buffer("d1", _table(5), 7)
+        assert mgr.should_pause_reads_for("d1")  # over the 1-byte cap
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+    # FlushFail: buffer dropped, in-flight zeroed → queue empty → reads resume.
+    assert not mgr.should_pause_reads_for("d1"), (
+        "failed flush must clear the destination's queue accounting or it wedges at cap"
+    )
+
+
+def test_should_pause_reads_for_counts_inflight_bytes():
+    """In-flight (swapped-out) bytes count toward the destination's queue:
+    a failing flush that holds its swap pins the destination at cap until
+    the flush resolves — reads stay paused for it, and only it."""
+    mgr, _, _ = _manager(dests=("d1", "d2"), buffer_max_bytes_per_destination=1)
     with mgr._lock:
-        mgr._inflight.add("d1")
-    # Over watermark AND everything in flight -> pause.
-    assert mgr.should_pause_reads()
-    with mgr._lock:
-        mgr._inflight.discard("d1")
+        mgr._inflight_bytes["d1"] = 100
+    assert mgr.should_pause_reads_for("d1")
+    assert not mgr.should_pause_reads_for("d2")
+
+
+def test_per_dest_cap_explicit_override_beats_auto_derive():
+    mgr, _, _ = _manager(dests=("d1", "d2"), buffer_total_max_bytes=1000, buffer_max_bytes_per_destination=7)
+    assert mgr._per_dest_cap == 7
+
+
+def test_dest_at_cap_triggers_flush_even_below_global_thresholds():
+    """A destination pinned at its cap has its reads paused, so it must
+    flush on the cap trigger rather than waiting for flush_max_bytes /
+    interval — otherwise it wedges: full queue, paused intake, no flush."""
+    mgr, _, pool = _manager(
+        dests=("d1",),
+        buffer_max_bytes_per_destination=1,
+        flush_max_bytes=10**12,  # global byte trigger unreachable
+        flush_interval_seconds=3600.0,  # interval trigger unreachable
+    )
+    fake, calls = _recording_flush(mgr)
+    with patch.object(mgr, "_flush", side_effect=fake):
+        mgr.buffer("d1", _table(10), 5)  # over the 1-byte cap
+        submitted = mgr.maybe_flush()
+    assert submitted == 1
+    assert calls and calls[0][3] == "memory"
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +509,10 @@ def test_drain_second_pass_flushes_rows_buffered_during_inflight_flush():
 
 
 def test_watermark_counts_inflight_bytes():
-    """QE M2: swapped-out (in-flight) tables count toward the watermark."""
+    """QE M2: swapped-out (in-flight) tables count toward the destination's
+    queue. While the flush is in flight, the destination is at cap and its
+    reads pause; once the flush completes, the queue drains and reads
+    resume."""
     mgr, _, _ = _manager(buffer_total_max_bytes=1, flush_interval_seconds=3600.0)
     release = threading.Event()
 
@@ -449,12 +523,14 @@ def test_watermark_counts_inflight_bytes():
     with patch("viaduck.delivery.append_only", side_effect=slow_apply):
         mgr.buffer("d1", _table(50), 5)
         assert mgr.maybe_flush(shutdown=True) == 1  # swap to in-flight
-        # Live buffer empty, but in-flight bytes keep us over the watermark
-        # and d1 is in flight -> reads must pause.
-        assert mgr.should_pause_reads()
+        # Live buffer empty, but in-flight bytes keep d1's queue at cap ->
+        # d1's reads must pause (and, d1 being the only dest, all reads).
+        assert mgr.should_pause_reads_for("d1")
+        assert mgr.should_pause_all_reads()
         release.set()
         assert mgr.wait_idle()
-    assert not mgr.should_pause_reads()
+    assert not mgr.should_pause_reads_for("d1")
+    assert not mgr.should_pause_all_reads()
 
 
 def test_on_flush_success_fires_for_data_not_for_idle_persists():
