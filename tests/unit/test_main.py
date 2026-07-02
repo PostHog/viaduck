@@ -271,6 +271,65 @@ def test_write_with_retry_log_severity_ladder():
         assert log_call.args[0] == expected, f"attempt {attempt_num} logged at {log_call.args[0]}, expected {expected}"
 
 
+def test_write_with_retry_occ_conflict_does_not_evict():
+    """An OCC commit conflict leaves the connection healthy — DuckLake takes
+    its snapshot at BeginTransaction, not connect, so retrying on the same
+    pooled connection is correct (it's what DuckLake's own internal retry
+    did). Evicting per conflict added 10-20s of reconnect per attempt AND
+    leaked ~160MB of native memory per pyducklake Catalog create — 274
+    reconnects OOM-killed the prod pod at 48Gi six times in one night."""
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    attempts = {"count": 0}
+
+    def op(catalog, table):
+        attempts["count"] += 1
+        if attempts["count"] <= 2:
+            raise RuntimeError("TransactionContext Error: Failed to commit: Failed to commit DuckLake transaction.")
+
+    with patch("viaduck.apply._backoff_sleep", return_value=False):
+        _write_with_retry(pool, "dest-1", op)
+
+    assert attempts["count"] == 3
+    pool.evict.assert_not_called()
+    # The retry still re-leases from the pool each attempt (pin/release
+    # discipline unchanged) — it just doesn't destroy the entry in between.
+    assert pool.get.call_count == 3
+
+
+def test_write_with_retry_non_occ_error_still_evicts():
+    """Connection-implicating errors (network, RDS restart) must still
+    evict + reconnect — only OCC conflicts skip the eviction."""
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    attempts = {"count": 0}
+
+    def op(catalog, table):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise ConnectionError("connection reset by peer")
+
+    with patch("viaduck.apply._backoff_sleep", return_value=False):
+        _write_with_retry(pool, "dest-1", op)
+
+    pool.evict.assert_called_once_with("dest-1")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("TransactionContext Error: Failed to commit: Failed to commit DuckLake transaction.", True),
+        ('Transaction conflict - attempting to insert into table with index "2354"', True),
+        ("connection reset by peer", False),
+        ("HTTP Error: HTTP GET error reading 'https://...' (HTTP 404 Not Found)", False),
+    ],
+)
+def test_is_occ_conflict_classification(message, expected):
+    from viaduck.apply import _is_occ_conflict
+
+    assert _is_occ_conflict(RuntimeError(message)) is expected
+
+
 def test_write_with_retry_fails_fast_on_routing_error():
     """RoutingError raised from _build_delete_filter inside the operation
     lambda is permanent (missing key column, config bug) — do NOT burn the
