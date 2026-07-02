@@ -125,6 +125,7 @@ def test_connect():
                     "enable_progress_bar": "true",
                     "enable_progress_bar_print": "false",
                     "enable_external_file_cache": "false",
+                    "ducklake_max_retry_count": "0",
                 },
             )
 
