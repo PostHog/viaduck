@@ -806,7 +806,15 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
             epochs = {d: epoch for d, (_pos, epoch) in plan.items()}
             groups = _group_by_cursor(positions, assigned_ids)
 
-            for start_snap, dest_ids in groups.items():
+            # Iterate lowest cursor first: the most-lagging group reads before
+            # a caught-up peer's turn can trip the buffer watermark. Under the
+            # prior insertion-order iteration, a destination whose cursor was
+            # further behind was silently starved whenever the first-iterated
+            # group filled the buffer mid-chunk — the outer loop moved to the
+            # next group and immediately hit `should_pause_reads()`, breaking
+            # out without reading anything. Sorting flips the priority so the
+            # laggiest destination gets first shot at each poll's read budget.
+            for start_snap, dest_ids in sorted(groups.items()):
                 if start_snap >= current_id:
                     continue  # already read through the current snapshot
                 cycle_groups_processed += 1
