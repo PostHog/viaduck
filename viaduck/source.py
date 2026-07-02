@@ -66,6 +66,18 @@ _CONNECTION_DEFAULTS = {
     # off keeps the memory picture symmetric with the source and easy to
     # reason about.
     "enable_external_file_cache": "false",
+    # Disable DuckLake's internal transaction-retry loop and defer ALL backoff
+    # decisions to viaduck.apply._write_with_retry. DuckLake's implementation
+    # (ducklake/src/storage/ducklake_transaction.cpp:2669) uses the retry
+    # index as the exponent directly — `pow(retry_backoff, i)` uncapped —
+    # so raising ducklake_max_retry_count for higher robustness blows sleeps
+    # out to hours per attempt. Even at defaults (max=10, wait=100ms, backoff=1.5)
+    # it eats ~8.5s of dead time inside each viaduck retry attempt, most of it
+    # invisible to viaduck's own metrics + shutdown paths. Setting to 0 makes
+    # DuckLake surface commit conflicts immediately; viaduck's own retry loop
+    # is the sole source of retry + backoff behavior (with jitter, cap, and
+    # stop_event awareness).
+    "ducklake_max_retry_count": "0",
 }
 
 
