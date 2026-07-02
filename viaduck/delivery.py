@@ -125,6 +125,15 @@ class DeliveryManager:
         self._buffers: dict[str, _Buffer] = {d: _Buffer() for d in assigned_ids}
         self._inflight: set[str] = set()
         self._executor = ThreadPoolExecutor(max_workers=cfg.workers, thread_name_prefix="flush")
+        # Shutdown signal threaded into apply._write_with_retry: a worker
+        # deep in the OCC retry backoff (up to ~30s per sleep, ~5 min per
+        # flush worst case) would otherwise ignore SIGTERM and get SIGKILLed
+        # by k8s at the end of terminationGracePeriodSeconds (60s default),
+        # tripping drain()'s "unflushed at deadline" warning on every rolling
+        # restart. drain() sets this so the sleep wakes early and the retry
+        # loop raises. Cursor semantics unchanged — an aborted retry is a
+        # FlushFail like any other.
+        self._stopping = threading.Event()
 
         # Position model. Initialized from the persisted cursors; the poll
         # thread reads positions for range grouping, workers move flushed
@@ -277,6 +286,11 @@ class DeliveryManager:
         abandoned with a warning (safe: persisted cursors make the ranges
         re-readable on restart — the spec's ProcessCrash path).
         """
+        # Signal to `apply._write_with_retry` that any in-flight OCC retry
+        # loop should wake and give up. Without this, workers blocked in a
+        # 30s backoff sleep continue past the drain deadline and get
+        # SIGKILLed by k8s.
+        self._stopping.set()
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             self.maybe_flush(shutdown=True)
@@ -379,9 +393,9 @@ class DeliveryManager:
             if tables:
                 batch = tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
                 if self._full_cdc:
-                    ops_count = apply_full_cdc(self._pool, dest_id, batch, self._key_columns)
+                    ops_count = apply_full_cdc(self._pool, dest_id, batch, self._key_columns, stop_event=self._stopping)
                 else:
-                    ops_count = append_only(self._pool, dest_id, batch)
+                    ops_count = append_only(self._pool, dest_id, batch, stop_event=self._stopping)
             # Cursor persist AFTER the destination commit (the gap is the
             # spec's CrashDuringFlush window). A short retry here avoids
             # invoking the full failure path (buffer drop + healthy-catalog

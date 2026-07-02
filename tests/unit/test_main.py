@@ -114,6 +114,80 @@ def test_write_with_retry_exhausted():
             _write_with_retry(pool, "dest-1", op)
 
 
+def test_write_with_retry_survives_many_transient_failures():
+    """Portola OCC scenario: peer writer commits at ~12s mean, viaduck flush
+    window 2-5s. Half the attempts race a peer commit and fail. Verify the
+    retry budget is deep enough that a run of transient failures resolves
+    before exhausting attempts."""
+    from viaduck.apply import _WRITE_MAX_RETRIES
+
+    assert _WRITE_MAX_RETRIES >= 10, (
+        "OCC-heavy destinations (concurrent-writer catalogs) need enough "
+        "retry budget to catch a P99 gap; 3 attempts is deterministic-fail "
+        "on portola-shape workloads"
+    )
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    attempts = {"count": 0}
+    fail_first_n = _WRITE_MAX_RETRIES - 2  # succeed on the second-to-last attempt
+
+    def op(catalog, table):
+        attempts["count"] += 1
+        if attempts["count"] <= fail_first_n:
+            raise Exception(f"transient OCC failure #{attempts['count']}")
+
+    with patch("viaduck.apply.time.sleep"):
+        _write_with_retry(pool, "dest-1", op)
+
+    assert attempts["count"] == fail_first_n + 1
+
+
+def test_write_with_retry_backoff_caps_and_jitters():
+    """Verify (a) delay is capped at _WRITE_MAX_DELAY_S so we don't grow
+    unbounded across 15 attempts, and (b) jitter perturbs the deterministic
+    exp schedule so N concurrent workers don't herd on the same retry tick."""
+    from viaduck.apply import _WRITE_BASE_DELAY_S, _WRITE_MAX_DELAY_S, _WRITE_MAX_RETRIES
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+
+    def op(catalog, table):
+        raise Exception("perma-fail")
+
+    delays: list[float] = []
+    with patch("viaduck.apply.time.sleep", side_effect=lambda d: delays.append(d)):
+        with pytest.raises(Exception, match="perma-fail"):
+            _write_with_retry(pool, "dest-1", op)
+
+    from viaduck.apply import _WRITE_JITTER_FRACTION
+
+    # Every delay is bounded by max * (1 + jitter_fraction), plus a small
+    # slack for float rounding.
+    upper = _WRITE_MAX_DELAY_S * (1.0 + _WRITE_JITTER_FRACTION) + 0.01
+    for d in delays:
+        assert 0 < d <= upper, f"delay {d} exceeds cap {upper}"
+
+    # We should have MAX_RETRIES - 1 sleeps (no sleep after the final failure).
+    assert len(delays) == _WRITE_MAX_RETRIES - 1
+
+    # Late attempts should hit the cap: the deterministic base at attempt
+    # log2(MAX_DELAY / BASE) is where it plateaus. Verify at least one late
+    # delay is within the jitter band around _WRITE_MAX_DELAY_S.
+    lower_band = _WRITE_MAX_DELAY_S * (1.0 - _WRITE_JITTER_FRACTION)
+    upper_band = _WRITE_MAX_DELAY_S * (1.0 + _WRITE_JITTER_FRACTION)
+    cap_hit = [d for d in delays[-3:] if lower_band <= d <= upper_band]
+    assert cap_hit, f"expected late delays in [{lower_band}, {upper_band}]s, got tail {delays[-3:]}"
+
+    # Jitter: not all delays should be equal to the deterministic exp schedule
+    # (would indicate jitter is disabled).
+    deterministic = [
+        _WRITE_BASE_DELAY_S * min(2**i, _WRITE_MAX_DELAY_S / _WRITE_BASE_DELAY_S) for i in range(len(delays))
+    ]
+    diffs = [abs(delays[i] - deterministic[i]) for i in range(len(delays))]
+    assert any(d > 0.01 for d in diffs), "jitter appears disabled — all delays are the exp base"
+
+
 def test_write_with_retry_fails_fast_on_schema_projection_error():
     """A SchemaProjectionError raised out of pool.get() (via _create →
     _maybe_build_projection → schema_projection.build) is permanent: the
@@ -141,7 +215,12 @@ def test_write_with_retry_fails_fast_on_schema_projection_error():
 
 
 def test_write_with_retry_logs_exception_message():
-    """Retry should log the actual exception message."""
+    """Retry should log the actual exception message. Early attempts (1..3)
+    are DEBUG (routine OCC dance under peer-writer pressure); WARN kicks in
+    at attempt 4+ so the log channel doesn't drown under sustained retries.
+    """
+    import logging
+
     pool = MagicMock()
     pool.get.return_value = (MagicMock(), MagicMock())
     attempts = {"count": 0}
@@ -154,8 +233,183 @@ def test_write_with_retry_logs_exception_message():
     with patch("viaduck.apply.time.sleep"), patch("viaduck.apply.log") as mock_log:
         _write_with_retry(pool, "dest-1", op)
 
-    warning_call = mock_log.warning.call_args
-    assert "connection refused" in str(warning_call)
+    log_call = mock_log.log.call_args
+    # attempt 1 → DEBUG
+    assert log_call.args[0] == logging.DEBUG, f"attempt 1 should be DEBUG, got {log_call.args[0]}"
+    assert "connection refused" in str(log_call)
+
+
+def test_write_with_retry_log_severity_ladder():
+    """Attempts 1..3 log DEBUG; attempt 4 and beyond log WARN. Ensures the
+    log signal-to-noise stays useful under sustained OCC retry pressure."""
+    import logging
+
+    from viaduck.apply import _WRITE_WARN_ATTEMPT_THRESHOLD
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+
+    # Fail exactly `_WRITE_WARN_ATTEMPT_THRESHOLD` times so we exercise both
+    # DEBUG (attempts < threshold) and WARN (attempt == threshold).
+    attempts = {"count": 0}
+    fail_first_n = _WRITE_WARN_ATTEMPT_THRESHOLD
+
+    def op(catalog, table):
+        attempts["count"] += 1
+        if attempts["count"] <= fail_first_n:
+            raise Exception(f"fail #{attempts['count']}")
+
+    with patch("viaduck.apply.time.sleep"), patch("viaduck.apply.log") as mock_log:
+        _write_with_retry(pool, "dest-1", op)
+
+    # First (threshold-1) log calls are DEBUG; the threshold-th one is WARN.
+    log_calls = mock_log.log.call_args_list
+    assert len(log_calls) == fail_first_n, f"expected {fail_first_n} log calls, got {len(log_calls)}"
+    for i, log_call in enumerate(log_calls):
+        attempt_num = i + 1
+        expected = logging.WARNING if attempt_num >= _WRITE_WARN_ATTEMPT_THRESHOLD else logging.DEBUG
+        assert log_call.args[0] == expected, f"attempt {attempt_num} logged at {log_call.args[0]}, expected {expected}"
+
+
+def test_write_with_retry_fails_fast_on_routing_error():
+    """RoutingError raised from _build_delete_filter inside the operation
+    lambda is permanent (missing key column, config bug) — do NOT burn the
+    full retry budget on it."""
+    from viaduck.router import RoutingError
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    attempts = {"count": 0}
+
+    def op(catalog, table):
+        attempts["count"] += 1
+        raise RoutingError("key column 'team_id' missing from batch")
+
+    with patch("viaduck.apply.time.sleep") as mock_sleep:
+        with pytest.raises(RoutingError, match="team_id"):
+            _write_with_retry(pool, "dest-1", op)
+
+    assert attempts["count"] == 1, "must fail fast on RoutingError, not retry"
+    mock_sleep.assert_not_called()
+
+
+def test_write_with_retry_retries_counter_increments():
+    """Every failed attempt bumps viaduck_dest_write_retries_total{destination}.
+    The successful attempt does NOT — retries is a failure counter, not an
+    attempt counter."""
+    metrics.init("test_retries_counter")
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    attempts = {"count": 0}
+    fail_first_n = 3
+
+    def op(catalog, table):
+        attempts["count"] += 1
+        if attempts["count"] <= fail_first_n:
+            raise Exception(f"fail #{attempts['count']}")
+
+    counter = metrics._dest_write_retries_total.labels(pipeline="test_retries_counter", destination="dest-r")
+    before = counter._value.get()
+
+    with patch("viaduck.apply.time.sleep"):
+        _write_with_retry(pool, "dest-r", op)
+
+    after = counter._value.get()
+    assert after - before == fail_first_n, f"expected {fail_first_n} retry bumps, got {after - before}"
+
+
+def test_write_with_retry_gauge_set_and_cleared():
+    """viaduck_dest_write_retrying is 1 during the retry loop and 0 after
+    (success OR failure). Set/clear must happen once regardless of the
+    number of attempts."""
+    metrics.init("test_gauge_scope")
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    observed_during: list[float] = []
+
+    def op(catalog, table):
+        observed_during.append(
+            metrics._dest_write_retrying.labels(pipeline="test_gauge_scope", destination="dest-g")._value.get()
+        )
+
+    with patch("viaduck.apply.time.sleep"):
+        _write_with_retry(pool, "dest-g", op)
+
+    # During op(), gauge is 1.
+    assert observed_during == [1.0], f"expected gauge=1 during op, got {observed_during}"
+    # After the retry loop, gauge is 0.
+    after = metrics._dest_write_retrying.labels(pipeline="test_gauge_scope", destination="dest-g")._value.get()
+    assert after == 0.0, f"gauge should be cleared to 0 after retry loop, got {after}"
+
+
+def test_write_with_retry_gauge_cleared_on_exhaustion():
+    """Same as above but for the exhaustion path — the finally: must clear
+    the gauge regardless of how the loop exits."""
+    metrics.init("test_gauge_exhaust")
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+
+    def op(catalog, table):
+        raise Exception("perma-fail")
+
+    with patch("viaduck.apply.time.sleep"):
+        with pytest.raises(Exception, match="perma-fail"):
+            _write_with_retry(pool, "dest-x", op)
+
+    after = metrics._dest_write_retrying.labels(pipeline="test_gauge_exhaust", destination="dest-x")._value.get()
+    assert after == 0.0, "gauge must clear even when retries exhaust"
+
+
+def test_write_with_retry_stop_event_aborts_retry():
+    """SIGTERM path: when the delivery layer sets its stop_event, an
+    in-flight retry loop wakes early from the backoff, raises the current
+    exception, and never sleeps the full delay. Without this the worker
+    ignores SIGTERM and gets SIGKILLed once k8s' termGracePeriodSeconds
+    elapses (60s vs the ~5-min retry budget)."""
+    import threading
+
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+
+    stop_event = threading.Event()
+    attempts = {"count": 0}
+
+    def op(catalog, table):
+        attempts["count"] += 1
+        # Set the stop event AFTER the first failure so the retry loop
+        # observes it during the backoff wait.
+        if attempts["count"] == 1:
+            stop_event.set()
+            raise Exception("first attempt fails")
+
+    # NOTE: no patch on time.sleep — the test wants Event.wait(delay) to
+    # actually be called, but with the event set it returns instantly
+    # regardless of the delay.
+    with pytest.raises(Exception, match="first attempt fails"):
+        _write_with_retry(pool, "dest-s", op, stop_event=stop_event)
+
+    assert attempts["count"] == 1, "retry loop should give up after stop_event set, not retry"
+
+
+def test_write_with_retry_stop_event_none_uses_time_sleep():
+    """Without a stop_event, the retry loop uses time.sleep — verify the
+    fallback path so an aborted-refactor doesn't silently disable backoff
+    for the no-event path."""
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+
+    def op(catalog, table):
+        raise Exception("perma-fail")
+
+    with patch("viaduck.apply.time.sleep") as mock_sleep:
+        with pytest.raises(Exception, match="perma-fail"):
+            _write_with_retry(pool, "dest-n", op)
+
+    # 14 backoffs (MAX_RETRIES - 1), all via time.sleep.
+    assert mock_sleep.call_count == 14
 
 
 def test_apply_full_cdc_projection_resolved_per_attempt():
@@ -1572,7 +1826,12 @@ def test_poll_cycle_cdc_write_failure_isolation():
     with (
         patch("viaduck.main.source.current_snapshot_id", return_value=10),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
-        patch("viaduck.apply.time.sleep"),
+        # Delivery threads its `_stopping` Event into `_write_with_retry`,
+        # so retry backoff goes through `_backoff_sleep(delay, event)` →
+        # `event.wait(delay)` — patching `time.sleep` alone would leave
+        # the retry loop blocking on real Event.wait calls. Patching
+        # `_backoff_sleep` covers both branches.
+        patch("viaduck.apply._backoff_sleep", return_value=False),
     ):
         _poll_cycle(
             MagicMock(),
@@ -1585,7 +1844,12 @@ def test_poll_cycle_cdc_write_failure_isolation():
             key_columns=["company"],
             mode="full_cdc",
         )
-    assert delivery.wait_idle()
+        # Keep wait_idle INSIDE the patch scope. The flush worker is
+        # burning through the OCC retry budget (`_WRITE_MAX_RETRIES` attempts
+        # with backoff capped at `_WRITE_MAX_DELAY_S`); if the patch has
+        # already exited, the worker's next backoff is real, blocking the
+        # test for minutes.
+        assert delivery.wait_idle()
 
     state_mgr.record_error.assert_called_once()
     dest_pool.evict.assert_called()

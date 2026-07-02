@@ -35,10 +35,19 @@ _source_snapshot_id = Gauge(
     ["pipeline"],
 )
 
+# Explicit buckets: the OCC retry policy in apply._write_with_retry can
+# stretch a single write to several minutes under sustained peer-writer
+# pressure. Default prometheus_client buckets top out at 10s, which collapses
+# the entire retry-storm range into +Inf and makes p95/p99 uninformative.
+# The bucket set spans from fast-path writes (~1s) up to the retry-budget
+# worst case (~5-7 min).
+_WRITE_LATENCY_BUCKETS = (0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+
 _dest_write_seconds = Histogram(
     "viaduck_dest_write_seconds",
     "Time per destination write",
     ["pipeline", "destination"],
+    buckets=_WRITE_LATENCY_BUCKETS,
 )
 _dest_rows_written_total = Counter(
     "viaduck_dest_rows_written_total",
@@ -151,6 +160,7 @@ _delivery_flush_seconds = Histogram(
     "viaduck_delivery_flush_seconds",
     "Wall time of a destination flush (conflict resolution + write + cursor)",
     ["pipeline", "destination"],
+    buckets=_WRITE_LATENCY_BUCKETS,
 )
 _delivery_buffers_dropped_total = Counter(
     "viaduck_delivery_buffers_dropped_total",
@@ -175,6 +185,23 @@ _partition_spec_total = Counter(
     "viaduck_partition_spec_total",
     "Outcomes from _ensure_partition_spec by destination + outcome label",
     ["pipeline", "destination", "outcome"],
+)
+
+# OCC retry surface. Every failed attempt inside apply._write_with_retry
+# bumps `dest_write_retries_total{destination}`; the retry loop set/clears
+# `dest_write_retrying{destination}` at 1/0 around the whole loop so poll-
+# thread pauses / noisy-neighbor incidents are diagnosable from Grafana
+# without grepping WARN logs. The gauge is what makes the "one stuck
+# destination pins the shared buffer watermark for minutes" case legible.
+_dest_write_retries_total = Counter(
+    "viaduck_dest_write_retries_total",
+    "Failed OCC write attempts per destination (does not count the successful attempt)",
+    ["pipeline", "destination"],
+)
+_dest_write_retrying = Gauge(
+    "viaduck_dest_write_retrying",
+    "1 while a destination flush is inside its OCC retry loop, 0 otherwise",
+    ["pipeline", "destination"],
 )
 
 # Per-value cast fallbacks in schema_projection._cast_column. The whole-batch
@@ -226,6 +253,8 @@ delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 
 partition_spec_total = _partition_spec_total
 projection_cast_null_fallback_total = _projection_cast_null_fallback_total
+dest_write_retries_total = _dest_write_retries_total
+dest_write_retrying = _dest_write_retrying
 
 
 def init(pipeline: str):
@@ -242,6 +271,7 @@ def init(pipeline: str):
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
     global partition_spec_total, projection_cast_null_fallback_total
+    global dest_write_retries_total, dest_write_retrying
 
     # Metrics with additional labels — wrap so .labels() auto-injects pipeline
     dest_write_seconds = _AutoPipelineLabels(_dest_write_seconds, pipeline)
@@ -259,6 +289,8 @@ def init(pipeline: str):
     partition_spec_total = _AutoPipelineLabels(_partition_spec_total, pipeline)
     projection_cast_null_fallback_total = _AutoPipelineLabels(_projection_cast_null_fallback_total, pipeline)
     dest_upsert_matched_total = _AutoPipelineLabels(_dest_upsert_matched_total, pipeline)
+    dest_write_retries_total = _AutoPipelineLabels(_dest_write_retries_total, pipeline)
+    dest_write_retrying = _AutoPipelineLabels(_dest_write_retrying, pipeline)
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)

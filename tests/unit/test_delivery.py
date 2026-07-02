@@ -278,7 +278,7 @@ def test_full_cdc_flush_concats_buffered_reads():
     mgr, _, _ = _manager(flush_interval_seconds=0.0, mode="full_cdc", key_columns=["value"])
     captured = {}
 
-    def fake_apply(pool, dest, batch, key_columns):
+    def fake_apply(pool, dest, batch, key_columns, stop_event=None):
         captured["rows"] = batch.num_rows
         return batch.num_rows
 
@@ -419,7 +419,7 @@ def test_drain_second_pass_flushes_rows_buffered_during_inflight_flush():
     release = threading.Event()
     flushed_batches = []
 
-    def slow_apply(pool, dest, batch):
+    def slow_apply(pool, dest, batch, stop_event=None):
         flushed_batches.append(batch.num_rows)
         if len(flushed_batches) == 1:
             release.wait(5)
@@ -442,7 +442,7 @@ def test_watermark_counts_inflight_bytes():
     mgr, _, _ = _manager(buffer_total_max_bytes=1, flush_interval_seconds=3600.0)
     release = threading.Event()
 
-    def slow_apply(pool, dest, batch):
+    def slow_apply(pool, dest, batch, stop_event=None):
         release.wait(5)
         return batch.num_rows
 

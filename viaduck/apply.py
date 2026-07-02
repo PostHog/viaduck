@@ -10,6 +10,8 @@ poll thread, per CDC read, before routing.
 from __future__ import annotations
 
 import logging
+import random
+import threading
 import time
 
 import pyarrow as pa
@@ -23,9 +25,43 @@ from viaduck.source import strip_meta
 
 log = logging.getLogger(__name__)
 
-_WRITE_MAX_RETRIES = 3
+# OCC retry policy. DuckLake refuses viaduck's commit whenever ANY concurrent
+# commit lands on the same table between viaduck's read-snapshot and its
+# commit — including commits that touch disjoint file sets (e.g., a peer
+# compactor rewriting old files while viaduck adds a new one). Empirically
+# a shared-table catalog (portola: backfill + peer compactor) commits at
+# ~12s mean, 47s p99 gap. A 2-5s viaduck flush window vs a 12s mean gap
+# gives ~50% per-attempt success, so 3 attempts (7s worth of backoff)
+# deterministically fails. 15 attempts with exp backoff capped at 30s +
+# ±50% jitter probes over ~5 min — enough headroom to catch the P99 gap
+# without stalling the flush worker forever. Fix the OCC over-strictness
+# at the DuckLake fork layer is separate work; this is the viaduck-side
+# operator that keeps replication moving until then.
+_WRITE_MAX_RETRIES = 15
 _WRITE_BASE_DELAY_S = 1.0
+_WRITE_MAX_DELAY_S = 30.0
+# ±50%: adversarial review pointed out that ±30% at the 30s cap gives only
+# ~±9s of spread, which starts to thin under fleets of ~30 shared-catalog
+# destinations racing a peer writer. ±50% doubles the spread at trivial cost.
+_WRITE_JITTER_FRACTION = 0.5
+# Attempts 1..N below this get DEBUG log lines (routine OCC dance); attempts
+# at or above this get WARN. Prevents WARN log floods under sustained OCC
+# pressure while keeping the "something is actually going wrong" signal
+# audible from attempt 4 onward.
+_WRITE_WARN_ATTEMPT_THRESHOLD = 4
 _DELETE_CHUNK_ROWS = 1000
+
+# Permanent errors that must NOT retry: retrying wastes the whole ~5 min
+# budget on an error whose next attempt would fail identically, and floods
+# logs with misleading "Write to X failed" messages when the actual error
+# is a build-time or config-time issue the operator needs to see raw.
+# Anything raised INSIDE the retry lambda (i.e., inside `_apply_changes`)
+# that's structurally permanent goes here. Errors raised OUTSIDE the retry
+# lambda don't need listing — they never enter the retry loop.
+_PERMANENT_ERROR_TYPES: tuple[type[BaseException], ...] = (
+    SchemaProjectionError,
+    RoutingError,  # _build_delete_filter — missing key column, config bug
+)
 
 
 def _require_non_null_rowids(batch: pa.Table) -> None:
@@ -42,41 +78,86 @@ def _require_non_null_rowids(batch: pa.Table) -> None:
         )
 
 
-def _write_with_retry(dest_pool, destination_id, operation):
+def _backoff_sleep(delay: float, stop_event: threading.Event | None) -> bool:
+    """Sleep `delay` seconds between retry attempts. If `stop_event` fires,
+    wake early and return True. Otherwise return False.
+
+    Extracted so tests can patch this single seam to zero out backoff
+    without threading extra plumbing through the retry loop.
+    """
+    if stop_event is None:
+        time.sleep(delay)
+        return False
+    return stop_event.wait(delay)
+
+
+def _write_with_retry(dest_pool, destination_id, operation, stop_event: threading.Event | None = None):
     """Execute a write operation on a destination with exponential backoff.
 
     operation: callable that takes (catalog, table) and performs the write.
     The pool lease (get/release) pins the connection so concurrent LRU
     eviction by other workers can't close it mid-transaction.
+
+    stop_event: optional shutdown signal. When set, the retry loop's next
+    backoff wakes early and the current exception propagates. Without this,
+    a worker deep in the retry backoff (up to ~30s per sleep) would ignore
+    SIGTERM and get SIGKILLed once k8s' terminationGracePeriodSeconds
+    elapses — cursor stays where it was (safe) but drain() reports an
+    abandoned buffer on every rolling restart.
     """
-    for attempt in range(_WRITE_MAX_RETRIES):
-        try:
-            catalog, table = dest_pool.get(destination_id)
+    metrics.dest_write_retrying.labels(destination=destination_id).set(1)
+    try:
+        for attempt in range(_WRITE_MAX_RETRIES):
             try:
-                return operation(catalog, table)
-            finally:
-                dest_pool.release(destination_id)
-        except SchemaProjectionError:
-            # Permanent by construction — the source/target schemas don't
-            # change between attempts, so retrying wastes exponential backoff
-            # (up to 3s here) and logs misleading "Write to X failed"
-            # messages for what is actually a build-time schema-drift error.
-            # Fail fast, surface the projection error to the caller.
-            raise
-        except Exception as exc:
-            if attempt == _WRITE_MAX_RETRIES - 1:
+                catalog, table = dest_pool.get(destination_id)
+                try:
+                    return operation(catalog, table)
+                finally:
+                    dest_pool.release(destination_id)
+            except _PERMANENT_ERROR_TYPES:
+                # Permanent by construction — retrying wastes the retry budget
+                # on an error whose next attempt fails identically, and floods
+                # the log with misleading "Write to X failed" for what is a
+                # build-time / config-time issue. Surface raw.
                 raise
-            delay = _WRITE_BASE_DELAY_S * (2**attempt)
-            log.warning(
-                "Write to %s failed (attempt %d/%d, error: %s), retrying in %.1fs",
-                destination_id,
-                attempt + 1,
-                _WRITE_MAX_RETRIES,
-                exc,
-                delay,
-            )
-            dest_pool.evict(destination_id)
-            time.sleep(delay)
+            except Exception as exc:
+                if attempt == _WRITE_MAX_RETRIES - 1:
+                    raise
+                # Exponential backoff capped at _WRITE_MAX_DELAY_S so the
+                # schedule doesn't sprint past the P99 peer-writer gap into
+                # pathological wait times. Jittered so a fleet of destinations
+                # racing the same peer commit doesn't herd on the same tick.
+                base = min(_WRITE_BASE_DELAY_S * (2**attempt), _WRITE_MAX_DELAY_S)
+                delay = base * (1.0 + random.uniform(-_WRITE_JITTER_FRACTION, _WRITE_JITTER_FRACTION))
+                metrics.dest_write_retries_total.labels(destination=destination_id).inc()
+                # Log severity ladder: routine OCC dance (attempts 1..3) is
+                # DEBUG; attempt 4+ is genuinely worth an operator's eye and
+                # gets WARN. Keeps the WARN channel scannable during
+                # sustained retry pressure.
+                if attempt + 1 >= _WRITE_WARN_ATTEMPT_THRESHOLD:
+                    log_level = logging.WARNING
+                else:
+                    log_level = logging.DEBUG
+                log.log(
+                    log_level,
+                    "Write to %s failed (attempt %d/%d, error: %s), retrying in %.1fs",
+                    destination_id,
+                    attempt + 1,
+                    _WRITE_MAX_RETRIES,
+                    exc,
+                    delay,
+                )
+                dest_pool.evict(destination_id)
+                # Wake early on shutdown — the flush worker's job is to make
+                # progress OR let the process exit, not to hold a sleep past
+                # SIGTERM. If `_backoff_sleep` returns True, the stop_event
+                # fired mid-wait; re-raise so the caller (delivery._flush)
+                # takes the FlushFail path immediately instead of another
+                # retry attempt.
+                if _backoff_sleep(delay, stop_event):
+                    raise
+    finally:
+        metrics.dest_write_retrying.labels(destination=destination_id).set(0)
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +454,13 @@ def _apply_changes(
 # ---------------------------------------------------------------------------
 
 
-def apply_full_cdc(dest_pool, dest_id: str, batch: pa.Table, key_columns: list[str]) -> int:
+def apply_full_cdc(
+    dest_pool,
+    dest_id: str,
+    batch: pa.Table,
+    key_columns: list[str],
+    stop_event: threading.Event | None = None,
+) -> int:
     """Phase 2 + Phase 3 for one destination flush. Returns ops applied."""
     resolved = _resolve_conflicts(batch)
     if resolved.num_rows == 0:
@@ -406,6 +493,7 @@ def apply_full_cdc(dest_pool, dest_id: str, batch: pa.Table, key_columns: list[s
             projection=dest_pool.projection_for(dest_id),
             on_null_fallback=_null_fallback,
         ),
+        stop_event=stop_event,
     )
     for column, count in fallback_counts.items():
         metrics.projection_cast_null_fallback_total.labels(destination=dest_id, column=column).inc(count)
@@ -418,7 +506,12 @@ def apply_full_cdc(dest_pool, dest_id: str, batch: pa.Table, key_columns: list[s
     return counts["deleted"] + counts["upserted"]
 
 
-def append_only(dest_pool, dest_id: str, batch: pa.Table) -> int:
+def append_only(
+    dest_pool,
+    dest_id: str,
+    batch: pa.Table,
+    stop_event: threading.Event | None = None,
+) -> int:
     """Append-only mode (mode=append_only): one tbl.append() per flush.
 
     Precondition: the operator declared the source insert-only via
@@ -463,7 +556,7 @@ def append_only(dest_pool, dest_id: str, batch: pa.Table) -> int:
         b = batch if projection is None else projection.apply(batch, on_null_fallback=_null_fallback)
         tbl.append(b)
 
-    _write_with_retry(dest_pool, dest_id, _apply)
+    _write_with_retry(dest_pool, dest_id, _apply, stop_event=stop_event)
     for column, count in fallback_counts.items():
         metrics.projection_cast_null_fallback_total.labels(destination=dest_id, column=column).inc(count)
     metrics.dest_rows_written_total.labels(destination=dest_id).inc(batch.num_rows)
