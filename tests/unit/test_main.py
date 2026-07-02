@@ -973,6 +973,63 @@ def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
     assert delivery.maybe_flush.call_count == 2  # once after chunk 0→5 + once at end of cycle
 
 
+def test_poll_cycle_reads_lowest_cursor_group_first():
+    """Under buffer-watermark pressure, the read budget must go to the
+    most-lagging cursor group first. Otherwise a caught-up destination fills
+    the buffer before the lagging one gets its turn and the lagging group
+    is silently starved every cycle (empirically observed on portola with
+    team-2 at lag 969 vs team-50689 at lag 7969 — team-50689 got zero
+    reads for the entire pod lifetime).
+    """
+    # Two destinations at very different cursors: dest-lagging at 100,
+    # dest-caughtup at 900. Config order lists dest-caughtup FIRST — the
+    # bug (pre-fix) would iterate that group first, fill the buffer on
+    # its read, and never get to dest-lagging.
+    delivery = _make_delivery({"dest-lagging": 100, "dest-caughtup": 900})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-caughtup", "cup"), ("dest-lagging", "lag")])
+    cfg.poll.cdc_chunk_snapshots = 200
+
+    # Watermark trips after the FIRST chunk read: outer check False; inner
+    # check for the first group False (allows one read); inner check for
+    # the second group True (skips it). Whichever group iterates first
+    # gets the read.
+    delivery.should_pause_reads.side_effect = [False, False, True, True]
+
+    read_calls: list[tuple[int, int]] = []
+
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+        read_calls.append((after_snapshot, end_snapshot))
+        return pa.table({"company": pa.array([], type=pa.string())})
+
+    router.build_filter_expr.return_value = None
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=1000),
+        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-caughtup", "dest-lagging"],
+            {"cup": "dest-caughtup", "lag": "dest-lagging"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    # Only one read should have happened (the second group's chunk was
+    # paused). It MUST have been the lagging group (starting at 100), not
+    # the caught-up group (starting at 900).
+    assert len(read_calls) == 1, f"expected exactly one read before watermark trip, got {read_calls}"
+    assert read_calls[0][0] == 100, (
+        f"lagging cursor should have read first; instead read started at {read_calls[0][0]} "
+        f"(the config-order-first, caught-up destination)"
+    )
+
+
 def test_poll_cycle_snapshot_at_zero():
     """Source snapshot 0 with positions at 0: nothing to read, triggers run."""
     delivery = _make_delivery({"dest-1": 0})
