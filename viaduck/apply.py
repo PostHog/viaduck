@@ -78,6 +78,22 @@ def _require_non_null_rowids(batch: pa.Table) -> None:
         )
 
 
+# DuckLake OCC conflict signatures (DuckLake wraps the underlying conflict
+# in a TransactionException whose message carries these markers). String
+# matching is regrettable but pyducklake surfaces no typed exception for
+# commit conflicts; both strings come from ducklake's commit path
+# (ducklake_transaction.cpp) and are stable across the fork.
+_OCC_CONFLICT_MARKERS = (
+    "Failed to commit DuckLake transaction",
+    "Transaction conflict",
+)
+
+
+def _is_occ_conflict(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(marker in msg for marker in _OCC_CONFLICT_MARKERS)
+
+
 def _backoff_sleep(delay: float, stop_event: threading.Event | None) -> bool:
     """Sleep `delay` seconds between retry attempts. If `stop_event` fires,
     wake early and return True. Otherwise return False.
@@ -147,7 +163,22 @@ def _write_with_retry(dest_pool, destination_id, operation, stop_event: threadin
                     exc,
                     delay,
                 )
-                dest_pool.evict(destination_id)
+                # Evict + reconnect ONLY for errors that implicate the
+                # connection itself (network, RDS restart, dead socket).
+                # An OCC commit conflict leaves the connection perfectly
+                # healthy — DuckLake takes its snapshot at BeginTransaction,
+                # not at connect, so the next attempt's fresh transaction
+                # sees the peer's commit on the SAME connection (this is
+                # exactly how DuckLake's own internal retry loop behaved
+                # before we disabled it). Reconnecting per conflict was
+                # doubly expensive in prod: it added 10-20s of catalog
+                # ATTACH to every retry attempt's window, and each
+                # pyducklake Catalog create leaks ~160MB of native memory
+                # on close (fork-side hunt pending) — 274 reconnects in
+                # 106 min OOM-killed the pod at 48Gi, six times in one
+                # night.
+                if not _is_occ_conflict(exc):
+                    dest_pool.evict(destination_id)
                 # Wake early on shutdown — the flush worker's job is to make
                 # progress OR let the process exit, not to hold a sleep past
                 # SIGTERM. If `_backoff_sleep` returns True, the stop_event
