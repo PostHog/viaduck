@@ -66,18 +66,29 @@ _CONNECTION_DEFAULTS = {
     # off keeps the memory picture symmetric with the source and easy to
     # reason about.
     "enable_external_file_cache": "false",
-    # Disable DuckLake's internal transaction-retry loop and defer ALL backoff
-    # decisions to viaduck.apply._write_with_retry. DuckLake's implementation
-    # (ducklake/src/storage/ducklake_transaction.cpp:2669) uses the retry
-    # index as the exponent directly — `pow(retry_backoff, i)` uncapped —
-    # so raising ducklake_max_retry_count for higher robustness blows sleeps
-    # out to hours per attempt. Even at defaults (max=10, wait=100ms, backoff=1.5)
-    # it eats ~8.5s of dead time inside each viaduck retry attempt, most of it
-    # invisible to viaduck's own metrics + shutdown paths. Setting to 0 makes
-    # DuckLake surface commit conflicts immediately; viaduck's own retry loop
-    # is the sole source of retry + backoff behavior (with jitter, cap, and
-    # stop_event awareness).
-    "ducklake_max_retry_count": "0",
+    # DuckLake's internal transaction-retry loop is the ONLY layer that can
+    # retry a commit cheaply: on conflict it re-runs CheckForConflicts, bumps
+    # the snapshot id, and re-executes just the catalog SQL — the parquet
+    # files already written to object storage are reused, not re-uploaded
+    # (CleanupFiles only fires on final abort). Snapshot-id collisions
+    # (`ducklake_snapshot_pkey` duplicate — any peer commit on the catalog
+    # takes the optimistically-allocated max+1 id) are pure mechanical
+    # conflicts and MUST be absorbed here; escalating them to
+    # viaduck.apply._write_with_retry re-does the entire flush including the
+    # parquet upload.
+    #
+    # The loop's sleep (ducklake_transaction.cpp:2669) is
+    # `wait_ms * random(0.5,1.0) * pow(retry_backoff, i)` with the retry
+    # index as an uncapped exponent — at defaults (max=10, wait=100ms,
+    # backoff=1.5) that's ~8.5s of dead time per attempt, and raising the
+    # count blows sleeps out to hours. backoff=1.0 sidesteps the exponent
+    # entirely: constant 25-50ms jittered sleeps, worst case ~1s across all
+    # 20 retries. viaduck's outer retry loop (jitter, cap, stop_event
+    # awareness) remains the backstop for real failures — semantic conflicts,
+    # network errors — and rarely fires.
+    "ducklake_max_retry_count": "20",
+    "ducklake_retry_wait_ms": "50",
+    "ducklake_retry_backoff": "1.0",
 }
 
 
