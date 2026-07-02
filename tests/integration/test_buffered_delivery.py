@@ -142,6 +142,8 @@ def test_cross_read_conflict_resolution_at_flush(tmp_path, state):
 
 
 def test_flush_failure_leaves_cursor_and_recovers(tmp_path, state):
+    from unittest.mock import patch
+
     pool = _make_pool(tmp_path, ["d-bad"], broken={"d-bad"})
     state.initialize_destinations(["d-bad"])
     state.advance_cursor("d-bad", snapshot_id=3)
@@ -149,9 +151,18 @@ def test_flush_failure_leaves_cursor_and_recovers(tmp_path, state):
         DeliveryConfig(workers=1, flush_interval_seconds=0.0), state, pool, ["event_id"], ["d-bad"], mode="full_cdc"
     )
 
+    # Patch OCC retry sleeps to zero — the pool is permanently broken, so
+    # every retry attempt fails identically, and the test only cares that
+    # the flush ultimately raises. Without the patch the retry policy
+    # (`_WRITE_MAX_RETRIES` attempts with backoff capped at
+    # `_WRITE_MAX_DELAY_S`) would burn minutes of real time before
+    # exhausting. Patch `_backoff_sleep` (not `time.sleep`) because the
+    # delivery layer threads a stop_event and the retry loop uses
+    # `Event.wait` under the covers.
     mgr.buffer("d-bad", _cdc_batch("acme", [1]), through_snapshot=7)
-    mgr.maybe_flush()
-    assert mgr.wait_idle(60)
+    with patch("viaduck.apply._backoff_sleep", return_value=False):
+        mgr.maybe_flush()
+        assert mgr.wait_idle(60)
 
     # FlushFail: cursor untouched, error recorded, position reset.
     cur = state.load_cursors(["d-bad"])["d-bad"]
