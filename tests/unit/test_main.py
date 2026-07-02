@@ -3191,3 +3191,96 @@ def test_initial_snapshot_id_earliest_falls_back_to_zero_on_empty_catalog():
 def test_initial_snapshot_id_scan_returns_zero():
     """scan mode always returns 0; _seed_new_destinations advances from there."""
     assert _initial_snapshot_id("scan", MagicMock()) == 0
+
+
+# ---------------------------------------------------------------------------
+# Log throttles: buffer-watermark WARN + [MEMTRACE] INFO
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_paused_logs_once_then_heartbeats(caplog):
+    """First entry logs immediately. Subsequent calls inside the heartbeat
+    interval are suppressed. After the interval, a "still exceeded" WARN
+    fires with the accumulated stall duration."""
+    import viaduck.main as vmain
+
+    # Reset stall state so this test is independent of any earlier tests.
+    vmain._watermark_stall_start = 0.0
+    vmain._last_watermark_warn_at = 0.0
+
+    fake_now = [1000.0]
+
+    def fake_monotonic():
+        return fake_now[0]
+
+    with caplog.at_level("WARNING", logger="viaduck.main"):
+        with patch("viaduck.main.time.monotonic", side_effect=fake_monotonic):
+            vmain._log_watermark_paused("all flushes in flight")
+            # Immediate re-entry within the heartbeat interval — no new log.
+            fake_now[0] += 5.0
+            vmain._log_watermark_paused("all flushes in flight")
+            # Past the heartbeat interval — one "still exceeded" line fires.
+            fake_now[0] += vmain._WATERMARK_HEARTBEAT_INTERVAL_S + 1.0
+            vmain._log_watermark_paused("all flushes in flight")
+
+    warns = [r for r in caplog.records if "Buffer watermark" in r.getMessage()]
+    assert len(warns) == 2, f"expected 2 warns (entry + heartbeat), got {len(warns)}"
+    assert "pausing CDC reads" in warns[0].getMessage()
+    assert "still exceeded" in warns[1].getMessage()
+    assert f"{int(vmain._WATERMARK_HEARTBEAT_INTERVAL_S + 6)}s" in warns[1].getMessage()
+
+
+def test_watermark_cleared_emits_edge_only_when_previously_stalled(caplog):
+    """`_log_watermark_cleared` is a no-op when no stall was active. When one
+    was active, it logs an INFO edge with the stall duration and resets."""
+    import viaduck.main as vmain
+
+    # Case 1: no active stall — cleared() is a no-op.
+    vmain._watermark_stall_start = 0.0
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        vmain._log_watermark_cleared()
+    infos = [r for r in caplog.records if "watermark" in r.getMessage().lower()]
+    assert infos == [], "no log expected when there was no active stall"
+
+    # Case 2: an active stall — cleared() logs and resets.
+    caplog.clear()
+    vmain._watermark_stall_start = 500.0
+    vmain._last_watermark_warn_at = 500.0
+    with caplog.at_level("INFO", logger="viaduck.main"):
+        with patch("viaduck.main.time.monotonic", return_value=560.0):
+            vmain._log_watermark_cleared()
+    infos = [r for r in caplog.records if "cleared" in r.getMessage()]
+    assert len(infos) == 1
+    assert "60s" in infos[0].getMessage()
+    assert vmain._watermark_stall_start == 0.0
+
+
+def test_memtrace_throttle_short_circuits_query(caplog):
+    """Throttled calls must skip the /proc + duckdb_memory() work entirely —
+    the whole point is to suppress the log AND avoid the per-cycle cost."""
+    import viaduck.main as vmain
+
+    vmain._last_memtrace_at = 0.0
+
+    mock_conn = MagicMock()
+    mock_conn.execute.return_value.fetchall.return_value = []
+
+    def fake_open(*args, **kwargs):
+        return iter(["VmRSS:  1024 kB\n", "VmSize: 2048 kB\n"])
+
+    fake_now = [1000.0]
+
+    with (
+        patch("viaduck.main.time.monotonic", side_effect=lambda: fake_now[0]),
+        patch("builtins.open", side_effect=fake_open),
+    ):
+        vmain._log_memory_stats(mock_conn)  # fires
+        fake_now[0] += 2.0
+        vmain._log_memory_stats(mock_conn)  # throttled
+        fake_now[0] += vmain._MEMTRACE_MIN_INTERVAL_S + 1.0
+        vmain._log_memory_stats(mock_conn)  # fires
+
+    # duckdb_memory() query only issued on the two firing calls.
+    assert mock_conn.execute.call_count == 2, (
+        f"throttle failed: query ran {mock_conn.execute.call_count} times, expected 2"
+    )

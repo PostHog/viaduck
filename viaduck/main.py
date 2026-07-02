@@ -798,8 +798,9 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
             # Global buffer watermark exceeded and every buffering
             # destination is already in flight — reading more only grows
             # memory. Skip reads; flushes in flight will relieve it.
-            log.warning("Buffer watermark exceeded with all flushes in flight; pausing CDC reads this cycle")
+            _log_watermark_paused("all flushes in flight")
         else:
+            _log_watermark_cleared()
             plan = delivery.read_plan()
             positions = {d: pos for d, (pos, _epoch) in plan.items()}
             epochs = {d: epoch for d, (_pos, epoch) in plan.items()}
@@ -821,7 +822,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                 routing_error = False
                 while chunk_start < current_id:
                     if delivery.should_pause_reads():
-                        log.warning("Buffer watermark exceeded mid-chunk; pausing CDC reads")
+                        _log_watermark_paused("mid-chunk")
                         break
                     chunk_end = min(chunk_start + chunk_size, current_id)
                     snap_range = f"{chunk_start}→{chunk_end}"
@@ -998,6 +999,20 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
 
 _MEM_STATS_FAILURES = 0
 _MEM_STATS_LOG_EVERY_NTH_FAILURE = 100
+# Poll cycles run every ~2s; MEMTRACE logs at INFO were drowning the log
+# under sustained buffer-watermark stall. Throttle to at most one entry per
+# _MEMTRACE_MIN_INTERVAL_S seconds. The line is still useful to correlate
+# with events, just not at 2s cadence.
+_MEMTRACE_MIN_INTERVAL_S = 300.0
+_last_memtrace_at: float = 0.0
+
+# Buffer-watermark stall tracking. Under sustained stall the poll thread
+# would emit the WARN line every ~2s, drowning the log. Log the transition
+# edges (entering / clearing) and a "still stalled" heartbeat at a low
+# cadence in between.
+_WATERMARK_HEARTBEAT_INTERVAL_S = 60.0
+_watermark_stall_start: float = 0.0
+_last_watermark_warn_at: float = 0.0
 
 
 def log_startup_memory() -> None:
@@ -1013,13 +1028,47 @@ def log_startup_memory() -> None:
         log.warning("[MEMTRACE] startup log failed", exc_info=True)
 
 
+def _log_watermark_paused(kind: str) -> None:
+    """Rate-limited buffer-watermark WARN. Fires once when the stall starts,
+    then a heartbeat every `_WATERMARK_HEARTBEAT_INTERVAL_S` for as long as
+    it persists. Callers should invoke `_log_watermark_cleared` when reads
+    resume.
+    """
+    global _watermark_stall_start, _last_watermark_warn_at
+    now = time.monotonic()
+    if _watermark_stall_start == 0.0:
+        _watermark_stall_start = now
+        _last_watermark_warn_at = now
+        log.warning("Buffer watermark exceeded (%s); pausing CDC reads", kind)
+        return
+    if now - _last_watermark_warn_at >= _WATERMARK_HEARTBEAT_INTERVAL_S:
+        _last_watermark_warn_at = now
+        stall_s = int(now - _watermark_stall_start)
+        log.warning("Buffer watermark still exceeded (%s), paused for %ds", kind, stall_s)
+
+
+def _log_watermark_cleared() -> None:
+    """Emit an INFO edge when the stall ends. Cheap to call every cycle."""
+    global _watermark_stall_start, _last_watermark_warn_at
+    if _watermark_stall_start == 0.0:
+        return
+    stall_s = int(time.monotonic() - _watermark_stall_start)
+    log.info("Buffer watermark cleared after %ds", stall_s)
+    _watermark_stall_start = 0.0
+    _last_watermark_warn_at = 0.0
+
+
 def _log_memory_stats(conn) -> None:
     """Log OS RSS, DuckDB per-tag memory tracker, and Python object count in one line.
 
     Best-effort; failures are rate-limited (log every 100th) to avoid a log
     storm if this consistently breaks. Must never kill the CDC loop.
     """
-    global _MEM_STATS_FAILURES
+    global _MEM_STATS_FAILURES, _last_memtrace_at
+    now = time.monotonic()
+    if now - _last_memtrace_at < _MEMTRACE_MIN_INTERVAL_S:
+        return
+    _last_memtrace_at = now
     try:
         rss_kb = vms_kb = 0
         for line in open("/proc/self/status"):
