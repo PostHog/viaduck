@@ -69,6 +69,15 @@ from viaduck.state import StateManager
 
 log = logging.getLogger(__name__)
 
+# Per-cycle read budget per cursor group. Bounds how many CDC chunks one
+# group may read before the poll cycle moves to the next group — the fairness
+# valve that keeps a deeply-lagging (or flush-failing, position-resetting)
+# destination from monopolizing the poll thread while healthy peers starve.
+# 4 chunks × cdc_chunk_snapshots=50 = 200 snapshots per group per cycle,
+# ~7× the source's per-cycle arrival rate — groups drain lag while every
+# other group still gets a turn each cycle.
+_MAX_CHUNKS_PER_GROUP_PER_CYCLE = 4
+
 
 def _start_progress_heartbeat(
     label: str,
@@ -806,14 +815,22 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
             epochs = {d: epoch for d, (_pos, epoch) in plan.items()}
             groups = _group_by_cursor(positions, assigned_ids)
 
-            # Iterate lowest cursor first: the most-lagging group reads before
-            # a caught-up peer's turn can trip the buffer watermark. Under the
-            # prior insertion-order iteration, a destination whose cursor was
-            # further behind was silently starved whenever the first-iterated
-            # group filled the buffer mid-chunk — the outer loop moved to the
-            # next group and immediately hit `should_pause_reads()`, breaking
-            # out without reading anything. Sorting flips the priority so the
-            # laggiest destination gets first shot at each poll's read budget.
+            # Iterate lowest cursor first — the most-lagging group gets the
+            # first turn each cycle — but cap the chunks each group may read
+            # per cycle so a deeply-lagging group cannot monopolize the poll
+            # thread. Both halves are load-bearing:
+            #   - Insertion-order iteration (pre-sort) starved a lagging
+            #     destination whose config index was after a caught-up peer:
+            #     the peer's read filled the buffer and the lagging group's
+            #     first watermark check bounced it out with zero reads.
+            #   - Sorted-but-uncapped iteration (the first fix) starved the
+            #     HEALTHY destination instead: the lagging group's chunk loop
+            #     ran to head — or forever, when its flushes kept failing and
+            #     the position kept resetting — so the caught-up group never
+            #     got a read. Observed on portola: team-2's cursor frozen for
+            #     1.5h while team-50689 relitigated the same range.
+            # The cap turns strict priority into a round-robin with a
+            # lagging-first bias: every group makes progress every cycle.
             for start_snap, dest_ids in sorted(groups.items()):
                 if start_snap >= current_id:
                     continue  # already read through the current snapshot
@@ -828,7 +845,9 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
                 chunk_size = cfg.poll.cdc_chunk_snapshots
                 chunk_start = start_snap
                 routing_error = False
-                while chunk_start < current_id:
+                chunks_this_group = 0
+                while chunk_start < current_id and chunks_this_group < _MAX_CHUNKS_PER_GROUP_PER_CYCLE:
+                    chunks_this_group += 1
                     if delivery.should_pause_reads():
                         _log_watermark_paused("mid-chunk")
                         break
