@@ -1030,6 +1030,62 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
     )
 
 
+def test_poll_cycle_lagging_group_cannot_monopolize_reads():
+    """The per-cycle chunk cap turns lagging-first priority into round-robin:
+    a deeply-lagging group reads at most _MAX_CHUNKS_PER_GROUP_PER_CYCLE
+    chunks per cycle, then the healthy group gets its turn. Without the cap
+    (the first sort-only fix), the lagging group's chunk loop ran to head —
+    or forever when its flushes kept failing and its position kept resetting
+    — and the healthy destination's cursor froze (observed on portola:
+    team-2 starved for 1.5h while team-50689 relitigated the same range).
+    """
+    from viaduck.main import _MAX_CHUNKS_PER_GROUP_PER_CYCLE
+
+    # dest-lagging is 10,000 snapshots behind; dest-healthy is 100 behind.
+    # Uncapped, dest-lagging's group would issue 100 chunk reads before
+    # dest-healthy saw a single one.
+    delivery = _make_delivery({"dest-lagging": 0, "dest-healthy": 9_900})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-lagging", "lag"), ("dest-healthy", "ok")])
+    cfg.poll.cdc_chunk_snapshots = 100
+
+    read_calls: list[tuple[int, int]] = []
+
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+        read_calls.append((after_snapshot, end_snapshot))
+        return pa.table({"company": pa.array([], type=pa.string())})
+
+    router.build_filter_expr.return_value = None
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=10_000),
+        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-lagging", "dest-healthy"],
+            {"lag": "dest-lagging", "ok": "dest-healthy"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    # The lagging group read exactly the cap, no more.
+    lagging_reads = [c for c in read_calls if c[0] < 9_900]
+    assert len(lagging_reads) == _MAX_CHUNKS_PER_GROUP_PER_CYCLE, (
+        f"lagging group should read exactly the per-cycle cap, got {len(lagging_reads)}: {lagging_reads}"
+    )
+    # The healthy group STILL got its read this cycle — the load-bearing
+    # assertion. Under the uncapped loop this list is empty.
+    healthy_reads = [c for c in read_calls if c[0] >= 9_900]
+    assert healthy_reads == [(9_900, 10_000)], f"healthy group must read within the same cycle, got {healthy_reads}"
+    # Order: lagging first (priority preserved), healthy after.
+    assert read_calls[0][0] == 0 and read_calls[-1][0] == 9_900
+
+
 def test_poll_cycle_snapshot_at_zero():
     """Source snapshot 0 with positions at 0: nothing to read, triggers run."""
     delivery = _make_delivery({"dest-1": 0})
