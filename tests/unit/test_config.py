@@ -68,6 +68,9 @@ def test_load_defaults_applied(config_file: Path):
     cfg = load(config_file)
     assert cfg.poll.interval_seconds == 5.0
     assert cfg.server.port == 8000
+    # 0 = auto-derive per-destination cap as buffer_total_max_bytes / N at
+    # DeliveryManager init; explicit values pass through (validated >= 0).
+    assert cfg.delivery.buffer_max_bytes_per_destination == 0
     assert cfg.web.enabled is True
     assert cfg.instance.id == "viaduck-0"
     assert cfg.instance.partition.mode == "all"
@@ -252,6 +255,31 @@ def test_drop_source_columns_with_projection_flag_ok(tmp_path: Path):
     cfg = load(p)
     assert cfg.destinations[0].schema_projection_enabled
     assert cfg.destinations[0].drop_source_columns == ("captured_at",)
+
+
+def test_buffer_max_bytes_per_destination_negative_rejected():
+    from viaduck.config import DeliveryConfig
+
+    with pytest.raises(ConfigError, match="buffer_max_bytes_per_destination"):
+        DeliveryConfig(buffer_max_bytes_per_destination=-1)
+
+
+def test_buffer_max_bytes_per_destination_loader_passthrough(tmp_path: Path):
+    raw = MINIMAL_YAML + "\ndelivery:\n  buffer_max_bytes_per_destination: 33554432\n"
+    p = tmp_path / "per_dest_cap.yaml"
+    p.write_text(raw)
+    cfg = load(p)
+    assert cfg.delivery.buffer_max_bytes_per_destination == 33554432
+
+
+def test_buffer_max_bytes_per_destination_quoted_string_rejected(tmp_path: Path):
+    """YAML `\"33554432\"` (quoted) must be rejected by _validate_int, not
+    silently coerced — the same foot-gun guard every other delivery int has."""
+    raw = MINIMAL_YAML + '\ndelivery:\n  buffer_max_bytes_per_destination: "33554432"\n'
+    p = tmp_path / "per_dest_cap_str.yaml"
+    p.write_text(raw)
+    with pytest.raises(ConfigError, match="buffer_max_bytes_per_destination must be an integer"):
+        load(p)
 
 
 def test_routing_mode_append_only_forbids_key_columns(tmp_path: Path):

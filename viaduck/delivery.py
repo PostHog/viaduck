@@ -125,6 +125,37 @@ class DeliveryManager:
         self._buffers: dict[str, _Buffer] = {d: _Buffer() for d in assigned_ids}
         self._inflight: set[str] = set()
         self._executor = ThreadPoolExecutor(max_workers=cfg.workers, thread_name_prefix="flush")
+        # Per-destination byte cap: the bound on each destination's CDC
+        # "queue" (live buffer + in-flight swap). Reads for a destination
+        # pause when ITS OWN queue is full — never because a peer's is.
+        # Kafka-partition semantics: one slow/stuck consumer doesn't halt
+        # the others' intake. Auto-derive a fair share of the global cap
+        # when not explicitly configured; the global cap survives as the
+        # forced-flush trigger in maybe_flush and the all-at-cap early-exit.
+        if cfg.buffer_max_bytes_per_destination > 0:
+            self._per_dest_cap = cfg.buffer_max_bytes_per_destination
+            if len(assigned_ids) * self._per_dest_cap > cfg.buffer_total_max_bytes:
+                # With destination-local read gating, the sum of per-dest
+                # caps IS the effective memory bound — the global value no
+                # longer stops reads. An explicit cap that oversubscribes
+                # it is a one-knob misconfig worth a loud line.
+                log.warning(
+                    "delivery.buffer_max_bytes_per_destination=%d x %d destinations = %d "
+                    "exceeds buffer_total_max_bytes=%d; effective memory bound is the sum "
+                    "of per-destination caps",
+                    self._per_dest_cap,
+                    len(assigned_ids),
+                    len(assigned_ids) * self._per_dest_cap,
+                    cfg.buffer_total_max_bytes,
+                )
+        else:
+            self._per_dest_cap = max(1, cfg.buffer_total_max_bytes // max(1, len(assigned_ids)))
+        log.info(
+            "Per-destination buffer cap: %d bytes (%s) across %d destinations",
+            self._per_dest_cap,
+            "explicit" if cfg.buffer_max_bytes_per_destination > 0 else "auto: buffer_total_max_bytes / N",
+            len(assigned_ids),
+        )
         # Shutdown signal threaded into apply._write_with_retry: a worker
         # deep in the OCC retry backoff (up to ~30s per sleep, ~5 min per
         # flush worst case) would otherwise ignore SIGTERM and get SIGKILLed
@@ -230,14 +261,35 @@ class DeliveryManager:
                 if self._position_dirty_since[dest_id] is None:
                     self._position_dirty_since[dest_id] = time.monotonic()
 
-    def should_pause_reads(self) -> bool:
-        """True when the global buffer watermark is exceeded and every
-        buffering destination is already in flight — reading more would
-        grow memory without any way to relieve it."""
+    def _dest_bytes_locked(self, dest_id: str) -> int:
+        return self._buffers[dest_id].bytes + self._inflight_bytes[dest_id]
+
+    def should_pause_reads_for(self, dest_id: str) -> bool:
+        """True when THIS destination's queue (live buffer + in-flight swap)
+        is at or above its per-destination cap. The poll thread stops reading
+        for this destination until a flush drains it — backpressure is
+        destination-local, so a stuck destination's full queue never pauses
+        a healthy peer's intake. Sets the reads-paused gauge as a side
+        signal: a destination pinned at cap for a long stretch is the
+        operator-visible symptom of a slow/hung flush downstream."""
         with self._lock:
-            if self._total_bytes_locked() < self._cfg.buffer_total_max_bytes:
+            paused = self._dest_bytes_locked(dest_id) >= self._per_dest_cap
+        metrics.delivery_reads_paused.labels(destination=dest_id).set(1 if paused else 0)
+        return paused
+
+    def should_pause_all_reads(self) -> bool:
+        """True when EVERY destination's queue is at or above its cap —
+        no read anywhere would help. The poll thread uses this as a
+        cycle-level early-exit and the operator-facing "pod is genuinely
+        wedged" log signal; per-destination pauses are routine operation
+        and intentionally quiet (gauge, not WARN)."""
+        with self._lock:
+            if not self._buffers:
+                # A partitioned instance can legitimately own zero
+                # destinations; vacuous all() would report it permanently
+                # wedged and spam the watermark WARN state machine.
                 return False
-            return all(self._buffers[d].rows == 0 or d in self._inflight for d in self._buffers)
+            return all(self._dest_bytes_locked(d) >= self._per_dest_cap for d in self._buffers)
 
     def maybe_flush(self, *, shutdown: bool = False) -> int:
         """Evaluate flush triggers and submit eligible flushes (FlushStart).
@@ -374,6 +426,12 @@ class DeliveryManager:
         if shutdown:
             return "shutdown"
         if has_data and over_watermark:
+            return "memory"
+        # A destination at its own queue cap must flush even if the global
+        # thresholds aren't met — reads for it are paused until this drains,
+        # so waiting for flush_max_bytes/interval would leave it wedged at
+        # the cap with its intake stopped.
+        if has_data and self._dest_bytes_locked(dest_id) >= self._per_dest_cap:
             return "memory"
         if has_data and buf.rows >= self._cfg.flush_max_rows:
             return "rows"

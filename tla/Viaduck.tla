@@ -50,11 +50,13 @@
 (* limitation: the recovery replay's delete removes the phantom, and TLC   *)
 (* now proves all invariants with no crash conditioning at all.            *)
 (*                                                                         *)
-(* MODEL SIZE: with Keys={1,2}, Dests={d1,d2}, MaxOps=4, TLC checks all 7  *)
-(* invariants over 22,589,617 distinct states (240.8M generated, depth     *)
-(* 19) in ~3 minutes. The unbuffered predecessor model was 730,153         *)
-(* distinct states — the growth is the BufferRead/FlushStart/FlushCommit  *)
-(* interleavings and the crash actions (incl. FlushCommitNoCursor).        *)
+(* MODEL SIZE: with Keys={1,2}, Dests={d1,d2}, MaxOps=4, BufferCap=3, TLC  *)
+(* checks all 7 invariants over 19,886,377 distinct states (211.6M         *)
+(* generated, depth 19) in ~2 minutes. The unbuffered predecessor model    *)
+(* was 730,153 distinct states — the growth is the BufferRead/FlushStart/  *)
+(* FlushCommit interleavings and the crash actions (incl.                  *)
+(* FlushCommitNoCursor); the BufferCap guard prunes ~2% vs unbounded,      *)
+(* confirming the cap actually binds in the explored state space.          *)
 (*                                                                         *)
 (* SCHEMA PROJECTION: viaduck/schema_projection.py transforms each batch   *)
 (* into the destination table shape before write. The implementation       *)
@@ -96,6 +98,13 @@ CONSTANTS
     Instances,      \* e.g. {"i1"}
     DestOwner,      \* function: dest -> instance
     MaxOps,         \* bound on source operations
+    BufferCap,      \* per-destination queue bound: BufferRead(d, _) is
+                    \* enabled only while |buffered[d]| + |inflight[d]| <
+                    \* BufferCap. Models the implementation's
+                    \* buffer_max_bytes_per_destination (bytes there,
+                    \* change-count here). Backpressure is destination-
+                    \* local by construction — one destination's full
+                    \* queue never disables a peer's BufferRead.
     ValProj         \* function: [Dests \X Vals -> Vals]. Per-destination
                     \* transform of the `val` slot only — the schema
                     \* projection abstraction. Key and rv pass through
@@ -255,9 +264,37 @@ Phase3Apply(d, resolved) ==
 \* destination is in flight — this is the buffer swap: FlushStart took the
 \* old buffer, reads land in the fresh one. The poll thread is the only
 \* buffer writer (single-writer discipline in the implementation).
+\*
+\* PER-DESTINATION BACKPRESSURE: the read is gated on THIS destination's
+\* queue (live buffer + in-flight swap) being under BufferCap — never on a
+\* peer's. This models delivery.should_pause_reads_for(d): each destination
+\* is a bounded queue (Kafka-partition semantics), and a full/stuck
+\* destination pauses only its own intake. NOTE this guard RESTORES spec
+\* conformance rather than adding a constraint: BufferRead(d, i) was always
+\* enabled per-destination independently here, but the implementation's
+\* original GLOBAL buffer watermark coupled destinations' read-enablement
+\* through shared memory accounting — a deviation the spec never modeled,
+\* and precisely the mechanism behind two production starvation incidents
+\* (team-50689 starved by iteration order; then team-2 starved by a peer's
+\* in-flight bytes pinning the shared watermark). Cardinality abstracts
+\* bytes: the implementation bounds queue BYTES, the model bounds queue
+\* CHANGE-COUNT — both are "reads stop when this destination's queue is
+\* full", which is the property the safety invariants care about.
+\*
+\* FIDELITY CAVEAT: this guard is HARD; the implementation's cap is SOFT
+\* by at most one chunk — the poll thread checks the cap before each chunk
+\* read, so a destination can cross its cap mid-chunk and land the slice
+\* it was already reading. The spec therefore explores a strict subset of
+\* the implementation's queue states (safety over the subset still holds;
+\* the one-chunk overshoot adds no new conflict/ordering behavior, only a
+\* bounded byte excess below the model's abstraction level). Wedge-freedom
+\* at the cap (cap-triggered flush drains a paused queue) is enforced by
+\* the implementation's maybe_flush trigger and unit tests, not by TLC —
+\* this model checks safety only (CHECK_DEADLOCK FALSE, no liveness props).
 BufferRead(d, i) ==
     /\ DestOwner[d] = i
     /\ bufferedThrough[d] < srcSnap
+    /\ Cardinality(buffered[d]) + Cardinality(inflight[d]) < BufferCap
     /\ buffered' = [buffered EXCEPT ![d] = @ \cup Phase1(CDCReadFrom(d, bufferedThrough[d]))]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = srcSnap]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,

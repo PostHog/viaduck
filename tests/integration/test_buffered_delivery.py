@@ -11,7 +11,7 @@ don't interfere.
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 import pytest
@@ -142,8 +142,6 @@ def test_cross_read_conflict_resolution_at_flush(tmp_path, state):
 
 
 def test_flush_failure_leaves_cursor_and_recovers(tmp_path, state):
-    from unittest.mock import patch
-
     pool = _make_pool(tmp_path, ["d-bad"], broken={"d-bad"})
     state.initialize_destinations(["d-bad"])
     state.advance_cursor("d-bad", snapshot_id=3)
@@ -170,6 +168,51 @@ def test_flush_failure_leaves_cursor_and_recovers(tmp_path, state):
     assert cur.last_error is not None
     assert mgr.positions() == {"d-bad": 3}
     assert mgr.status_snapshot()["d-bad"].buffer_rows == 0
+    pool.close_all()
+
+
+def test_broken_destination_at_cap_does_not_block_healthy_peer(tmp_path, state):
+    """QE must-fix #3, on the REAL DeliveryManager + real pyducklake: one
+    destination broken (writes fail), one healthy, both queued past a tiny
+    per-destination cap. The healthy destination's flush must land and its
+    cursor advance while the broken one fails — and after the dust settles
+    NEITHER destination is stuck at its cap (the broken one's failure path
+    drops its buffer and zeroes its in-flight accounting). Catches
+    real-accounting regressions the mocked poll-cycle tests structurally
+    cannot (e.g. inflight_bytes zeroing moved out of _flush's finally).
+    """
+    pool = _make_pool(tmp_path, ["d-ok", "d-bad"], broken={"d-bad"})
+    state.initialize_destinations(["d-ok", "d-bad"])
+    mgr = DeliveryManager(
+        DeliveryConfig(workers=2, flush_interval_seconds=0.0, buffer_max_bytes_per_destination=1),
+        state,
+        pool,
+        ["event_id"],
+        ["d-ok", "d-bad"],
+        mode="full_cdc",
+    )
+
+    mgr.buffer("d-ok", _cdc_batch("acme", [1, 2]), through_snapshot=7)
+    mgr.buffer("d-bad", _cdc_batch("evil", [3]), through_snapshot=7)
+    # Both over the 1-byte cap: reads paused for both, destination-locally.
+    assert mgr.should_pause_reads_for("d-ok")
+    assert mgr.should_pause_reads_for("d-bad")
+
+    with patch("viaduck.apply._backoff_sleep", return_value=False):
+        assert mgr.maybe_flush() == 2
+        assert mgr.wait_idle(60)
+
+    # Healthy destination: rows landed, cursor advanced.
+    rows = _read_dest(pool, "d-ok")
+    assert sorted(rows.column("event_id").to_pylist()) == [1, 2]
+    cursors = state.load_cursors(["d-ok", "d-bad"])
+    assert cursors["d-ok"].last_snapshot_id == 7
+    # Broken destination: cursor untouched, error recorded.
+    assert cursors["d-bad"].last_snapshot_id == 0
+    assert cursors["d-bad"].last_error is not None
+    # Both queues drained — nobody is wedged at cap.
+    assert not mgr.should_pause_reads_for("d-ok")
+    assert not mgr.should_pause_reads_for("d-bad")
     pool.close_all()
 
 

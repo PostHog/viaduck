@@ -381,6 +381,15 @@ class DeliveryConfig:
     flush_max_rows: int = 500_000
     flush_max_bytes: int = 268_435_456  # 256 MiB per destination
     buffer_total_max_bytes: int = 1_073_741_824  # 1 GiB across all buffers
+    # Per-destination buffer + in-flight byte ceiling — the bound on each
+    # destination's CDC "queue". When a destination's (buffered + in-flight)
+    # bytes reach this, the poll thread stops reading FOR THAT DESTINATION
+    # only; peers keep flowing at their own pace. This is what makes
+    # backpressure destination-local (Kafka-partition semantics) instead of
+    # the previous global watermark, where one stuck destination's bytes
+    # paused reads for everyone. 0 (default) auto-derives a fair share:
+    # buffer_total_max_bytes / number of assigned destinations.
+    buffer_max_bytes_per_destination: int = 0
     pool_max_open: int = 100  # destination connection pool size
 
     def __post_init__(self):
@@ -391,6 +400,11 @@ class DeliveryConfig:
         for name in ("flush_max_rows", "flush_max_bytes", "buffer_total_max_bytes", "pool_max_open"):
             if getattr(self, name) < 1:
                 raise ConfigError(f"delivery.{name} must be >= 1, got {getattr(self, name)}")
+        if self.buffer_max_bytes_per_destination < 0:
+            raise ConfigError(
+                f"delivery.buffer_max_bytes_per_destination must be >= 0 (0 = auto), "
+                f"got {self.buffer_max_bytes_per_destination}"
+            )
 
 
 @dataclass(frozen=True)
@@ -461,6 +475,10 @@ class ViaduckConfig:
         log.info("config: delivery.flush_max_rows=%d", self.delivery.flush_max_rows)
         log.info("config: delivery.flush_max_bytes=%d", self.delivery.flush_max_bytes)
         log.info("config: delivery.buffer_total_max_bytes=%d", self.delivery.buffer_total_max_bytes)
+        log.info(
+            "config: delivery.buffer_max_bytes_per_destination=%d (0=auto: total/N)",
+            self.delivery.buffer_max_bytes_per_destination,
+        )
         log.info("config: delivery.pool_max_open=%d", self.delivery.pool_max_open)
 
         log.info("config: server.port=%d", self.server.port)
@@ -646,6 +664,10 @@ def load(path: str | Path) -> ViaduckConfig:
         flush_max_bytes=_validate_int(delivery_raw.get("flush_max_bytes", 268_435_456), "delivery.flush_max_bytes"),
         buffer_total_max_bytes=_validate_int(
             delivery_raw.get("buffer_total_max_bytes", 1_073_741_824), "delivery.buffer_total_max_bytes"
+        ),
+        buffer_max_bytes_per_destination=_validate_int(
+            delivery_raw.get("buffer_max_bytes_per_destination", 0),
+            "delivery.buffer_max_bytes_per_destination",
         ),
         pool_max_open=_validate_int(delivery_raw.get("pool_max_open", 100), "delivery.pool_max_open"),
     )

@@ -162,6 +162,11 @@ _delivery_flush_seconds = Histogram(
     ["pipeline", "destination"],
     buckets=_WRITE_LATENCY_BUCKETS,
 )
+_delivery_reads_paused = Gauge(
+    "viaduck_delivery_reads_paused",
+    "1 while a destination's queue (buffer + in-flight) is at its per-destination cap and CDC reads for it are paused",
+    ["pipeline", "destination"],
+)
 _delivery_buffers_dropped_total = Counter(
     "viaduck_delivery_buffers_dropped_total",
     "Buffers discarded after a failed flush (range will be re-read)",
@@ -250,6 +255,7 @@ delivery_buffer_total_bytes = _delivery_buffer_total_bytes
 delivery_flushes_total = _delivery_flushes_total
 delivery_flush_seconds = _delivery_flush_seconds
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
+delivery_reads_paused = _delivery_reads_paused
 
 partition_spec_total = _partition_spec_total
 projection_cast_null_fallback_total = _projection_cast_null_fallback_total
@@ -270,6 +276,7 @@ def init(pipeline: str):
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
+    global delivery_reads_paused
     global partition_spec_total, projection_cast_null_fallback_total
     global dest_write_retries_total, dest_write_retrying
 
@@ -280,6 +287,7 @@ def init(pipeline: str):
     delivery_flushes_total = _AutoPipelineLabels(_delivery_flushes_total, pipeline)
     delivery_flush_seconds = _AutoPipelineLabels(_delivery_flush_seconds, pipeline)
     delivery_buffers_dropped_total = _AutoPipelineLabels(_delivery_buffers_dropped_total, pipeline)
+    delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
     dest_rows_written_total = _AutoPipelineLabels(_dest_rows_written_total, pipeline)
     dest_last_snapshot_id = _AutoPipelineLabels(_dest_last_snapshot_id, pipeline)
     dest_lag_snapshots = _AutoPipelineLabels(_dest_lag_snapshots, pipeline)
