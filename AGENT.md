@@ -164,11 +164,12 @@ the M3 soak at the seed boundary, locked by integration tests).
 
 The CDC algorithm is formally specified in `tla/Viaduck.tla` and verified by
 TLC. Run via `flox activate` then `just tlc`. The spec models source operations,
-buffered CDC reads, two-step flushes (buffer swap → commit/fail), concurrent
-per-destination flush workers, seeding, and commit/cursor-gap scenarios both
-with and without process death — ALL checked unconditionally; the
-tombstone rule retired the everCrashed phantom conditioning entirely —
-checking 7 invariants across 22.6M distinct states (~3 min). Modify the spec when changing
+buffered CDC reads (bounded by BufferCap — per-destination backpressure),
+two-step flushes (buffer swap → commit/fail), concurrent per-destination
+flush workers, seeding, and commit/cursor-gap scenarios both with and
+without process death — ALL checked unconditionally; the tombstone rule
+retired the everCrashed phantom conditioning entirely — checking 7
+invariants across 19,886,377 distinct states. Modify the spec when changing
 the CDC algorithm or adding new failure modes — and when designing semantic
 changes, extend the spec FIRST and let TLC pass judgment before implementing.
 Always run `just tlc` after spec changes.
@@ -178,10 +179,13 @@ Always run `just tlc` after spec changes.
 - **Config via YAML** with `_env` suffix convention for credential indirection
 - **At-least-once semantics**: no cross-catalog transactions; destinations tolerate duplicates
 - **Buffered delivery**: reads at poll cadence, writes at flush cadence (default 120s) — decouples lag visibility from write amplification; `workers: 1, flush_interval_seconds: 0` reproduces unbuffered behavior
+- **Per-destination bounded buffers (queue semantics)**: each destination's queue (buffered + in-flight) is capped at `buffer_total_max_bytes / N` (or `buffer_max_bytes_per_destination`); an at-cap destination is excluded from CDC read filters and its position frozen — one slow destination backpressures only itself, like a per-partition Kafka consumer. Cap hit also force-flushes (trigger=`memory`). Modeled as BufferCap in the TLA+ spec.
 - **State on plain Postgres**: cursor advances must not create catalog snapshots (the snapshot treadmill); lives in a dedicated `viaduck` schema so it never pollutes the ducklake catalog's namespace; upserts carry a monotonicity guard
 - **LRU connection pool with lease pinning**: bounds memory at high fanout (default 100 open connections); eviction never closes a connection mid-transaction
 - **Per-destination error isolation**: one broken destination doesn't block others; a failed flush drops only that destination's buffers
-- **Grouped CDC reads**: destinations at the same read position share a single CDC call
+- **Grouped CDC reads, chunked with a round-robin cap**: destinations at the same read position share a single CDC call; reads chunk at `poll.cdc_chunk_snapshots` with ≤4 chunks per group per cycle so a lagging group can't starve peers
+- **Two-layer write retry**: DuckLake's internal retry (`ducklake_max_retry_count=20`, FLAT 25-50ms backoff — `ducklake_retry_backoff` MUST stay 1.0: DuckLake's sleep is `wait_ms × random × backoff^attempt` with the attempt index as an uncapped exponent, so any backoff >1 compounds over 20 attempts into minutes-to-hours sleeps) absorbs snapshot-id commit collisions with catalog-SQL-only retries; viaduck's outer loop (15 attempts, exp backoff capped 30s, ±50% jitter) handles real failures. OCC conflicts do NOT evict the pooled connection (eviction per retry leaked ~160MB native each). `SchemaProjectionError`/`RoutingError` are permanent and fail fast.
+- **Schema projection** (`schema_projection.py`): per-destination drops/reorder/safe-casts onto the destination's existing schema; build-time guards refuse key/routing-column mutation and NOT-NULL-violating casts; per-value cast fallback nulls unparseable values and alarms via `projection_cast_null_fallback_total`
 - **Scan-based seeding with REPLACE semantics**: new destinations bulk-load from a filtered source scan; a cursor-0 destination with leftover rows (crashed prior seed) is truncated first (`routing.seed_truncate`, default true). Configurable via `seed_mode` (default: `scan`)
 - **Worker threads are a concurrency knob, not a CPU multiplier**: Arrow's compute pool and DuckDB's threads are process-global underneath every flush worker — see README "Worker-thread sizing"
 
@@ -193,19 +197,20 @@ Always run `just tlc` after spec changes.
 | `delivery.py` | DeliveryManager: per-destination buffers, flush triggers, worker pool, position model |
 | `apply.py` | Phase 2 conflict resolution, Phase 3 delete/upsert + Winner(k), write retry |
 | `config.py` | YAML parsing, env var resolution, frozen dataclass |
-| `source.py` | Source catalog connection, CDC reading (table_changes / table_insertions, exclusive start) |
+| `source.py` | Source catalog connection + DuckLake connection defaults (internal retry, cache off), CDC reading (table_changes / table_insertions, exclusive start) |
 | `router.py` | Arrow splitting by routing field |
+| `schema_projection.py` | Per-destination projection plans: drops, ordering, safe casts, build-time guards, per-value fallback |
 | `destination.py` | LRU connection pool for destination catalogs, lease pinning |
 | `state.py` | Per-destination cursors on plain Postgres (psycopg) |
 | `arrowutil.py` | Shared Arrow kernel helpers (row_indices, full_bool) |
-| `metrics.py` | Prometheus metric definitions (27 metrics) |
+| `metrics.py` | Prometheus metric definitions (32 metrics) |
 | `server.py` | HTTP /metrics, /healthz, /readyz, /status, /ui, /ui/sse |
 | `logging_config.py` | Structured logging setup |
 
 ## Testing
 
-- Unit tests: `tests/unit/` — mocked pyducklake, fast (356 tests)
-- Integration tests: `tests/integration/` — real pyducklake with local DuckDB; Postgres-backed state tests via testcontainers (45 tests)
+- Unit tests: `tests/unit/` — mocked pyducklake, fast (506 tests)
+- Integration tests: `tests/integration/` — real pyducklake with local DuckDB; Postgres-backed state tests via testcontainers (75 tests)
 - Performance tests: `tests/perf/` — router, phases, delete filter, end-to-end delivery fanout at 200/500/1000 destinations (11 benchmarks)
 - Soak: manual docker-compose kill sequence (SIGKILL + SIGTERM + convergence diff) — run for delivery-semantics changes
 
