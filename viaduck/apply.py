@@ -94,6 +94,35 @@ def _is_occ_conflict(exc: BaseException) -> bool:
     return any(marker in msg for marker in _OCC_CONFLICT_MARKERS)
 
 
+# Signatures that a write failure genuinely implicates the CONNECTION (dead
+# socket, RDS restart/failover, TLS drop) and thus needs an evict + reconnect
+# to recover. Everything NOT matched here — OCC conflicts AND write/IO errors
+# (read-only fs, disk full, permission) — leaves the connection usable and
+# MUST retry on the SAME connection. Closing mid-write orphans the fork httpfs
+# write-retry buffer (~one flush, 130-160MB native) that a same-connection
+# retry reuses; force-evicting on "any non-OCC error" was the dominant driver
+# of the writer OOM loop (447 reconnects ≈ 415 team-2 read-only-/tmp write
+# retries). This is a positive allowlist, not a not-OCC negative, precisely so
+# a non-connection error can never trigger a leaking reconnect.
+_CONNECTION_ERROR_MARKERS = (
+    "server closed the connection",
+    "connection to server",
+    "could not connect",
+    "connection refused",
+    "connection reset",
+    "terminating connection",  # RDS restart / failover / admin action
+    "SSL connection has been closed",
+    "no connection to the server",
+    "broken pipe",
+    "Connection Error",  # DuckDB-surfaced socket failure
+)
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(marker in msg for marker in _CONNECTION_ERROR_MARKERS)
+
+
 def _backoff_sleep(delay: float, stop_event: threading.Event | None) -> bool:
     """Sleep `delay` seconds between retry attempts. If `stop_event` fires,
     wake early and return True. Otherwise return False.
@@ -177,7 +206,14 @@ def _write_with_retry(dest_pool, destination_id, operation, stop_event: threadin
                 # on close (fork-side hunt pending) — 274 reconnects in
                 # 106 min OOM-killed the pod at 48Gi, six times in one
                 # night.
-                if not _is_occ_conflict(exc):
+                # Was `if not _is_occ_conflict(exc)` — evict on ANY non-OCC
+                # error — which force-closed the connection on write/IO errors
+                # (read-only /tmp, disk, permission) too, orphaning the fork
+                # httpfs write-retry buffer per failure (the OOM leak; see
+                # _CONNECTION_ERROR_MARKERS). Now only a positively-identified
+                # connection-death signal reconnects; everything else retries
+                # on the same live connection.
+                if _is_connection_error(exc):
                     dest_pool.evict(destination_id)
                 # Wake early on shutdown — the flush worker's job is to make
                 # progress OR let the process exit, not to hold a sleep past

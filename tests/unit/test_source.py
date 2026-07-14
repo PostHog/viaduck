@@ -128,6 +128,7 @@ def test_connect():
                     "ducklake_max_retry_count": "20",
                     "ducklake_retry_wait_ms": "50",
                     "ducklake_retry_backoff": "1.0",
+                    "temp_directory": "/tmp",
                 },
             )
 

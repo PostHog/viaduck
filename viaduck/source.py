@@ -89,6 +89,14 @@ _CONNECTION_DEFAULTS = {
     "ducklake_max_retry_count": "20",
     "ducklake_retry_wait_ms": "50",
     "ducklake_retry_backoff": "1.0",
+    # DuckDB spills intermediates to `temp_directory`; unset, it defaults to
+    # `.tmp` relative to CWD (`/`), which is read-only under the pod's
+    # readOnlyRootFilesystem. A large flush that spills then fails with
+    # `Failed to create directory ".tmp": Read-only file system`, stalling that
+    # destination (only the biggest-flush destination hits it, so it looks
+    # per-destination). Point spill at the mounted writable /tmp emptyDir.
+    # Overridable per-connection via properties.
+    "temp_directory": "/tmp",
 }
 
 
