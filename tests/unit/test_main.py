@@ -99,6 +99,29 @@ def test_write_with_retry_retries_on_failure():
         _write_with_retry(pool, "dest-1", op)
 
     assert attempts["count"] == 2
+    # A generic (non-connection) failure retries on the SAME connection and
+    # must NOT evict/reconnect: closing mid-write orphaned the fork httpfs
+    # write-retry buffer (~one flush, 130-160MB native) — the writer OOM leak.
+    # Only a positively-identified connection-death signal may reconnect.
+    pool.evict.assert_not_called()
+
+
+def test_write_with_retry_evicts_only_on_connection_error():
+    """A genuine connection-death signal reconnects; a plain write/IO error
+    does not (evicting on it orphaned the httpfs write-retry buffer = OOM leak)."""
+    pool = MagicMock()
+    pool.get.return_value = (MagicMock(), MagicMock())
+    attempts = {"count": 0}
+
+    def op(catalog, table):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise Exception("server closed the connection unexpectedly")
+
+    with patch("viaduck.apply.time.sleep"):
+        _write_with_retry(pool, "dest-1", op)
+
+    assert attempts["count"] == 2
     pool.evict.assert_called_once_with("dest-1")
 
 
