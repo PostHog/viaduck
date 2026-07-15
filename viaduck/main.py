@@ -54,6 +54,7 @@ import os
 import signal
 import threading
 import time
+from datetime import UTC, datetime
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -780,6 +781,68 @@ def run(cfg: config.ViaduckConfig) -> None:
     log.info("Shutdown complete")
 
 
+# Time-lag export failures are throttled like _MEM_STATS_FAILURES: a
+# persistent failure (revoked grant, meta-schema rename) would otherwise
+# freeze the gauge at its last value with only DEBUG logs — a flat lag
+# line that reads as "healthy" is worse than an absent one.
+_TIME_LAG_FAILURES = 0
+_TIME_LAG_LOG_EVERY_NTH_FAILURE = 100
+
+
+def _export_dest_time_lag(src_table, delivery_snapshot, assigned_ids, snap_now: int) -> None:
+    """Export viaduck_dest_time_lag_seconds: wall-clock age of each
+    destination's last flushed source snapshot (now - snapshot_time), from
+    ONE indexed ducklake_snapshot lookup shared by all destinations. Exact —
+    unlike dest_lag_snapshots, which needs a commit-rate assumption to
+    convert to time.
+
+    A destination whose cursor is AT the source head is caught up and reads
+    0 — without this, a quiet source (no commits) would grow the gauge
+    without bound while dest_lag_snapshots correctly reads 0 in the same
+    state (the classic idle-stream lag trap; caught up => 0). The healthy-
+    state floor for a busy source is ~poll+flush cadence: the honest
+    staleness of the durable cursor.
+
+    Best-effort: a lookup failure must never break the poll cycle. Clock
+    skew between this pod and the catalog writer is acceptable at seconds
+    granularity. A never-flushed destination (cursor 0) is skipped —
+    there is no meaningful cursor to age.
+    """
+    global _TIME_LAG_FAILURES
+    try:
+        caught_up = {did for did in assigned_ids if delivery_snapshot[did].flushed_snapshot >= snap_now}
+        for did in caught_up:
+            metrics.dest_time_lag_seconds.labels(destination=did).set(0.0)
+        cursors = {delivery_snapshot[did].flushed_snapshot for did in assigned_ids if did not in caught_up}
+        cursors.discard(0)
+        if not cursors:
+            return
+        times = source.snapshot_times(src_table, sorted(cursors))
+        now = datetime.now(UTC)
+        for did in assigned_ids:
+            if did in caught_up:
+                continue
+            snap = delivery_snapshot[did].flushed_snapshot
+            ts = times.get(snap)
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+            lag_s = max((now - ts).total_seconds(), 0.0)
+            metrics.dest_time_lag_seconds.labels(destination=did).set(lag_s)
+        _TIME_LAG_FAILURES = 0
+    except Exception:
+        _TIME_LAG_FAILURES += 1
+        if _TIME_LAG_FAILURES == 1 or _TIME_LAG_FAILURES % _TIME_LAG_LOG_EVERY_NTH_FAILURE == 0:
+            log.warning(
+                "time-lag export failed (%d consecutive); gauge is stale until this recovers",
+                _TIME_LAG_FAILURES,
+                exc_info=True,
+            )
+        else:
+            log.debug("time-lag export failed; skipping this cycle", exc_info=True)
+
+
 def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, mode):
     # Local boolean so the existing branch sites stay terse. Threading mode
     # (not full_cdc) through the call signature avoids reconstructing the
@@ -967,6 +1030,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
     snap_now = current_id if current_id is not None else 0
     dest_statuses = []
     delivery_snapshot = delivery.status_snapshot()
+    _export_dest_time_lag(src_table, delivery_snapshot, assigned_ids, snap_now)
     for did in assigned_ids:
         d = delivery_snapshot[did]
         lag = max(snap_now - d.flushed_snapshot, 0)

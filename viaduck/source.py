@@ -11,6 +11,8 @@ import pyarrow as pa
 from viaduck import metrics
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from pyducklake import Catalog, Table
     from pyducklake.cdc import ChangeSet
 
@@ -144,6 +146,57 @@ def current_snapshot_id(table: Table) -> int | None:
     if row is None or row[0] is None:
         return None
     return int(row[0])
+
+
+# Warn-once registry for cursors found older than snapshot retention: the
+# clamp below keeps the gauge honest ("at least window age") but the state
+# itself is an operational incident — the CDC range past that cursor may no
+# longer be fully readable. One warning per cursor id, not one per 2s cycle.
+_clamp_warned_cursors: set[int] = set()
+
+
+def snapshot_times(table: Table, snapshot_ids: list[int]) -> dict[int, datetime]:
+    """snapshot_id -> snapshot_time for the given ids, in one indexed lookup.
+
+    Powers the exact time-lag gauge: unlike the snapshot-count lag, the
+    wall-clock age of a destination's cursor needs no commit-rate assumption.
+
+    Ids missing from ducklake_snapshot (a cursor older than snapshot
+    retention — its row was expired) are CLAMPED to the oldest retained
+    snapshot_time, so a badly-lagged destination reports "at least the
+    window age" instead of silently disappearing from the gauge.
+
+    Same direct-SQL pattern as current_snapshot_id/earliest_snapshot_id:
+    never materialize the snapshot table through pyducklake.
+    """
+    if not snapshot_ids:
+        return {}
+    catalog_name = table._catalog.name
+    meta_schema = f"__ducklake_metadata_{catalog_name}".replace('"', '""')
+    id_list = ", ".join(str(int(s)) for s in snapshot_ids)
+    rows = table._catalog.connection.execute(
+        f'SELECT snapshot_id, snapshot_time FROM "{meta_schema}".ducklake_snapshot WHERE snapshot_id IN ({id_list})'
+    ).fetchall()
+    out = {int(r[0]): r[1] for r in rows}
+    missing = [s for s in snapshot_ids if int(s) not in out]
+    if missing:
+        newly = [int(s) for s in missing if int(s) not in _clamp_warned_cursors]
+        if newly:
+            _clamp_warned_cursors.update(newly)
+            log.warning(
+                "cursor snapshot(s) %s older than %s's snapshot retention; clamping time-lag "
+                "to the oldest retained snapshot — the CDC range past these cursors may no "
+                "longer be fully readable",
+                newly,
+                catalog_name,
+            )
+        row = table._catalog.connection.execute(
+            f'SELECT MIN(snapshot_time) FROM "{meta_schema}".ducklake_snapshot'
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            for s in missing:
+                out[int(s)] = row[0]
+    return out
 
 
 def earliest_snapshot_id(table: Table) -> int | None:

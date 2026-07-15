@@ -7,7 +7,14 @@ from unittest.mock import MagicMock, patch
 import pyarrow as pa
 
 from viaduck import metrics
-from viaduck.source import current_snapshot_id, earliest_snapshot_id, read_cdc, read_cdc_changes, strip_meta
+from viaduck.source import (
+    current_snapshot_id,
+    earliest_snapshot_id,
+    read_cdc,
+    read_cdc_changes,
+    snapshot_times,
+    strip_meta,
+)
 
 
 def setup_module():
@@ -282,3 +289,75 @@ def test_strip_meta_partial_metadata():
     result = strip_meta(t)
     assert result.column_names == ["id", "name"]
     assert result.num_rows == 1
+
+
+class TestSnapshotTimes:
+    """snapshot_times: one indexed lookup, clamp-to-oldest for expired cursors."""
+
+    def _table(self, side_effect):
+        table = MagicMock()
+        table._catalog.name = "lake"
+        table._catalog.connection.execute.side_effect = side_effect
+        return table
+
+    def test_empty_ids_queries_nothing(self):
+        table = self._table(AssertionError("must not query"))
+        assert snapshot_times(table, []) == {}
+
+    def test_maps_ids_to_times(self):
+        result = MagicMock()
+        result.fetchall.return_value = [(10, "t10"), (20, "t20")]
+        table = self._table([result])
+        out = snapshot_times(table, [10, 20])
+        assert out == {10: "t10", 20: "t20"}
+        sql = table._catalog.connection.execute.call_args[0][0]
+        assert '"__ducklake_metadata_lake".ducklake_snapshot' in sql
+        assert "IN (10, 20)" in sql
+
+    def test_missing_id_clamped_to_oldest_retained(self):
+        # Cursor 5 was expired out of ducklake_snapshot: the IN lookup only
+        # finds 20; the follow-up MIN(snapshot_time) supplies the clamp so a
+        # badly-lagged destination reports at least the window age.
+        in_result = MagicMock()
+        in_result.fetchall.return_value = [(20, "t20")]
+        min_result = MagicMock()
+        min_result.fetchone.return_value = ("t_oldest",)
+        table = self._table([in_result, min_result])
+        out = snapshot_times(table, [5, 20])
+        assert out == {5: "t_oldest", 20: "t20"}
+        min_sql = table._catalog.connection.execute.call_args_list[1][0][0]
+        assert "MIN(snapshot_time)" in min_sql
+
+    def test_meta_schema_quoted_for_hyphenated_catalogs(self):
+        result = MagicMock()
+        result.fetchall.return_value = [(10, "t10")]
+        table = self._table([result])
+        table._catalog.name = "megaduck-mw-prod-us"
+        snapshot_times(table, [10])
+        sql = table._catalog.connection.execute.call_args[0][0]
+        assert '"__ducklake_metadata_megaduck-mw-prod-us".ducklake_snapshot' in sql
+
+    def test_clamp_warns_once_per_cursor(self, caplog):
+        import logging as _logging
+
+        from viaduck import source as source_mod
+
+        source_mod._clamp_warned_cursors.clear()
+        in_result = MagicMock()
+        in_result.fetchall.return_value = []
+        min_result = MagicMock()
+        min_result.fetchone.return_value = ("t_oldest",)
+        table = self._table([in_result, min_result, in_result, min_result])
+        with caplog.at_level(_logging.WARNING, logger="viaduck.source"):
+            snapshot_times(table, [5])
+            snapshot_times(table, [5])  # same cursor again: no second warning
+        warnings = [r for r in caplog.records if "older than" in r.message]
+        assert len(warnings) == 1
+
+    def test_empty_catalog_returns_found_only(self):
+        in_result = MagicMock()
+        in_result.fetchall.return_value = []
+        min_result = MagicMock()
+        min_result.fetchone.return_value = (None,)
+        table = self._table([in_result, min_result])
+        assert snapshot_times(table, [5]) == {}
