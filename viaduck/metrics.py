@@ -64,6 +64,13 @@ _dest_lag_snapshots = Gauge(
     "Snapshot lag per destination (current - last_replicated)",
     ["pipeline", "destination"],
 )
+_dest_time_lag_seconds = Gauge(
+    "viaduck_dest_time_lag_seconds",
+    "Wall-clock age of the destination's last flushed source snapshot "
+    "(now - ducklake_snapshot.snapshot_time) — exact time lag, unlike the "
+    "snapshot-count lag, which needs a commit-rate assumption to convert",
+    ["pipeline", "destination"],
+)
 
 _unrouted_rows_total = Counter(
     "viaduck_unrouted_rows_total",
@@ -231,6 +238,7 @@ dest_write_seconds = _dest_write_seconds
 dest_rows_written_total = _dest_rows_written_total
 dest_last_snapshot_id = _dest_last_snapshot_id
 dest_lag_snapshots = _dest_lag_snapshots
+dest_time_lag_seconds = _dest_time_lag_seconds
 
 unrouted_rows_total = _unrouted_rows_total
 
@@ -267,6 +275,7 @@ def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
     global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
+    global dest_time_lag_seconds
     global unrouted_rows_total
     global pool_open_connections, pool_evictions_total, pool_creates_total
     global errors_total
@@ -291,6 +300,7 @@ def init(pipeline: str):
     dest_rows_written_total = _AutoPipelineLabels(_dest_rows_written_total, pipeline)
     dest_last_snapshot_id = _AutoPipelineLabels(_dest_last_snapshot_id, pipeline)
     dest_lag_snapshots = _AutoPipelineLabels(_dest_lag_snapshots, pipeline)
+    dest_time_lag_seconds = _AutoPipelineLabels(_dest_time_lag_seconds, pipeline)
     errors_total = _AutoPipelineLabels(_errors_total, pipeline)
     dest_rows_deleted_total = _AutoPipelineLabels(_dest_rows_deleted_total, pipeline)
     dest_rows_upserted_total = _AutoPipelineLabels(_dest_rows_upserted_total, pipeline)

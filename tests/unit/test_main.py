@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from unittest.mock import MagicMock, call, patch
 
 import pyarrow as pa
@@ -3588,3 +3589,138 @@ def test_memtrace_throttle_short_circuits_query(caplog):
     assert mock_conn.execute.call_count == 2, (
         f"throttle failed: query ran {mock_conn.execute.call_count} times, expected 2"
     )
+
+
+# ---------------------------------------------------------------------------
+# _export_dest_time_lag (exact wall-clock lag gauge)
+# ---------------------------------------------------------------------------
+
+
+def test_export_dest_time_lag_sets_exact_age():
+    from datetime import datetime, timedelta
+
+    from viaduck.main import _export_dest_time_lag
+
+    metrics.init("test")  # re-bind: earlier test modules re-init with other pipelines
+    delivery = _make_delivery({"dest-1": 10})
+    snapshot = delivery.status_snapshot.return_value
+    ts = datetime.now(UTC) - timedelta(seconds=120)
+    with patch("viaduck.main.source.snapshot_times", return_value={10: ts}) as st:
+        _export_dest_time_lag(MagicMock(), snapshot, ["dest-1"], snap_now=100)
+    st.assert_called_once()
+    assert st.call_args[0][1] == [10]
+    val = metrics._dest_time_lag_seconds.labels(pipeline="test", destination="dest-1")._value.get()
+    assert 119 <= val <= 130
+
+
+def test_export_dest_time_lag_treats_naive_timestamp_as_utc():
+    from datetime import datetime, timedelta
+
+    from viaduck.main import _export_dest_time_lag
+
+    metrics.init("test")  # re-bind: earlier test modules re-init with other pipelines
+    delivery = _make_delivery({"dest-2": 7})
+    snapshot = delivery.status_snapshot.return_value
+    naive = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=60)
+    with patch("viaduck.main.source.snapshot_times", return_value={7: naive}):
+        _export_dest_time_lag(MagicMock(), snapshot, ["dest-2"], snap_now=100)
+    val = metrics._dest_time_lag_seconds.labels(pipeline="test", destination="dest-2")._value.get()
+    assert 59 <= val <= 70
+
+
+def test_export_dest_time_lag_skips_never_flushed():
+    from viaduck.main import _export_dest_time_lag
+
+    delivery = _make_delivery({"dest-3": 0})
+    snapshot = delivery.status_snapshot.return_value
+    with patch("viaduck.main.source.snapshot_times") as st:
+        _export_dest_time_lag(MagicMock(), snapshot, ["dest-3"], snap_now=100)
+    st.assert_not_called()
+
+
+def test_export_dest_time_lag_never_breaks_the_poll_cycle():
+    from viaduck.main import _export_dest_time_lag
+
+    delivery = _make_delivery({"dest-4": 9})
+    snapshot = delivery.status_snapshot.return_value
+    with patch("viaduck.main.source.snapshot_times", side_effect=RuntimeError("catalog blip")):
+        _export_dest_time_lag(MagicMock(), snapshot, ["dest-4"], snap_now=100)  # must not raise
+
+
+def test_export_dest_time_lag_caught_up_reads_zero():
+    """Caught up (cursor == head) => 0, even on a quiet source. Without the
+    short-circuit a source with no new commits would grow the gauge without
+    bound while dest_lag_snapshots correctly reads 0 in the same state."""
+    from viaduck.main import _export_dest_time_lag
+
+    metrics.init("test")
+    delivery = _make_delivery({"dest-5": 42})
+    snapshot = delivery.status_snapshot.return_value
+    with patch("viaduck.main.source.snapshot_times") as st:
+        _export_dest_time_lag(MagicMock(), snapshot, ["dest-5"], snap_now=42)
+    st.assert_not_called()
+    val = metrics._dest_time_lag_seconds.labels(pipeline="test", destination="dest-5")._value.get()
+    assert val == 0.0
+
+
+def test_export_dest_time_lag_one_lookup_for_all_destinations():
+    """The headline property: all behind destinations share ONE snapshot_times
+    call, with duplicate cursors deduped."""
+    from datetime import UTC, datetime, timedelta
+
+    from viaduck.main import _export_dest_time_lag
+
+    metrics.init("test")
+    delivery = _make_delivery({"a": 7, "b": 7, "c": 9})
+    snapshot = delivery.status_snapshot.return_value
+    ts = datetime.now(UTC) - timedelta(seconds=30)
+    with patch("viaduck.main.source.snapshot_times", return_value={7: ts, 9: ts}) as st:
+        _export_dest_time_lag(MagicMock(), snapshot, ["a", "b", "c"], snap_now=100)
+    st.assert_called_once()
+    assert st.call_args[0][1] == [7, 9]
+    for dest in ("a", "b", "c"):
+        val = metrics._dest_time_lag_seconds.labels(pipeline="test", destination=dest)._value.get()
+        assert 29 <= val <= 40
+
+
+def test_export_dest_time_lag_future_timestamp_clamps_to_zero():
+    from datetime import UTC, datetime, timedelta
+
+    from viaduck.main import _export_dest_time_lag
+
+    metrics.init("test")
+    delivery = _make_delivery({"dest-6": 3})
+    snapshot = delivery.status_snapshot.return_value
+    future = datetime.now(UTC) + timedelta(seconds=45)  # clock skew
+    with patch("viaduck.main.source.snapshot_times", return_value={3: future}):
+        _export_dest_time_lag(MagicMock(), snapshot, ["dest-6"], snap_now=100)
+    val = metrics._dest_time_lag_seconds.labels(pipeline="test", destination="dest-6")._value.get()
+    assert val == 0.0
+
+
+def test_poll_cycle_wires_time_lag_export():
+    """The call-site line in _poll_cycle must exist: mutation testing showed
+    the helper alone passes with the wiring deleted."""
+    delivery = _make_delivery({"dest-1": 10})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    with (
+        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main._export_dest_time_lag") as ex,
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+        )
+    ex.assert_called_once()
+    args = ex.call_args[0]
+    assert args[2] == ["dest-1"]
+    assert args[3] == 10  # snap_now threaded through
