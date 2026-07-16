@@ -88,6 +88,17 @@ _pool_evictions_total = Counter(
     "LRU connection pool evictions",
     ["pipeline"],
 )
+# Force-evictions from the write-retry path, split by why. Each one is a full
+# Catalog close+recreate (10-20s re-ATTACH, plus the known ~160MB native
+# leak per close — see apply._write_with_retry) so a climbing rate is an
+# incident signal, not noise: `connection` = network/RDS death, and
+# `instance_fatal` = a DuckDB instance invalidated by an Internal/Fatal
+# error (fork bug — always worth eyes).
+_pool_force_evictions_total = Counter(
+    "viaduck_pool_force_evictions_total",
+    "Write-retry force-evictions of a destination's pooled catalog, by reason",
+    ["pipeline", "destination", "reason"],
+)
 _pool_creates_total = Counter(
     "viaduck_pool_creates_total",
     "New destination connections created",
@@ -269,6 +280,7 @@ partition_spec_total = _partition_spec_total
 projection_cast_null_fallback_total = _projection_cast_null_fallback_total
 dest_write_retries_total = _dest_write_retries_total
 dest_write_retrying = _dest_write_retrying
+pool_force_evictions_total = _pool_force_evictions_total
 
 
 def init(pipeline: str):
@@ -288,6 +300,7 @@ def init(pipeline: str):
     global delivery_reads_paused
     global partition_spec_total, projection_cast_null_fallback_total
     global dest_write_retries_total, dest_write_retrying
+    global pool_force_evictions_total
 
     # Metrics with additional labels — wrap so .labels() auto-injects pipeline
     dest_write_seconds = _AutoPipelineLabels(_dest_write_seconds, pipeline)
@@ -309,6 +322,7 @@ def init(pipeline: str):
     dest_upsert_matched_total = _AutoPipelineLabels(_dest_upsert_matched_total, pipeline)
     dest_write_retries_total = _AutoPipelineLabels(_dest_write_retries_total, pipeline)
     dest_write_retrying = _AutoPipelineLabels(_dest_write_retrying, pipeline)
+    pool_force_evictions_total = _AutoPipelineLabels(_pool_force_evictions_total, pipeline)
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
