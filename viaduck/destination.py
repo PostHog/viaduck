@@ -164,6 +164,7 @@ class DestinationPool:
         """Force-evict a connection (e.g., after an error). If the entry is
         pinned (the caller itself, mid-retry), the close is deferred to the
         final release."""
+        to_close: Catalog | None = None
         with self._lock:
             entry = self._pool.pop(destination_id, None)
             if entry is None:
@@ -173,12 +174,20 @@ class DestinationPool:
             if self._pins.get(destination_id, 0) > 0:
                 self._zombies.setdefault(destination_id, []).append(cat)
             else:
-                try:
-                    cat.close()
-                except Exception:
-                    log.warning("Error closing evicted connection for %s", destination_id)
+                # Close OUTSIDE the lock, same as get()'s LRU path: closing a
+                # ducklake-attached catalog does nontrivial native work, and
+                # force-evict is now a per-attempt hot path when an instance
+                # is fatally invalidated (see apply._write_with_retry) — a
+                # slow close here must not serialize every flush worker and
+                # the poll thread through the pool lock.
+                to_close = cat
             metrics.pool_open_connections.set(len(self._pool))
             log.debug("Force-evicted connection for destination %s", destination_id)
+        if to_close is not None:
+            try:
+                to_close.close()
+            except Exception:
+                log.warning("Error closing evicted connection for %s", destination_id)
 
     def close_all(self) -> None:
         """Close all open connections (and any deferred zombies)."""

@@ -14,6 +14,7 @@ import random
 import threading
 import time
 
+import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -123,6 +124,41 @@ def _is_connection_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CONNECTION_ERROR_MARKERS)
 
 
+# Signal that the DuckDB INSTANCE (not the socket) is dead. An Internal- or
+# Fatal-class error — e.g. a fork bug in the DuckLake commit path ("Calling
+# GetValueInternal on a value that is NULL", team-50689 2026-07-16) —
+# permanently invalidates the whole database; every subsequent statement on
+# any connection to it fails with "database has been invalidated because of
+# a previous fatal error" until the instance is recreated. Retrying on the
+# same instance is futile by construction, so this is the one
+# non-connection case that MUST evict. The write-retry-buffer preservation
+# argument for retrying in place (see _CONNECTION_ERROR_MARKERS) doesn't
+# apply: nothing inside an invalidated instance is reusable, holding it
+# just pins its memory.
+#
+# Typed check first: pyducklake propagates duckdb exceptions unwrapped, and
+# duckdb.InternalException / duckdb.FatalException are exactly the two
+# classes that invalidate the instance (OutOfMemoryException and
+# TransactionException are NOT subclasses of either — verified MROs — so
+# OOM/OCC can't false-positive here). The string marker is a fallback for
+# any future wrapping layer; the text comes from duckdb's
+# ErrorManager::InvalidatedDatabase and is duckdb-core, not fork-owned.
+#
+# NOTE: the invalidated-database wrapper message also embeds the original
+# commit error, so it substring-matches _OCC_CONFLICT_MARKERS too. That
+# overlap is harmless only because the retry loop checks instance-fatal for
+# its evict/fail-fast decisions and never consults _is_occ_conflict — keep
+# it that way (asserted in test_apply_retry.py).
+_INSTANCE_FATAL_MARKERS = ("database has been invalidated because of a previous fatal error",)
+
+
+def _is_instance_fatal(exc: BaseException) -> bool:
+    if isinstance(exc, (duckdb.InternalException, duckdb.FatalException)):
+        return True
+    msg = str(exc)
+    return any(marker in msg for marker in _INSTANCE_FATAL_MARKERS)
+
+
 def _backoff_sleep(delay: float, stop_event: threading.Event | None) -> bool:
     """Sleep `delay` seconds between retry attempts. If `stop_event` fires,
     wake early and return True. Otherwise return False.
@@ -151,6 +187,7 @@ def _write_with_retry(dest_pool, destination_id, operation, stop_event: threadin
     abandoned buffer on every rolling restart.
     """
     metrics.dest_write_retrying.labels(destination=destination_id).set(1)
+    instance_fatals = 0
     try:
         for attempt in range(_WRITE_MAX_RETRIES):
             try:
@@ -166,7 +203,30 @@ def _write_with_retry(dest_pool, destination_id, operation, stop_event: threadin
                 # build-time / config-time issue. Surface raw.
                 raise
             except Exception as exc:
+                instance_fatal = _is_instance_fatal(exc)
+                if instance_fatal:
+                    instance_fatals += 1
                 if attempt == _WRITE_MAX_RETRIES - 1:
+                    raise
+                # Instance-fatal budget: ONE fresh-instance retry. The first
+                # fatal evicts below and retries on a recreated instance —
+                # that heals the transient case (concurrency-dependent fork
+                # bug). A SECOND fatal means a fresh instance died on the
+                # same batch: deterministic. Burning the remaining OCC-tuned
+                # budget would cost 10-20s ATTACH + up-to-30s backoff + the
+                # known ~160MB native close-leak per further attempt while
+                # progressing nothing — fail fast to delivery._flush, which
+                # evicts, drops the buffer for a cadence-paced re-read, and
+                # records the destination error.
+                if instance_fatal and instance_fatals >= 2:
+                    log.error(
+                        "Write to %s hit a second instance-fatal on a fresh instance "
+                        "(attempt %d/%d) — deterministic failure, giving up early: %s",
+                        destination_id,
+                        attempt + 1,
+                        _WRITE_MAX_RETRIES,
+                        exc,
+                    )
                     raise
                 # Exponential backoff capped at _WRITE_MAX_DELAY_S so the
                 # schedule doesn't sprint past the P99 peer-writer gap into
@@ -178,8 +238,10 @@ def _write_with_retry(dest_pool, destination_id, operation, stop_event: threadin
                 # Log severity ladder: routine OCC dance (attempts 1..3) is
                 # DEBUG; attempt 4+ is genuinely worth an operator's eye and
                 # gets WARN. Keeps the WARN channel scannable during
-                # sustained retry pressure.
-                if attempt + 1 >= _WRITE_WARN_ATTEMPT_THRESHOLD:
+                # sustained retry pressure. An instance invalidation is never
+                # routine (it means a Fatal/Internal error killed the DuckDB
+                # instance — fork bug) and is WARN from first sight.
+                if instance_fatal or attempt + 1 >= _WRITE_WARN_ATTEMPT_THRESHOLD:
                     log_level = logging.WARNING
                 else:
                     log_level = logging.DEBUG
@@ -211,9 +273,16 @@ def _write_with_retry(dest_pool, destination_id, operation, stop_event: threadin
                 # (read-only /tmp, disk, permission) too, orphaning the fork
                 # httpfs write-retry buffer per failure (the OOM leak; see
                 # _CONNECTION_ERROR_MARKERS). Now only a positively-identified
-                # connection-death signal reconnects; everything else retries
-                # on the same live connection.
-                if _is_connection_error(exc):
+                # connection-death signal reconnects — plus a fatally-
+                # invalidated instance (_is_instance_fatal), where the
+                # instance is already dead and every same-instance retry
+                # fails identically (team-50689 burned all 15 attempts
+                # against one invalidated instance, 2026-07-16).
+                if _is_connection_error(exc) or instance_fatal:
+                    metrics.pool_force_evictions_total.labels(
+                        destination=destination_id,
+                        reason="instance_fatal" if instance_fatal else "connection",
+                    ).inc()
                     dest_pool.evict(destination_id)
                 # Wake early on shutdown — the flush worker's job is to make
                 # progress OR let the process exit, not to hold a sleep past
