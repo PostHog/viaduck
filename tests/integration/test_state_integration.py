@@ -229,3 +229,83 @@ def test_concurrent_create_table_race(pg_uri, state_table_name):
     for m in managers:
         m.close()
     assert not errors
+
+
+# ---------------------------------------------------------------------------
+# Destination lifecycle (viaduck/lifecycle.py semantics live in the tracker;
+# these pin the StateManager's storage contract against real Postgres)
+# ---------------------------------------------------------------------------
+
+
+def test_lifecycle_round_trip_and_isolation(sm):
+    sm.initialize_destinations(["d1"])
+    # Absent rows: empty result (tracker normalizes absent -> active).
+    assert sm.load_lifecycle_states(["d1", "d2"]) == {}
+
+    sm.set_lifecycle_state("d1", "paused", reason="broken catalog", updated_by="test")
+    assert sm.load_lifecycle_states(["d1"]) == {"d1": "paused"}
+    rows = sm.load_lifecycle_rows(["d1"])
+    assert rows["d1"]["state"] == "paused"
+    assert rows["d1"]["reason"] == "broken catalog"
+    assert rows["d1"]["updated_by"] == "test"
+    assert rows["d1"]["updated_at"] is not None
+
+    # Update in place (upsert path).
+    sm.set_lifecycle_state("d1", "active", reason="fixed", updated_by="test2")
+    assert sm.load_lifecycle_states(["d1"]) == {"d1": "active"}
+
+
+def test_lifecycle_table_is_per_pipeline(pg_uri, state_table_name):
+    # The lifecycle table derives from the cursor table name — two
+    # pipelines with colliding destination ids must not share operator
+    # intent (review finding: shared hard-coded table let one pipeline's
+    # pause hit the other).
+    a = StateManager(pg_uri, "i1", StateConfig(table=state_table_name))
+    b = StateManager(pg_uri, "i1", StateConfig(table=state_table_name + "_other"))
+    try:
+        a.initialize_destinations(["d1"])
+        b.initialize_destinations(["d1"])
+        a.set_lifecycle_state("d1", "paused", reason="pipeline A only", updated_by="test")
+        assert a.load_lifecycle_states(["d1"]) == {"d1": "paused"}
+        assert b.load_lifecycle_states(["d1"]) == {}
+    finally:
+        a.close()
+        b.close()
+
+
+def test_lifecycle_check_constraint_rejects_unknown_state(sm, pg_uri, state_table_name):
+    sm.initialize_destinations(["d1"])
+    # Direct SQL (bypassing the code-level guard): the DB CHECK holds the
+    # vocabulary, which is what makes the tracker's unknown-state paused
+    # fallback forward-compat-only rather than a live path.
+    with psycopg.connect(pg_uri, autocommit=True) as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                f"INSERT INTO viaduck.{state_table_name}_lifecycle "
+                "(destination_id, state, updated_at) VALUES ('d1', 'frobnicated', now())"
+            )
+
+
+def test_retirement_severs_cursor_rows_for_all_instances(pg_uri, state_table_name):
+    # Two instances own rows for the same destination (partitioning drift
+    # over time); retirement is per-destination and must sever both, so a
+    # re-add seeds fresh regardless of which instance picks it up.
+    i1 = StateManager(pg_uri, "i1", StateConfig(table=state_table_name))
+    i2 = StateManager(pg_uri, "i2", StateConfig(table=state_table_name))
+    try:
+        i1.initialize_destinations(["d1"])
+        i2.initialize_destinations(["d1"])
+        i1.advance_cursor("d1", snapshot_id=9, cumulative_rows=10)
+
+        deleted = i1.delete_destination_state("d1")
+        assert deleted == 2
+        assert i1.load_cursors(["d1"]) == {}
+        assert i2.load_cursors(["d1"]) == {}
+        # Idempotent (the per-cycle resurrect-race sweep).
+        assert i1.delete_destination_state("d1") == 0
+        # Re-add: initialize creates a FRESH cursor-0 row -> re-seed path.
+        i1.initialize_destinations(["d1"], initial_snapshot_id=0)
+        assert i1.load_cursors(["d1"])["d1"].last_snapshot_id == 0
+    finally:
+        i1.close()
+        i2.close()

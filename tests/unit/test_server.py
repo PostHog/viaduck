@@ -69,3 +69,30 @@ def test_health_record_poll_updates_liveness():
     time.sleep(0.03)
     h.record_poll()  # refresh
     assert h.is_alive()
+
+
+def test_lifecycle_endpoint_payload():
+    import json as _json
+
+    from viaduck import server as srv
+
+    srv.set_lifecycle_states(
+        {"d1": "paused", "d2": "active"},
+        rows={
+            "d1": {
+                "state": "paused",
+                "reason": "ops hold",
+                "updated_by": "jakob",
+                "updated_at": "2026-07-23T00:00:00+00:00",
+            }
+        },
+    )
+    payload = _json.loads(srv._lifecycle_json())
+    assert payload["destinations"]["d1"]["state"] == "paused"
+    assert payload["destinations"]["d1"]["reason"] == "ops hold"
+    assert payload["destinations"]["d1"]["updated_by"] == "jakob"
+    # d2 has no row (absent = active): state still served, metadata null.
+    assert payload["destinations"]["d2"]["state"] == "active"
+    assert payload["destinations"]["d2"]["reason"] is None
+    # Staleness signal for keep-last-known operation.
+    assert payload["loaded_at_age_s"] is not None and payload["loaded_at_age_s"] >= 0

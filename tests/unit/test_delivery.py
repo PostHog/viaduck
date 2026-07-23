@@ -551,3 +551,104 @@ def test_on_flush_success_fires_for_data_not_for_idle_persists():
         mgr.maybe_flush()
         assert mgr.wait_idle()
     assert hits == [1]
+
+
+# ---------------------------------------------------------------------------
+# Destination lifecycle hooks (viaduck/lifecycle.py)
+# ---------------------------------------------------------------------------
+
+
+def test_discard_buffer_rewinds_position_and_bumps_epoch():
+    mgr, _, _ = _manager(cursors={"d1": 5})
+    plan = mgr.read_plan()
+    pos, epoch = plan["d1"]
+    assert pos == 5
+    mgr.buffer("d1", _table(4), through_snapshot=9, epoch=epoch)
+    assert mgr.positions() == {"d1": 9}
+
+    dropped = mgr.discard_buffer("d1")
+    assert dropped == 4
+    # Position rewound to the durable cursor — the discarded range will be
+    # re-read on resume (controlled-crash semantics, same as FlushFail).
+    assert mgr.positions() == {"d1": 5}
+    # A read that overlapped the discard is rejected by the epoch guard.
+    mgr.buffer("d1", _table(2), through_snapshot=9, epoch=epoch)
+    assert mgr.status_snapshot()["d1"].buffer_rows == 0
+    assert mgr.positions() == {"d1": 5}
+
+
+def test_discard_buffer_noop_when_clean():
+    mgr, _, _ = _manager(cursors={"d1": 5})
+    assert mgr.discard_buffer("d1") == 0
+    # Epoch untouched on the no-op path: an in-flight read may still land.
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(1), through_snapshot=6, epoch=epoch)
+    assert mgr.status_snapshot()["d1"].buffer_rows == 1
+
+
+def test_suspended_destination_never_flushes():
+    mgr, _, _ = _manager()
+    fake, calls = _recording_flush(mgr)
+    with patch.object(mgr, "_flush", fake):
+        mgr.buffer("d1", _table(3), through_snapshot=7)
+        mgr.set_suspended({"d1"})
+        assert mgr.maybe_flush(shutdown=True) == 0
+        assert calls == []
+        # Unsuspend: the same trigger now fires.
+        mgr.set_suspended(set())
+        assert mgr.maybe_flush(shutdown=True) == 1
+        assert calls[0][0] == "d1"
+
+
+def test_is_clean_tracks_buffer_and_position():
+    mgr, _, _ = _manager(cursors={"d1": 5})
+    assert mgr.is_clean("d1")
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(2), through_snapshot=8, epoch=epoch)
+    assert not mgr.is_clean("d1")
+    mgr.discard_buffer("d1")
+    assert mgr.is_clean("d1")
+
+
+def test_position_only_advance_is_not_clean():
+    # An advanced position with no data still means the durable cursor is
+    # behind (a lazy persist is pending) — draining must wait for it.
+    mgr, _, _ = _manager(cursors={"d1": 5})
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.advance_position("d1", 9, epoch=epoch)
+    assert not mgr.is_clean("d1")
+
+
+def test_flush_success_after_discard_restores_position():
+    # Review finding: pause racing an in-flight flush left position <
+    # flushed after the flush committed — on resume the already-applied
+    # range was re-read and re-applied (deterministic duplicates in
+    # append_only). The success path must restore position >= through.
+    import threading
+
+    mgr, sm, _ = _manager(cursors={"d1": 5})
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.advance_position("d1", 9, epoch=epoch)  # position-only: no data write path
+
+    gate = threading.Event()
+    entered = threading.Event()
+
+    def _blocking_advance(dest_id, through, cumulative, attempts=3):
+        entered.set()
+        gate.wait(timeout=10)
+        sm.advance_cursor(dest_id, through, cumulative)
+
+    with patch.object(mgr, "_advance_cursor_with_retry", _blocking_advance):
+        assert mgr.maybe_flush(shutdown=True) == 1  # real _flush, empty tables
+        assert entered.wait(timeout=10)
+        # Lifecycle pause lands mid-flush: rewinds position to flushed=5.
+        mgr.discard_buffer("d1")
+        assert mgr.positions()["d1"] == 5
+        gate.set()
+        assert mgr.wait_idle(timeout_s=10)
+
+    # Flush succeeded through 9: position restored, no re-read of (5, 9].
+    assert mgr.positions()["d1"] == 9
+    snap = mgr.status_snapshot()["d1"]
+    assert snap.flushed_snapshot == 9
+    assert mgr.is_clean("d1")

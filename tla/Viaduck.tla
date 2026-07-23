@@ -51,12 +51,15 @@
 (* now proves all invariants with no crash conditioning at all.            *)
 (*                                                                         *)
 (* MODEL SIZE: with Keys={1,2}, Dests={d1,d2}, MaxOps=4, BufferCap=3, TLC  *)
-(* checks all 7 invariants over 19,886,377 distinct states (211.6M         *)
-(* generated, depth 19) in ~2 minutes. The unbuffered predecessor model    *)
-(* was 730,153 distinct states — the growth is the BufferRead/FlushStart/  *)
-(* FlushCommit interleavings and the crash actions (incl.                  *)
-(* FlushCommitNoCursor); the BufferCap guard prunes ~2% vs unbounded,      *)
-(* confirming the cap actually binds in the explored state space.          *)
+(* checks all 7 invariants over 85,012,333 distinct states (1.18B          *)
+(* generated) in ~18 minutes. The pre-lifecycle model was 19,886,377       *)
+(* distinct states — the growth is PauseDest's discard/rewind firing at    *)
+(* any point, incl. under an in-flight flush. Removing FlushCommit's       *)
+(* position-restore max() yields a 6-step BufferPositionBound              *)
+(* counterexample (SrcInsert, BufferRead, FlushStart, PauseDest,           *)
+(* FlushCommit) — the formal witness for the pause-races-in-flight-flush   *)
+(* duplicate-delivery bug and the proof the restore is load-bearing. The   *)
+(* unbuffered ancestor model was 730,153 distinct states.                  *)
 (*                                                                         *)
 (* SCHEMA PROJECTION: viaduck/schema_projection.py transforms each batch   *)
 (* into the destination table shape before write. The implementation       *)
@@ -324,11 +327,17 @@ FlushCommit(d, i) ==
     /\ flushing[d]
     /\ dstRows' = [dstRows EXCEPT ![d] = Phase3Apply(d, Phase2(inflight[d]))]
     /\ cursors' = [cursors EXCEPT ![d] = inflightThrough[d]]
+    \* Position restore (delivery._flush success path): a PauseDest that
+    \* raced this flush rewound bufferedThrough below inflightThrough; the
+    \* flush SUCCEEDED, so leaving the position behind would re-read a
+    \* committed range on resume. In normal operation this is a no-op
+    \* (bufferedThrough >= inflightThrough always).
+    /\ bufferedThrough' = [bufferedThrough EXCEPT
+                             ![d] = IF @ < inflightThrough[d] THEN inflightThrough[d] ELSE @]
     /\ flushing' = [flushing EXCEPT ![d] = FALSE]
     /\ inflight' = [inflight EXCEPT ![d] = {}]
     /\ inflightThrough' = [inflightThrough EXCEPT ![d] = 0]
-    /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, buffered,
-                   bufferedThrough, opCount>>
+    /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, buffered, opCount>>
 
 \* Flush fails: the destination transaction rolls back (ASSUMPTION 4), the
 \* in-flight set is discarded, AND the live buffer is discarded with the
@@ -347,6 +356,27 @@ FlushFail(d, i) ==
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = cursors[d]]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
                    opCount>>
+
+\* Lifecycle pause/retire discard (viaduck/lifecycle.py + delivery.
+\* discard_buffer): drop the live buffer and rewind the read position to
+\* the persisted cursor. Unlike ProcessCrash the process lives, and
+\* unlike FlushFail an IN-FLIGHT FLUSH IS PRESERVED — the implementation
+\* deliberately lets an already-submitted write finish (completing and
+\* advancing the cursor beats aborting mid-write). The zombie flush may
+\* later FlushCommit, advancing cursors past the rewound read position;
+\* FlushCommit's position-restore max() (mirroring the implementation's
+\* success-path restore) is what keeps BufferPositionBound an invariant.
+\* Firing PauseDest at any time over-approximates operator behavior; the
+\* paused duration needs no modeling (an action not firing IS a pause),
+\* and resume is just BufferRead continuing from the rewound position —
+\* the crash-recovery re-read, which is why resume is gap-free.
+PauseDest(d, i) ==
+    /\ DestOwner[d] = i
+    /\ buffered[d] /= {} \/ bufferedThrough[d] > cursors[d]
+    /\ buffered' = [buffered EXCEPT ![d] = {}]
+    /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = cursors[d]]
+    /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
+                   flushing, inflight, inflightThrough, opCount>>
 
 \* Crash in the commit/cursor gap: the destination transaction committed
 \* but the process died before the cursor persisted. All in-memory state
@@ -552,6 +582,8 @@ Next ==
          FlushCommit(d, i)
     \/ \E d \in Dests, i \in Instances :
          FlushFail(d, i)
+    \/ \E d \in Dests, i \in Instances :
+         PauseDest(d, i)
     \/ \E d \in Dests, i \in Instances :
          CrashDuringFlush(d, i)
     \/ \E d \in Dests, i \in Instances :

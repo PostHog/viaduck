@@ -79,6 +79,11 @@ class StateManager:
         # intentional: the bare table name is the implicit alias of the
         # schema-qualified INSERT/UPDATE target.
         self._qualified = f"{schema}.{table}"
+        # Lifecycle table name derives from the cursor table name so two
+        # pipelines sharing one Postgres (the default URI is the source
+        # catalog's DB) with colliding destination ids cannot pause each
+        # other — same per-pipeline isolation the cursor table gets.
+        self._lifecycle_qualified = f"{schema}.{table}_lifecycle"
         self._lock = threading.Lock()
         self._conn: psycopg.Connection | None = None
         self._table_ensured = False
@@ -123,6 +128,28 @@ class StateManager:
             # raises a unique violation on the pg_class/pg_type insert in
             # one of them. The table exists either way.
             log.info("State table '%s' created concurrently by another instance", self._table)
+        try:
+            # Lifecycle is per-DESTINATION operator intent (pausing a
+            # destination pauses it on every instance), unlike the cursor
+            # table's per-(destination, instance) rows. Absent row = active;
+            # see viaduck/lifecycle.py for the state semantics.
+            # NOTE: CREATE IF NOT EXISTS never updates the CHECK — adding a
+            # state to lifecycle.VALID_STATES later needs a migration on
+            # every existing deployment's table.
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._lifecycle_qualified} (
+                    destination_id text        PRIMARY KEY,
+                    state          text        NOT NULL
+                        CHECK (state IN ('active', 'paused', 'draining', 'retired')),
+                    reason         text,
+                    updated_by     text,
+                    updated_at     timestamptz NOT NULL
+                )
+                """
+            )
+        except (psycopg.errors.DuplicateTable, psycopg.errors.UniqueViolation):
+            log.info("Lifecycle table created concurrently by another instance")
         if not self._table_ensured:
             log.info("State table '%s' ready", self._table)
             self._table_ensured = True
@@ -293,6 +320,123 @@ class StateManager:
         updated = self._run(_op)
         if updated:
             log.warning("Recorded error for destination %s: %s", destination_id, error)
+
+    # -- destination lifecycle (see viaduck/lifecycle.py) --------------------
+
+    def load_lifecycle_states(self, destination_ids: list[str]) -> dict[str, str]:
+        """Raw lifecycle rows for the given destinations. Missing ids are
+        absent from the result (absent row = active; the caller normalizes
+        via lifecycle.normalize so the fail-safe unknown-state handling
+        lives in exactly one place)."""
+        if not destination_ids:
+            return {}
+
+        def _op(conn: psycopg.Connection):
+            rows = conn.execute(
+                f"""
+                SELECT destination_id, state
+                FROM {self._lifecycle_qualified}
+                WHERE destination_id = ANY(%s)
+                """,
+                (destination_ids,),
+            ).fetchall()
+            return {r[0]: r[1] for r in rows}
+
+        return self._run(_op)
+
+    def load_lifecycle_rows(self, destination_ids: list[str]) -> dict[str, dict]:
+        """Full lifecycle rows (state/reason/updated_by/updated_at) for the
+        read-only /lifecycle endpoint. Missing ids absent, like
+        load_lifecycle_states."""
+        if not destination_ids:
+            return {}
+
+        def _op(conn: psycopg.Connection):
+            rows = conn.execute(
+                f"""
+                SELECT destination_id, state, reason, updated_by, updated_at
+                FROM {self._lifecycle_qualified}
+                WHERE destination_id = ANY(%s)
+                """,
+                (destination_ids,),
+            ).fetchall()
+            return {
+                r[0]: {
+                    "state": r[1],
+                    "reason": r[2],
+                    "updated_by": r[3],
+                    "updated_at": r[4].isoformat() if r[4] else None,
+                }
+                for r in rows
+            }
+
+        return self._run(_op)
+
+    def delete_destination_state(self, destination_id: str) -> int:
+        """Sever a destination's resume point: delete its cursor rows for
+        ALL instances (retirement is per-destination). Called when a
+        destination is observed RETIRED — at startup before initialization,
+        and idempotently each cycle for a mid-run retire (an in-flight
+        flush completing after the delete would upsert the row back; the
+        next cycle's delete removes it again). This is what makes
+        "re-add = new tenant = fresh seed" true by construction: with no
+        cursor row, a re-activated destination seeds per seed_mode instead
+        of resuming from a stale snapshot the source may have expired."""
+
+        def _op(conn: psycopg.Connection):
+            cur = conn.execute(
+                f"DELETE FROM {self._qualified} WHERE destination_id = %s",
+                (destination_id,),
+            )
+            return cur.rowcount
+
+        deleted = self._run(_op)
+        if deleted:
+            log.warning(
+                "Severed resume point for retired destination %s (%d cursor row(s) deleted; re-add will re-seed)",
+                destination_id,
+                deleted,
+            )
+        return deleted
+
+    def set_lifecycle_state(self, destination_id: str, state: str, *, reason: str, updated_by: str) -> None:
+        """Write a lifecycle state. REFUSES 'retired': retirement is an
+        explicit human ack through the documented SQL, never a code path —
+        an erroneous automated retire would discard the resume point and
+        turn a later re-add into a full re-seed."""
+        from viaduck import lifecycle
+
+        if state not in lifecycle.WRITABLE_STATES:
+            raise ValueError(
+                f"viaduck code may not write lifecycle state {state!r} "
+                f"(writable: {sorted(lifecycle.WRITABLE_STATES)}); "
+                "'retired' requires an operator UPDATE with updated_by set"
+            )
+        now = datetime.now(UTC)
+
+        def _op(conn: psycopg.Connection):
+            conn.execute(
+                f"""
+                INSERT INTO {self._lifecycle_qualified}
+                    (destination_id, state, reason, updated_by, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (destination_id) DO UPDATE SET
+                    state = EXCLUDED.state,
+                    reason = EXCLUDED.reason,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (destination_id, state, reason, updated_by, now),
+            )
+
+        self._run(_op)
+        log.warning(
+            "Lifecycle state for %s set to %s (reason: %s, by: %s)",
+            destination_id,
+            state,
+            reason,
+            updated_by,
+        )
 
     def close(self) -> None:
         """Close the connection. Safe to call multiple times."""
