@@ -277,9 +277,16 @@ class DestinationConfig:
     # time on any source column not in the target and not in this list.
     # Typical entries: `captured_at` when writing to canonical events.
     drop_source_columns: tuple[str, ...] = ()
+    # Directly-provided postgres URI (CP-discovered destinations build it
+    # from the discovery payload + a k8s Secret read; static destinations
+    # keep the env indirection). NEVER log this value — unlike
+    # postgres_uri_env it IS the credential, not a pointer to one.
+    postgres_uri_direct: str | None = field(default=None, repr=False)
 
     @property
     def postgres_uri(self) -> str:
+        if self.postgres_uri_direct is not None:
+            return self.postgres_uri_direct
         return _resolve_env_value(self.postgres_uri_env)
 
     def resolved_properties(self) -> dict[str, str]:
@@ -408,6 +415,69 @@ class DeliveryConfig:
 
 
 @dataclass(frozen=True)
+class DiscoveryConfig:
+    """CP-driven destination discovery (viaduck/discovery.py). Disabled by
+    default: enabling requires a URL; auth arrives as header name + a
+    token env var (the scoped read-only secret — never the CP admin
+    internal secret). `defaults` seeds every discovered destination
+    (memory_limit, sslmode, extra properties, drop_source_columns)."""
+
+    enabled: bool = False
+    url: str | None = None
+    auth_header_name: str | None = None
+    auth_token_env: str | None = None
+    poll_interval_s: float = 60.0
+    request_timeout_s: float = 10.0
+    # Refuse a payload mapping fewer destinations than this at startup
+    # (fail to static-only, synced=0): a CP bug serving an empty list must
+    # not silently vanish every discovered tenant on the next restart.
+    # 0 = allow empty (genuine zero-tenant bootstrap).
+    min_destinations: int = 1
+    # Total wall-time budget for resolving discovered destinations'
+    # Secrets at startup (N sequential k8s API reads must never eat the
+    # liveness grace and crashloop static tenants).
+    materialize_deadline_s: float = 60.0
+    # Defense-in-depth against a spoofed/compromised discovery payload:
+    # the payload directs which Secret to read and where to send the
+    # resulting password (libpq handshake), so both the metadata-store
+    # endpoints and the Secret namespaces are allowlisted. Empty list =
+    # allow anything (NOT recommended outside tests).
+    allowed_endpoint_suffixes: tuple[str, ...] = (".ducklings.svc", ".ducklings.svc.cluster.local")
+    allowed_secret_namespaces: tuple[str, ...] = ("ducklings",)
+    defaults: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.enabled and not self.url:
+            raise ConfigError("discovery.enabled requires discovery.url")
+        if (self.auth_header_name is None) != (self.auth_token_env is None):
+            raise ConfigError("discovery.auth_header_name and discovery.auth_token_env must be set together")
+        if self.poll_interval_s <= 0 or self.request_timeout_s <= 0 or self.materialize_deadline_s <= 0:
+            raise ConfigError("discovery poll_interval_s/request_timeout_s/materialize_deadline_s must be positive")
+        if self.min_destinations < 0:
+            raise ConfigError("discovery.min_destinations must be >= 0")
+        d = self.defaults
+        if not isinstance(d, dict):
+            raise ConfigError("discovery.defaults must be a mapping")
+        for key in ("memory_limit", "sslmode"):
+            if key in d and not isinstance(d[key], str):
+                raise ConfigError(f"discovery.defaults.{key} must be a string")
+        if "drop_source_columns" in d:
+            v = d["drop_source_columns"]
+            if not isinstance(v, list) or not all(isinstance(c, str) for c in v):
+                # A bare string would iterate per-CHARACTER into the drop
+                # list — the same YAML foot-gun the loader guards against
+                # for static destinations.
+                raise ConfigError("discovery.defaults.drop_source_columns must be a list of strings")
+        if "properties" in d:
+            _validate_string_dict(d["properties"], "discovery.defaults.properties")
+
+    def auth_header(self) -> tuple[str, str] | None:
+        if self.auth_header_name is None or self.auth_token_env is None:
+            return None
+        return (self.auth_header_name, _resolve_env_value(self.auth_token_env))
+
+
+@dataclass(frozen=True)
 class ViaduckConfig:
     source: SourceConfig
     routing: RoutingConfig
@@ -418,6 +488,7 @@ class ViaduckConfig:
     instance: InstanceConfig = field(default_factory=InstanceConfig)
     state: StateConfig = field(default_factory=StateConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
 
     def __post_init__(self):
         if not self.destinations:
@@ -685,6 +756,28 @@ def load(path: str | Path) -> ViaduckConfig:
         partition=partition,
     )
 
+    disc_raw = raw.get("discovery", {}) or {}
+    try:
+        discovery = DiscoveryConfig(
+            enabled=bool(disc_raw.get("enabled", False)),
+            url=disc_raw.get("url"),
+            auth_header_name=disc_raw.get("auth_header_name"),
+            auth_token_env=disc_raw.get("auth_token_env"),
+            poll_interval_s=float(disc_raw.get("poll_interval_s", 60.0)),
+            request_timeout_s=float(disc_raw.get("request_timeout_s", 10.0)),
+            min_destinations=int(disc_raw.get("min_destinations", 1)),
+            materialize_deadline_s=float(disc_raw.get("materialize_deadline_s", 60.0)),
+            allowed_endpoint_suffixes=tuple(
+                disc_raw.get("allowed_endpoint_suffixes", [".ducklings.svc", ".ducklings.svc.cluster.local"])
+            ),
+            allowed_secret_namespaces=tuple(disc_raw.get("allowed_secret_namespaces", ["ducklings"])),
+            defaults=disc_raw.get("defaults", {}) or {},
+        )
+    except (TypeError, ValueError) as e:
+        # An explicit `null` (or wrong type) on a numeric key raises a raw
+        # TypeError from the coercion — surface it as config guidance.
+        raise ConfigError(f"discovery section invalid: {e}") from e
+
     return ViaduckConfig(
         source=source,
         routing=routing,
@@ -695,4 +788,5 @@ def load(path: str | Path) -> ViaduckConfig:
         instance=instance,
         state=state,
         delivery=delivery,
+        discovery=discovery,
     )

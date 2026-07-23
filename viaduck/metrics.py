@@ -195,6 +195,46 @@ _lifecycle_discarded_rows_total = Counter(
     "Buffered rows discarded by a lifecycle pause/retire (durable in the source; re-read from the cursor on resume)",
     ["pipeline", "destination"],
 )
+_discovery_synced = Gauge(
+    "viaduck_discovery_synced",
+    "1 after a successful discovery poll; 0 = static-only (CP unreachable at startup) or stale drift view",
+    ["pipeline"],
+)
+_discovery_config_generation = Gauge(
+    "viaduck_discovery_config_generation",
+    "config_generation from the last successful discovery poll (opaque change token; compare for equality)",
+    ["pipeline"],
+)
+_discovery_last_success_timestamp_seconds = Gauge(
+    "viaduck_discovery_last_success_timestamp_seconds",
+    "Unix time of the last successful discovery poll (alert on age)",
+    ["pipeline"],
+)
+_discovery_poll_failures_total = Counter(
+    "viaduck_discovery_poll_failures_total",
+    "Failed discovery polls (last view kept)",
+    ["pipeline"],
+)
+_discovery_broken_entries_total = Counter(
+    "viaduck_discovery_broken_entries_total",
+    "Discovery entries skipped, by reason (not_writable|no_bucket|no_metadata_store|no_secret_ref|...)",
+    ["pipeline", "reason"],
+)
+_discovery_destinations = Gauge(
+    "viaduck_discovery_destinations",
+    "Destinations materialized from discovery at startup (fixed for the process lifetime until C3)",
+    ["pipeline"],
+)
+_discovery_drift_destinations = Gauge(
+    "viaduck_discovery_drift_destinations",
+    "Live payload vs this process (kind=added|removed|changed); nonzero = restart to apply",
+    ["pipeline", "kind"],
+)
+_discovery_drift_transitions_total = Counter(
+    "viaduck_discovery_drift_transitions_total",
+    "Drift state transitions (kind=added|removed|changed|unwritable) — alertable, unlike gauge flaps",
+    ["pipeline", "kind"],
+)
 _delivery_buffers_dropped_total = Counter(
     "viaduck_delivery_buffers_dropped_total",
     "Buffers discarded after a failed flush (range will be re-read)",
@@ -287,6 +327,14 @@ delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 delivery_reads_paused = _delivery_reads_paused
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
+discovery_synced = _discovery_synced
+discovery_config_generation = _discovery_config_generation
+discovery_last_success_timestamp_seconds = _discovery_last_success_timestamp_seconds
+discovery_poll_failures_total = _discovery_poll_failures_total
+discovery_broken_entries_total = _discovery_broken_entries_total
+discovery_destinations = _discovery_destinations
+discovery_drift_destinations = _discovery_drift_destinations
+discovery_drift_transitions_total = _discovery_drift_transitions_total
 
 partition_spec_total = _partition_spec_total
 projection_cast_null_fallback_total = _projection_cast_null_fallback_total
@@ -318,6 +366,9 @@ def init(pipeline: str):
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
+    global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
+    global discovery_poll_failures_total, discovery_broken_entries_total
+    global discovery_destinations, discovery_drift_destinations, discovery_drift_transitions_total
     global partition_spec_total, projection_cast_null_fallback_total
     global dest_write_retries_total, dest_write_retrying
     global pool_force_evictions_total
@@ -332,6 +383,14 @@ def init(pipeline: str):
     delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
     destination_lifecycle_state = _AutoPipelineLabels(_destination_lifecycle_state, pipeline)
     lifecycle_discarded_rows_total = _AutoPipelineLabels(_lifecycle_discarded_rows_total, pipeline)
+    discovery_broken_entries_total = _AutoPipelineLabels(_discovery_broken_entries_total, pipeline)
+    discovery_drift_destinations = _AutoPipelineLabels(_discovery_drift_destinations, pipeline)
+    discovery_drift_transitions_total = _AutoPipelineLabels(_discovery_drift_transitions_total, pipeline)
+    discovery_synced = _discovery_synced.labels(pipeline=pipeline)
+    discovery_config_generation = _discovery_config_generation.labels(pipeline=pipeline)
+    discovery_last_success_timestamp_seconds = _discovery_last_success_timestamp_seconds.labels(pipeline=pipeline)
+    discovery_poll_failures_total = _discovery_poll_failures_total.labels(pipeline=pipeline)
+    discovery_destinations = _discovery_destinations.labels(pipeline=pipeline)
     dest_rows_written_total = _AutoPipelineLabels(_dest_rows_written_total, pipeline)
     dest_last_snapshot_id = _AutoPipelineLabels(_dest_last_snapshot_id, pipeline)
     dest_lag_snapshots = _AutoPipelineLabels(_dest_lag_snapshots, pipeline)

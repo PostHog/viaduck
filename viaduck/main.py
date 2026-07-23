@@ -54,6 +54,7 @@ import os
 import signal
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pyarrow as pa
@@ -699,9 +700,121 @@ def run(cfg: config.ViaduckConfig) -> None:
     # Postgres (NOT a DuckLake table): a cursor advance must not create
     # catalog snapshots, or idle destinations generate CDC work forever.
     state_mgr = StateManager(cfg.state.resolve_postgres_uri(cfg.source), cfg.instance.id, cfg.state)
-    dest_pool = DestinationPool(cfg, max_open=cfg.delivery.pool_max_open)
     router = Router(cfg.routing)
 
+    # CP-driven destination discovery (M4: additive at startup, static
+    # wins, set fixed for the process lifetime; the DriftWatcher below
+    # only detects divergence). Fail-open: an unreachable CP starts us
+    # static-only with viaduck_discovery_synced=0 — the durable source
+    # makes late pickup safe and the gauge makes it loud.
+    drift_watcher = None
+    all_destinations = list(cfg.destinations)
+    discovered_ids: set[str] = set()
+    if cfg.discovery.enabled:
+        from viaduck import discovery as disco
+
+        # The ENTIRE discovery block fails open: no payload problem, CP
+        # bug, config typo (incl. a missing token env), or unexpected
+        # exception may take static tenants down. Any failure → static-
+        # only + synced=0 (the alertable signal) + the drift watcher
+        # still running so recovery is visible.
+        auth = None
+        baseline: dict[str, disco.MappedDestination] = {}
+        generation = -1
+        discovered: list = []
+        try:
+            auth = cfg.discovery.auth_header()
+            payload = None
+            last_err: Exception | None = None
+            for attempt in range(3):
+                try:
+                    payload = disco.fetch(cfg.discovery.url, auth, cfg.discovery.request_timeout_s)
+                    break
+                except disco.DiscoveryError as e:
+                    last_err = e
+                    if attempt < 2:
+                        time.sleep(min(2**attempt, 5))
+            if payload is None:
+                raise last_err  # type: ignore[misc]
+            mapped = disco.map_payload(payload)
+            if len(mapped) < cfg.discovery.min_destinations:
+                raise disco.DiscoveryError(
+                    f"payload mapped {len(mapped)} destination(s) < discovery.min_destinations "
+                    f"({cfg.discovery.min_destinations}) — refusing a suspiciously empty payload "
+                    "(set min_destinations: 0 for a genuine zero-tenant bootstrap)"
+                )
+            discovered = disco.materialize(
+                mapped,
+                {d.routing_value for d in cfg.destinations},
+                cfg.discovery.defaults,
+                static_ids={d.id for d in cfg.destinations},
+                # Bounded wall time: N sequential Secret reads against a
+                # blackholed API server must not eat the liveness grace
+                # and crashloop static tenants (round-2 review). The
+                # heartbeat keeps /healthz green while reads progress.
+                deadline_s=cfg.discovery.materialize_deadline_s,
+                heartbeat=health.record_poll,
+                secret_timeout_s=cfg.discovery.request_timeout_s,
+                allowed_endpoint_suffixes=cfg.discovery.allowed_endpoint_suffixes,
+                allowed_secret_namespaces=cfg.discovery.allowed_secret_namespaces,
+            )
+            generation = payload["config_generation"]
+            baseline = {m.dest_id: m for m in mapped}
+            all_destinations = list(cfg.destinations) + discovered
+            cfg = replace(cfg, destinations=all_destinations)
+            # Success only after the merged config validated — synced=1
+            # means "this process reflects the CP", and ONLY the startup
+            # path may set it (the drift poller's success must not clear
+            # the static-only alert; round-2 review).
+            disco.record_success_metrics(payload)
+            metrics.discovery_destinations.set(len(discovered))
+            discovered_ids = {d.id for d in discovered}
+            if mapped and not discovered:
+                log.error(
+                    "Discovery mapped %d destination(s) but materialized NONE — every entry was "
+                    "dropped (see discovery_broken_entries_total); running static-only",
+                    len(mapped),
+                )
+            else:
+                log.info(
+                    "Discovery: %d destination(s) materialized (generation %s), %d static",
+                    len(discovered),
+                    generation,
+                    len(cfg.destinations) - len(discovered),
+                )
+            for d in discovered:
+                # Non-secret summary for grep parity with log_summary
+                # (which ran before the merge). Never the URI.
+                log.info("Discovered destination %s: table=%s data_path=%s", d.id, d.table, d.data_path)
+        except Exception:
+            metrics.discovery_synced.set(0)
+            metrics.discovery_destinations.set(0)
+            metrics.discovery_poll_failures_total.inc()
+            baseline = {}
+            generation = -1
+            discovered_ids = set()
+            log.error(
+                "Discovery failed at startup — running STATIC-ONLY until restart "
+                "(discovered tenants get no delivery this process lifetime)",
+                exc_info=True,
+            )
+        # Constructed AFTER the try/except so the baseline is final —
+        # no post-construction mutation, no cross-thread hazard.
+        drift_watcher = disco.DriftWatcher(
+            url=cfg.discovery.url,
+            auth_header=auth,
+            timeout_s=cfg.discovery.request_timeout_s,
+            poll_interval_s=cfg.discovery.poll_interval_s,
+            baseline=baseline,
+            startup_generation=generation,
+        )
+    # The pool and everything below MUST see the post-merge cfg — the
+    # pool resolves destination configs by id at flush time, and a pool
+    # holding the pre-merge cfg makes every discovered destination buffer
+    # forever without ever flushing (round-2 review CRITICAL; the third
+    # stale-captured-config defect in this effort — construct consumers
+    # AFTER the last cfg rebind).
+    dest_pool = DestinationPool(cfg, max_open=cfg.delivery.pool_max_open)
     # Cache source schema for destination table creation.
     # `Table.schema` is a property in pyducklake — do not call it.
     dest_pool.set_source_schema(src_table.schema)
@@ -734,7 +847,23 @@ def run(cfg: config.ViaduckConfig) -> None:
         metrics.set_destination_lifecycle(did, lifecycle.RETIRED, lifecycle.VALID_STATES)
 
     initial_snapshot_id = _initial_snapshot_id(cfg.routing.seed_mode, src_table)
-    state_mgr.initialize_destinations(assigned_ids, initial_snapshot_id=initial_snapshot_id)
+    static_assigned = [d for d in assigned_ids if d not in discovered_ids]
+    state_mgr.initialize_destinations(static_assigned, initial_snapshot_id=initial_snapshot_id)
+    disc_assigned = [d for d in assigned_ids if d in discovered_ids]
+    if disc_assigned:
+        # C5 seed semantics: discovery STARTS THE STREAM, it never
+        # backfills (that stays with provisioning/DLT). Discovered
+        # destinations initialize at the current source head regardless
+        # of the pipeline's seed_mode — a fresh cursor at latest also
+        # keeps them out of the scan-seed pass by construction
+        # (_seed_new_destinations only touches cursor-0 rows).
+        latest = source.current_snapshot_id(src_table) or 0
+        state_mgr.initialize_destinations(disc_assigned, initial_snapshot_id=latest)
+        log.info(
+            "Discovery: %d assigned destination(s) initialized at source head (snapshot %d)",
+            len(disc_assigned),
+            latest,
+        )
 
     # Seed new destinations from source scan (avoids CDC replay from
     # snapshot 0). Only lifecycle-ACTIVE destinations seed: a paused
@@ -745,8 +874,16 @@ def run(cfg: config.ViaduckConfig) -> None:
     # (see seed_pending in the poll loop).
     seed_pending: set[str] = set()
     if cfg.routing.seed_mode == "scan":
-        seed_eligible = [d for d in assigned_ids if lifecycle.normalize(raw_lifecycle.get(d), d) == lifecycle.ACTIVE]
-        skipped = [d for d in assigned_ids if d not in seed_eligible]
+        seed_eligible = [
+            d
+            for d in assigned_ids
+            if d not in discovered_ids and lifecycle.normalize(raw_lifecycle.get(d), d) == lifecycle.ACTIVE
+        ]
+        # Discovered dests are neither seedable nor "skipped" — they
+        # initialize at head below; without this exclusion a genuinely
+        # empty source (head=0) would trap them in seed_pending forever
+        # with a misleading restart-to-seed ERROR (round-2 review).
+        skipped = [d for d in assigned_ids if d not in seed_eligible and d not in discovered_ids]
         if skipped:
             skipped_cursors = state_mgr.load_cursors(skipped)
             seed_pending = {d for d in skipped if d not in skipped_cursors or skipped_cursors[d].last_snapshot_id == 0}
@@ -789,6 +926,9 @@ def run(cfg: config.ViaduckConfig) -> None:
         len(assigned_ids),
         cfg.instance.id,
     )
+
+    if drift_watcher is not None:
+        drift_watcher.start()
 
     shutdown = False
 
@@ -860,6 +1000,8 @@ def run(cfg: config.ViaduckConfig) -> None:
         pass
     # Tell SSE handlers to exit before calling http.shutdown(), otherwise
     # an open /ui/sse client would block shutdown() forever.
+    if drift_watcher is not None:
+        drift_watcher.stop()
     server.signal_shutdown()
     http.shutdown()
     log.info("Shutdown complete")
