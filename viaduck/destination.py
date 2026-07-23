@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-import re
 import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 from viaduck import metrics, schema_projection
+from viaduck.scrub import scrub_credentials
 from viaduck.source import with_connection_defaults
 
 if TYPE_CHECKING:
@@ -27,25 +27,6 @@ class DestinationConnectError(Exception):
     """Connect/attach failure with credentials scrubbed from the message.
     Raised `from None` so the original (password-bearing) exception text
     cannot reach logs via the traceback chain."""
-
-
-_CRED_PATTERNS = (
-    # libpq kv form incl. quoted values and space-padded '='; IGNORECASE
-    # covers PASSWORD=. Quoted form stops at the escaped-quote boundary.
-    re.compile(r"password\s*=\s*(?:'(?:\\.|[^'])*'|\S+)", re.IGNORECASE),
-    # Python dict-repr style ('password': '...') from wrapped driver kwargs.
-    re.compile(r"(['\"]password['\"]\s*:\s*)['\"](?:\\.|[^'\"])*['\"]", re.IGNORECASE),
-    # URL userinfo. GREEDY password segment so a password containing '@'
-    # scrubs to the LAST '@' (the host separator) — the non-greedy form
-    # leaked the tail of such passwords (round-2 review).
-    re.compile(r"://([^/:@\s]+):(\S+)@"),
-)
-
-
-def _scrub_credentials(text: str) -> str:
-    text = _CRED_PATTERNS[0].sub("password=***", text)
-    text = _CRED_PATTERNS[1].sub(r"\1'***'", text)
-    return _CRED_PATTERNS[2].sub(r"://\1:***@", text)
 
 
 class DestinationPool:
@@ -367,7 +348,7 @@ class DestinationPool:
             # exceptions with tracebacks. Scrub before re-raising, and
             # break the chain (`from None`): the original exception's
             # message would otherwise ride along in the traceback.
-            raise DestinationConnectError(f"destination {destination_id}: {_scrub_credentials(str(e))}") from None
+            raise DestinationConnectError(f"destination {destination_id}: {scrub_credentials(str(e))}") from None
 
 
 # SQL metacharacters that should never appear in a pyducklake-returned

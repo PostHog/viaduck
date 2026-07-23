@@ -810,7 +810,7 @@ def test_ensure_partition_spec_metric_counts_each_outcome():
 
 
 def test_connect_errors_scrub_credentials():
-    from viaduck.destination import _scrub_credentials
+    from viaduck.scrub import scrub_credentials as _scrub_credentials
 
     kv = 'ATTACH failed: Unable to connect to Postgres at "host=h port=5432 user=u password=SECRETPW dbname=d"'
     assert "SECRETPW" not in _scrub_credentials(kv)
@@ -823,7 +823,7 @@ def test_connect_errors_scrub_credentials():
 
 
 def test_scrub_hardened_formats():
-    from viaduck.destination import _scrub_credentials
+    from viaduck.scrub import scrub_credentials as _scrub_credentials
 
     for text in (
         "password = SECRETPW dbname=d",
@@ -840,7 +840,8 @@ def test_scrub_hardened_formats():
 def test_connect_error_suppresses_original_via_log(caplog):
     import logging as _logging
 
-    from viaduck.destination import DestinationConnectError, _scrub_credentials
+    from viaduck.destination import DestinationConnectError
+    from viaduck.scrub import scrub_credentials as _scrub_credentials
 
     logger = _logging.getLogger("test.scrub")
     try:
@@ -854,3 +855,18 @@ def test_connect_error_suppresses_original_via_log(caplog):
     text = caplog.text
     assert "SUPERSECRET" not in text
     assert "password=***" in text
+
+
+def test_scrub_is_linear_on_adversarial_input():
+    # CodeQL py/redos: the earlier quoted-value pattern backtracked
+    # exponentially on an unclosed quote followed by many escape pairs.
+    # The unrolled-loop form must stay linear.
+    import time as _time
+
+    from viaduck.scrub import scrub_credentials
+
+    hostile = "password='" + "\\&" * 20000  # unclosed quote, 20k escape pairs
+    t0 = _time.monotonic()
+    scrub_credentials(hostile)
+    scrub_credentials('{"password":"' + "\\!" * 20000)
+    assert _time.monotonic() - t0 < 1.0

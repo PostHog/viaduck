@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from viaduck import metrics
 from viaduck.config import DestinationConfig
 from viaduck.k8s_secrets import SecretReadError, read_secret_key
+from viaduck.scrub import scrub_credentials
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +128,11 @@ class MappedDestination:
 
 
 def _broken(reason: str, detail: str, *, count: bool = True) -> None:
+    # Structural no-secrets-in-logs: detail strings can derive from
+    # exception text raised near secret handling (SecretReadError et al
+    # are DESIGNED secret-free, but scrubbing at the boundary makes that
+    # a property instead of a promise).
+    detail = scrub_credentials(detail)
     if count:
         metrics.discovery_broken_entries_total.labels(reason=reason).inc()
         log.warning("Discovery entry skipped (%s): %s", reason, detail)
