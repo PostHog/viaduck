@@ -59,7 +59,7 @@ from datetime import UTC, datetime
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from viaduck import config, logging_config, metrics, source
+from viaduck import config, lifecycle, logging_config, metrics, source
 from viaduck.apply import _require_non_null_rowids
 from viaduck.arrowutil import full_bool, row_indices
 from viaduck.delivery import DeliveryManager
@@ -409,7 +409,7 @@ def _verify_seed_key_uniqueness(
         )
 
 
-def _derive_dest_status(d, snap_now: int) -> str:
+def _derive_dest_status(d, snap_now: int, lifecycle_state: str = "active") -> str:
     """Operational status for a destination, from its delivery snapshot.
 
     Raw flush lag is the wrong signal here: between flushes the persisted
@@ -418,6 +418,10 @@ def _derive_dest_status(d, snap_now: int) -> str:
     hasn't even been seen); read-current with data awaiting flush is
     "buffering".
     """
+    if lifecycle_state != "active":
+        # Operator intent short-circuits everything: an intentionally
+        # paused destination is "paused", not a page-worthy "lagging".
+        return lifecycle_state
     if d.last_error:
         return "error"
     if d.flushing:
@@ -706,12 +710,52 @@ def run(cfg: config.ViaduckConfig) -> None:
     rv_to_dest: dict[str, str] = {d.routing_value: d.id for d in cfg.destinations}
 
     assigned_ids = cfg.assigned_destination_ids()
+
+    # Destination lifecycle (viaduck/lifecycle.py): retired destinations are
+    # excluded from EVERYTHING at startup — no state row, no seed, no buffer,
+    # no pool slot. Paused/draining start constructed but gated (the tracker
+    # applies their state before the first cycle).
+    lifecycle_rows = state_mgr.load_lifecycle_rows(assigned_ids)
+    raw_lifecycle = {d: r["state"] for d, r in lifecycle_rows.items()}
+    retired_ids = [d for d in assigned_ids if lifecycle.normalize(raw_lifecycle.get(d), d) == lifecycle.RETIRED]
+    if retired_ids:
+        log.warning(
+            "Excluding %d retired destination(s) from this run: %s "
+            "(re-activation requires a lifecycle row update and re-seeds per seed_mode)",
+            len(retired_ids),
+            retired_ids,
+        )
+    assigned_ids = [d for d in assigned_ids if d not in retired_ids]
+    rv_to_dest = {rv: did for rv, did in rv_to_dest.items() if did not in retired_ids}
+    for did in retired_ids:
+        # Sever the resume point: re-add = new tenant = fresh seed. Also
+        # done per-cycle for a mid-run retire; this is the restart backstop.
+        state_mgr.delete_destination_state(did)
+        metrics.set_destination_lifecycle(did, lifecycle.RETIRED, lifecycle.VALID_STATES)
+
     initial_snapshot_id = _initial_snapshot_id(cfg.routing.seed_mode, src_table)
     state_mgr.initialize_destinations(assigned_ids, initial_snapshot_id=initial_snapshot_id)
 
-    # Seed new destinations from source scan (avoids CDC replay from snapshot 0)
+    # Seed new destinations from source scan (avoids CDC replay from
+    # snapshot 0). Only lifecycle-ACTIVE destinations seed: a paused
+    # destination must not receive bulk writes (pausing a broken
+    # destination is the obvious operator move, and a failing seed here
+    # would crashloop the whole instance). A skipped cursor-0 destination
+    # is remembered and kept out of the read set until a restart seeds it
+    # (see seed_pending in the poll loop).
+    seed_pending: set[str] = set()
     if cfg.routing.seed_mode == "scan":
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids)
+        seed_eligible = [d for d in assigned_ids if lifecycle.normalize(raw_lifecycle.get(d), d) == lifecycle.ACTIVE]
+        skipped = [d for d in assigned_ids if d not in seed_eligible]
+        if skipped:
+            skipped_cursors = state_mgr.load_cursors(skipped)
+            seed_pending = {d for d in skipped if d not in skipped_cursors or skipped_cursors[d].last_snapshot_id == 0}
+            if seed_pending:
+                log.warning(
+                    "Skipping seed for non-active destination(s) %s; they stay read-gated until a restart seeds them",
+                    sorted(seed_pending),
+                )
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, seed_eligible)
 
     key_columns = cfg.routing.key_columns
     mode = cfg.routing.mode
@@ -729,6 +773,12 @@ def run(cfg: config.ViaduckConfig) -> None:
         mode=mode,
         on_flush_success=health.record_replication,
     )
+
+    tracker = lifecycle.LifecycleTracker(assigned_ids)
+    tracker.apply(raw_lifecycle, delivery, dest_pool, state_mgr)
+    delivery.set_suspended(tracker.suspended_ids())
+    tracker.export_metrics()
+    server.set_lifecycle_states(tracker.states(), rows=lifecycle_rows)
 
     log.info(
         "Viaduck started: source=%s.%s, routing_field=%s, mode=%s, destinations=%d, instance=%s",
@@ -752,7 +802,41 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     while not shutdown:
         try:
-            _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, mode)
+            # Refresh operator lifecycle intent. A state-store blip keeps
+            # the last-known states (fail-safe: intent changes rarely; not
+            # delivering on a stale ACTIVE would be worse than delivering
+            # one cycle late on a stale PAUSE).
+            try:
+                lifecycle_rows = state_mgr.load_lifecycle_rows(assigned_ids)
+                raw_lifecycle = {d: r["state"] for d, r in lifecycle_rows.items()}
+            except Exception:
+                log.warning("Lifecycle state load failed; keeping last-known states", exc_info=True)
+            tracker.apply(raw_lifecycle, delivery, dest_pool, state_mgr)
+            delivery.set_suspended(tracker.suspended_ids())
+            server.set_lifecycle_states(tracker.states(), rows=lifecycle_rows)
+
+            read_ids = [d for d in tracker.readable_ids() if d not in seed_pending]
+            for d in tracker.readable_ids():
+                if d in seed_pending:
+                    log.error(
+                        "Destination %s is active but was never seeded (skipped while non-active); "
+                        "restart viaduck to seed it — until then it takes no reads",
+                        d,
+                    )
+
+            _poll_cycle(
+                src_table,
+                delivery,
+                dest_pool,
+                router,
+                cfg,
+                assigned_ids,
+                rv_to_dest,
+                key_columns,
+                mode,
+                read_ids=read_ids,
+                lifecycle_states=tracker.states(),
+            )
         except Exception:
             log.exception("Fatal error in poll cycle")
             break
@@ -843,11 +927,30 @@ def _export_dest_time_lag(src_table, delivery_snapshot, assigned_ids, snap_now: 
             log.debug("time-lag export failed; skipping this cycle", exc_info=True)
 
 
-def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to_dest, key_columns, mode):
+def _poll_cycle(
+    src_table,
+    delivery,
+    dest_pool,
+    router,
+    cfg,
+    assigned_ids,
+    rv_to_dest,
+    key_columns,
+    mode,
+    *,
+    read_ids=None,
+    lifecycle_states=None,
+):
     # Local boolean so the existing branch sites stay terse. Threading mode
     # (not full_cdc) through the call signature avoids reconstructing the
     # original config value from a derived bool later (status payload).
     full_cdc = mode == "full_cdc"
+    # Lifecycle gating: only ACTIVE destinations read; None (tests, and any
+    # future caller without lifecycle) means everything assigned reads.
+    if read_ids is None:
+        read_ids = assigned_ids
+    if lifecycle_states is None:
+        lifecycle_states = {}
     """One poll cycle: read CDC from each position group into buffers,
     advance in-memory positions, evaluate flush triggers.
 
@@ -875,7 +978,11 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
             plan = delivery.read_plan()
             positions = {d: pos for d, (pos, _epoch) in plan.items()}
             epochs = {d: epoch for d, (_pos, epoch) in plan.items()}
-            groups = _group_by_cursor(positions, assigned_ids)
+            # Only lifecycle-ACTIVE destinations participate in reads;
+            # draining destinations keep flushing what they have, paused/
+            # retired are fully inert (assigned_ids still drives the lag/
+            # status exports below so a draining destination stays visible).
+            groups = _group_by_cursor(positions, read_ids)
 
             # Iterate lowest cursor first — the most-lagging group gets the
             # first turn each cycle — but cap the chunks each group may read
@@ -1036,7 +1143,7 @@ def _poll_cycle(src_table, delivery, dest_pool, router, cfg, assigned_ids, rv_to
         lag = max(snap_now - d.flushed_snapshot, 0)
         metrics.dest_lag_snapshots.labels(destination=did).set(lag)
 
-        st = _derive_dest_status(d, snap_now)
+        st = _derive_dest_status(d, snap_now, lifecycle_states.get(did, "active"))
 
         dest_statuses.append(
             DestStatus(

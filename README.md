@@ -317,6 +317,34 @@ Cursor advances are single `INSERT ... ON CONFLICT DO UPDATE` upserts with a mon
 
 State is keyed by `(destination_id, instance_id)`, enabling multiple viaduck instances to independently track their assigned destinations without conflicts.
 
+## Destination Lifecycle (operator runbook)
+
+Each destination has an operator-intent state in `viaduck.<state_table>_lifecycle` (per-destination — pausing pauses it on every instance; the table name derives from `state.table` so pipelines sharing a Postgres never share intent). Absent row = `active`. States re-read every poll cycle, so changes apply live, no restart. Observability: `viaduck_destination_lifecycle_state{destination,state}` (one-hot), the read-only `/lifecycle` endpoint (state + reason/updated_by/updated_at + staleness age), `viaduck_lifecycle_discarded_rows_total`, and `/status` destination status strings (`paused`/`draining`/`retired` short-circuit `lagging` — join lag alerts against `viaduck_destination_lifecycle_state{state!="active"}` so intentional pauses don't page).
+
+| state | effect |
+|---|---|
+| `active` | normal delivery |
+| `paused` | no reads, no flushes; buffer discarded (durable in source), connection released, cursor = resume point. Resume is gap-free (crash-recovery re-read) |
+| `draining` | no new reads; buffered data flushes out, then the connection is released. Reversible. **Check the drain-complete log line**: "drain complete (flushed out)" is a clean drain; "drain ended via a flush-failure rewind" means the read-but-unflushed range was NOT delivered — resume to re-read it before retiring |
+| `retired` | terminal. Excluded at startup; cursor rows are severed (all instances), so **re-add = new tenant = fresh seed** per `seed_mode` |
+
+```sql
+-- Pause (live, applies within one poll cycle):
+INSERT INTO viaduck.viaduck_state_lifecycle (destination_id, state, reason, updated_by, updated_at)
+VALUES ('team-2', 'paused', 'RDS maintenance', 'jakob', now())
+ON CONFLICT (destination_id) DO UPDATE
+  SET state = EXCLUDED.state, reason = EXCLUDED.reason,
+      updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at;
+
+-- Resume: same statement with state = 'active'.
+-- Drain (pre-retirement): state = 'draining'; wait for the drain-complete log.
+-- Retire (the explicit human ack — viaduck code REFUSES to write this value):
+--   state = 'retired'. Cursor rows are deleted by viaduck when it observes
+--   the state; re-adding the destination later re-seeds from scratch.
+```
+
+A destination paused while it has never been seeded (cursor 0) skips seeding at startup and stays read-gated after resume until a restart seeds it (loud ERROR each cycle).
+
 ## New Destination Seeding
 
 When a new destination is added to the config, it needs the current source data. Three modes are available via `routing.seed_mode`:

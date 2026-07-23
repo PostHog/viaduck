@@ -497,6 +497,52 @@ _web_enabled = True
 # Set when the server is shutting down so long-lived handlers (SSE) can exit
 # their loops promptly. Without this, `http.shutdown()` blocks forever on any
 # active /ui/sse client.
+# ---------------------------------------------------------------------------
+# Destination lifecycle snapshot (read-only /lifecycle endpoint; the write
+# surface is deliberately SQL-only in v1 — see viaduck/lifecycle.py)
+# ---------------------------------------------------------------------------
+
+_lifecycle_lock = threading.Lock()
+_lifecycle_states: dict[str, str] = {}
+_lifecycle_rows: dict[str, dict] = {}
+_lifecycle_loaded_at: float | None = None
+
+
+def set_lifecycle_states(states: dict[str, str], rows: dict[str, dict] | None = None) -> None:
+    """Publish the current per-destination lifecycle states (poll thread).
+    `rows` carries reason/updated_by/updated_at when the caller has them;
+    the effective state always comes from `states` (the tracker's view,
+    which includes the absent-row=active and unknown=paused normalization).
+    """
+    global _lifecycle_states, _lifecycle_rows, _lifecycle_loaded_at
+    with _lifecycle_lock:
+        _lifecycle_states = dict(states)
+        if rows is not None:
+            _lifecycle_rows = dict(rows)
+        _lifecycle_loaded_at = time.time()
+
+
+def _lifecycle_json() -> str:
+    with _lifecycle_lock:
+        dests = {}
+        for dest, state in _lifecycle_states.items():
+            row = _lifecycle_rows.get(dest, {})
+            dests[dest] = {
+                "state": state,
+                "reason": row.get("reason"),
+                "updated_by": row.get("updated_by"),
+                "updated_at": row.get("updated_at"),
+            }
+        return json.dumps(
+            {
+                # loaded_at lets the operator distinguish fresh intent from
+                # state stale under keep-last-known (store blips).
+                "loaded_at_age_s": round(time.time() - _lifecycle_loaded_at, 1) if _lifecycle_loaded_at else None,
+                "destinations": dests,
+            }
+        )
+
+
 _shutdown_event = threading.Event()
 
 
@@ -530,6 +576,13 @@ def _make_handler():
                     self.send_response(503)
                     self.end_headers()
                     self.wfile.write(f"not ready {body}\n".encode())
+            elif self.path == "/lifecycle":
+                payload = _lifecycle_json().encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
             elif self.path == "/status" and _web_enabled:
                 payload = status.to_json().encode()
                 self.send_response(200)
@@ -593,7 +646,7 @@ def start(port: int = 8000, web_enabled: bool = True) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer(("", port), _make_handler())
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    endpoints = "/metrics, /healthz, /readyz"
+    endpoints = "/metrics, /healthz, /readyz, /lifecycle"
     if web_enabled:
         endpoints += ", /status, /ui"
     log.info("HTTP server listening on port %d (%s)", port, endpoints)

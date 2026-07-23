@@ -201,6 +201,10 @@ class DeliveryManager:
         # (same caveat as rows_replicated).
         self._applied: dict[str, dict[str, int]] = {d: {"inserts": 0, "updates": 0, "deletes": 0} for d in assigned_ids}
         self._buffered_rows_total: dict[str, int] = {d: 0 for d in assigned_ids}
+        # Lifecycle-suspended destinations (paused/retired): no flush
+        # submissions. Draining destinations are NOT here — draining exists
+        # to flush out. Owned by the poll thread via set_suspended().
+        self._suspended: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Poll-thread API
@@ -307,6 +311,11 @@ class DeliveryManager:
             order = sorted(self._buffers, key=lambda d: self._buffers[d].bytes, reverse=over_watermark)
             for dest_id in order:
                 if dest_id in self._inflight:
+                    continue
+                if dest_id in self._suspended:
+                    # Lifecycle pause/retire: nothing may be delivered. The
+                    # buffer was discarded on suspension; this guard covers
+                    # a read that raced the transition.
                     continue
                 trigger = self._trigger_for_locked(dest_id, now, shutdown, over_watermark)
                 if trigger is None:
@@ -466,6 +475,16 @@ class DeliveryManager:
             type_counts = self._change_type_counts(batch) if tables else None
             with self._lock:
                 self._flushed[dest_id] = max(self._flushed[dest_id], through)
+                # A lifecycle discard (pause/retire) may have rewound the
+                # position below `through` while this flush was in flight.
+                # The flush SUCCEEDED, so the destination has the range —
+                # leaving position behind would re-read and re-apply it on
+                # resume (deterministic duplicates in append_only). Restore
+                # position >= flushed; epoch bump discards any read that
+                # overlapped the restore.
+                if self._position[dest_id] < through:
+                    self._position[dest_id] = through
+                    self._epoch[dest_id] += 1
                 self._rows_replicated[dest_id] = cumulative
                 self._last_error[dest_id] = None
                 if type_counts is not None:
@@ -556,6 +575,59 @@ class DeliveryManager:
                     dest_id,
                     self._flushed[dest_id],
                 )
+
+    # ------------------------------------------------------------------ #
+    # Destination lifecycle (viaduck/lifecycle.py; poll-thread only)
+    # ------------------------------------------------------------------ #
+
+    def set_suspended(self, dest_ids: set[str]) -> None:
+        """Replace the suspended set (paused/retired destinations — no
+        flush submissions). Draining destinations must NOT be passed."""
+        with self._lock:
+            self._suspended = set(dest_ids)
+
+    def discard_buffer(self, dest_id: str) -> int:
+        """Lifecycle pause/retire: drop the live buffer and rewind the read
+        position to the persisted cursor — deliberately the same semantics
+        as _on_flush_failure (a pause is a controlled crash for this
+        destination; the range is durable in the source and re-read from
+        the cursor on resume). Epoch bump discards reads that overlapped
+        the transition. Returns the number of rows dropped. An in-flight
+        flush is left to finish naturally: completing an already-submitted
+        write and advancing the cursor is strictly better than aborting
+        mid-write."""
+        with self._lock:
+            dropped = self._buffers[dest_id]
+            if dropped.rows == 0 and self._position[dest_id] <= self._flushed[dest_id]:
+                return 0
+            self._buffers[dest_id] = _Buffer()
+            self._position[dest_id] = self._flushed[dest_id]
+            self._epoch[dest_id] += 1
+            self._position_dirty_since[dest_id] = None
+            metrics.delivery_buffer_rows.labels(destination=dest_id).set(0)
+            metrics.delivery_buffer_bytes.labels(destination=dest_id).set(0)
+            metrics.delivery_buffer_total_bytes.set(self._total_bytes_locked())
+            metrics.lifecycle_discarded_rows_total.labels(destination=dest_id).inc(dropped.rows)
+            return dropped.rows
+
+    def last_error(self, dest_id: str) -> str | None:
+        """Last recorded delivery error for a destination (None after a
+        successful flush). The lifecycle tracker uses this to distinguish
+        a drain that flushed out from one that went "clean" via a flush
+        failure's position rewind — retiring on the latter abandons the
+        rewound range."""
+        with self._lock:
+            return self._last_error.get(dest_id)
+
+    def is_clean(self, dest_id: str) -> bool:
+        """True when nothing is buffered or in flight and the read position
+        equals the durable cursor — the drain-complete condition."""
+        with self._lock:
+            return (
+                dest_id not in self._inflight
+                and self._buffers[dest_id].rows == 0
+                and self._position[dest_id] <= self._flushed[dest_id]
+            )
 
     def wait_idle(self, timeout_s: float = 30.0) -> bool:
         """Test helper: wait until no flush is in flight. Returns True if idle."""

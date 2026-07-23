@@ -185,6 +185,16 @@ _delivery_reads_paused = Gauge(
     "1 while a destination's queue (buffer + in-flight) is at its per-destination cap and CDC reads for it are paused",
     ["pipeline", "destination"],
 )
+_destination_lifecycle_state = Gauge(
+    "viaduck_destination_lifecycle_state",
+    "1 for the destination's current lifecycle state (active|paused|draining|retired); see viaduck/lifecycle.py",
+    ["pipeline", "destination", "state"],
+)
+_lifecycle_discarded_rows_total = Counter(
+    "viaduck_lifecycle_discarded_rows_total",
+    "Buffered rows discarded by a lifecycle pause/retire (durable in the source; re-read from the cursor on resume)",
+    ["pipeline", "destination"],
+)
 _delivery_buffers_dropped_total = Counter(
     "viaduck_delivery_buffers_dropped_total",
     "Buffers discarded after a failed flush (range will be re-read)",
@@ -275,12 +285,22 @@ delivery_flushes_total = _delivery_flushes_total
 delivery_flush_seconds = _delivery_flush_seconds
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 delivery_reads_paused = _delivery_reads_paused
+destination_lifecycle_state = _destination_lifecycle_state
+lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
 
 partition_spec_total = _partition_spec_total
 projection_cast_null_fallback_total = _projection_cast_null_fallback_total
 dest_write_retries_total = _dest_write_retries_total
 dest_write_retrying = _dest_write_retrying
 pool_force_evictions_total = _pool_force_evictions_total
+
+
+def set_destination_lifecycle(dest_id: str, state: str, all_states) -> None:
+    """One-hot lifecycle gauge (mode-gauge pattern): exactly one state label
+    is 1 per destination, the rest 0 — so fleet queries can't read a stale
+    1 from the previous state."""
+    for s in all_states:
+        destination_lifecycle_state.labels(destination=dest_id, state=s).set(1 if s == state else 0)
 
 
 def init(pipeline: str):
@@ -297,7 +317,7 @@ def init(pipeline: str):
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
-    global delivery_reads_paused
+    global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
     global partition_spec_total, projection_cast_null_fallback_total
     global dest_write_retries_total, dest_write_retrying
     global pool_force_evictions_total
@@ -310,6 +330,8 @@ def init(pipeline: str):
     delivery_flush_seconds = _AutoPipelineLabels(_delivery_flush_seconds, pipeline)
     delivery_buffers_dropped_total = _AutoPipelineLabels(_delivery_buffers_dropped_total, pipeline)
     delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
+    destination_lifecycle_state = _AutoPipelineLabels(_destination_lifecycle_state, pipeline)
+    lifecycle_discarded_rows_total = _AutoPipelineLabels(_lifecycle_discarded_rows_total, pipeline)
     dest_rows_written_total = _AutoPipelineLabels(_dest_rows_written_total, pipeline)
     dest_last_snapshot_id = _AutoPipelineLabels(_dest_last_snapshot_id, pipeline)
     dest_lag_snapshots = _AutoPipelineLabels(_dest_lag_snapshots, pipeline)
