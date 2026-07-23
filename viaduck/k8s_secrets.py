@@ -95,7 +95,13 @@ def read_secret_key(namespace: str, name: str, key: str, *, timeout_s: float = 1
 
     data = body.get("data") or {}
     if key not in data:
-        raise SecretReadError(f"secret {namespace}/{name} has no key {key!r} (keys: {sorted(data)})")
+        # Deliberately NOT listing the available keys: they come from the
+        # secret payload dict, and error text must carry nothing derived
+        # from it (CodeQL's clear-text-logging taint flow ends here; the
+        # operator can kubectl the Secret for its key names). The count
+        # is an int — taint-free and enough to distinguish "wrong key"
+        # from "empty secret".
+        raise SecretReadError(f"secret {namespace}/{name} has no key {key!r} ({len(data)} other key(s) present)")
     try:
         return base64.b64decode(data[key], validate=True).decode("utf-8")
     except Exception as e:

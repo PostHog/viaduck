@@ -55,11 +55,14 @@ def test_rbac_denied_names_the_fix(_in_cluster):
             read_secret_key("ducklings", "s", "k")
 
 
-def test_missing_key_lists_available(_in_cluster):
-    body = {"data": {"other": base64.b64encode(b"x").decode()}}
+def test_missing_key_reports_count_not_names(_in_cluster):
+    # Key names come from the secret payload dict — error text must not
+    # carry anything derived from it (clear-text-logging taint source).
+    body = {"data": {"otherkeyname": base64.b64encode(b"x").decode()}}
     with patch("urllib.request.urlopen", return_value=_resp(body)):
-        with pytest.raises(SecretReadError, match="other"):
+        with pytest.raises(SecretReadError, match="1 other key") as ei:
             read_secret_key("ns", "s", "password")
+        assert "otherkeyname" not in str(ei.value)
 
 
 def test_error_messages_never_contain_secret_material(_in_cluster):
