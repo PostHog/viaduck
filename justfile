@@ -217,3 +217,8 @@ build:
 [group('build')]
 clean:
     rm -rf .venv dist *.egg-info __pycache__ viaduck/__pycache__
+
+# Fast-profile model check (~3M states, under a minute locally) — the
+# smoke pass; `just tlc` (full, ~85M states) is authoritative.
+tlc-fast:
+    cd tla && tlc Viaduck.tla -config Viaduck.fast.cfg -workers auto

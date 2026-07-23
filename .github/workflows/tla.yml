@@ -1,0 +1,93 @@
+name: TLA+ Model Check
+
+# On-demand + spec-change verification of tla/Viaduck.tla — NOT a default
+# PR gate. The full profile explores ~85M distinct states (~18 min on 12
+# perf cores; expect 60-90 min on a standard 4-vCPU runner), so:
+#   - workflow_dispatch: full by default (the receipt for spec changes)
+#   - pull_request touching tla/**: fast profile (~3M states, minutes) as
+#     an automatic smoke signal, non-required
+#   - nightly on main: full, catches spec/code drift for free
+# The local `just tlc` run stays authoritative for the edit-check loop.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Model size"
+        type: choice
+        options: [full, fast]
+        default: full
+  pull_request:
+    paths:
+      - "tla/**"
+      - ".github/workflows/tla.yml"
+  schedule:
+    - cron: "17 3 * * *" # nightly, off the top-of-hour stampede
+
+permissions:
+  contents: read
+
+env:
+  TLA_TOOLS_VERSION: v1.7.4
+
+jobs:
+  tlc:
+    runs-on: ubuntu-latest
+    # Full profile on 4 vCPUs needs generous headroom; fast finishes in
+    # minutes. Cap well below the 6h job limit so a pathological spec
+    # change fails loudly instead of burning hours.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache tla2tools.jar
+        id: cache-tla
+        uses: actions/cache@v4
+        with:
+          path: tla2tools.jar
+          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
+
+      - name: Fetch tla2tools.jar
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
+
+      - name: Resolve profile
+        id: profile
+        run: |
+          # dispatch: the chosen input; PR path-trigger: fast; schedule: full
+          case "${{ github.event_name }}" in
+            workflow_dispatch) echo "cfg=${{ inputs.profile == 'fast' && 'Viaduck.fast.cfg' || 'Viaduck.cfg' }}" >> "$GITHUB_OUTPUT" ;;
+            pull_request)      echo "cfg=Viaduck.fast.cfg" >> "$GITHUB_OUTPUT" ;;
+            *)                 echo "cfg=Viaduck.cfg" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Run TLC
+        working-directory: tla
+        run: |
+          java -XX:+UseParallelGC -Xmx12g \
+            -cp "${GITHUB_WORKSPACE}/tla2tools.jar" tlc2.TLC \
+            Viaduck.tla -config "${{ steps.profile.outputs.cfg }}" \
+            -workers auto 2>&1 | tee "${GITHUB_WORKSPACE}/tlc.log"
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### TLC (${{ steps.profile.outputs.cfg }})"
+            grep -E "distinct states|No error|violated|Error" tlc.log | tail -5 | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlc-log-${{ github.run_id }}
+          path: tlc.log
+          retention-days: 30
