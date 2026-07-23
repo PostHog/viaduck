@@ -807,3 +807,66 @@ def test_ensure_partition_spec_metric_counts_each_outcome():
         "d",
     )
     assert counter.labels(destination="d", outcome="refused_populated")._value.get() == before + 1
+
+
+def test_connect_errors_scrub_credentials():
+    from viaduck.scrub import scrub_credentials as _scrub_credentials
+
+    kv = 'ATTACH failed: Unable to connect to Postgres at "host=h port=5432 user=u password=SECRETPW dbname=d"'
+    assert "SECRETPW" not in _scrub_credentials(kv)
+    assert "password=***" in _scrub_credentials(kv)
+    quoted = "could not attach: password='SECRET PW' dbname=d"
+    assert "SECRET" not in _scrub_credentials(quoted)
+    url = 'IOException: Cannot open file "postgresql://user:SECRETPW@host:5432/db"'
+    assert "SECRETPW" not in _scrub_credentials(url)
+    assert "user:***@host" in _scrub_credentials(url)
+
+
+def test_scrub_hardened_formats():
+    from viaduck.scrub import scrub_credentials as _scrub_credentials
+
+    for text in (
+        "password = SECRETPW dbname=d",
+        "PASSWORD=SECRETPW host=h",
+        "{'password': 'SECRETPW', 'host': 'h'}",
+        'IOException: "postgresql://user:SEC@RET@PW@host:5432/db"',
+    ):
+        scrubbed = _scrub_credentials(text)
+        assert "SECRETPW" not in scrubbed and "SEC@RET" not in scrubbed, (text, scrubbed)
+    # Greedy userinfo scrub keeps the host visible.
+    assert "@host:5432" in _scrub_credentials('x "postgresql://user:SEC@RET@host:5432/db"')
+
+
+def test_connect_error_suppresses_original_via_log(caplog):
+    import logging as _logging
+
+    from viaduck.destination import DestinationConnectError
+    from viaduck.scrub import scrub_credentials as _scrub_credentials
+
+    logger = _logging.getLogger("test.scrub")
+    try:
+        try:
+            raise RuntimeError("attach failed: password=SUPERSECRET host=h")
+        except RuntimeError as e:
+            raise DestinationConnectError(f"destination d1: {_scrub_credentials(str(e))}") from None
+    except DestinationConnectError:
+        with caplog.at_level(_logging.ERROR, logger="test.scrub"):
+            logger.exception("Flush failed for destination d1")
+    text = caplog.text
+    assert "SUPERSECRET" not in text
+    assert "password=***" in text
+
+
+def test_scrub_is_linear_on_adversarial_input():
+    # CodeQL py/redos: the earlier quoted-value pattern backtracked
+    # exponentially on an unclosed quote followed by many escape pairs.
+    # The unrolled-loop form must stay linear.
+    import time as _time
+
+    from viaduck.scrub import scrub_credentials
+
+    hostile = "password='" + "\\&" * 20000  # unclosed quote, 20k escape pairs
+    t0 = _time.monotonic()
+    scrub_credentials(hostile)
+    scrub_credentials('{"password":"' + "\\!" * 20000)
+    assert _time.monotonic() - t0 < 1.0

@@ -8,6 +8,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 from viaduck import metrics, schema_projection
+from viaduck.scrub import scrub_credentials
 from viaduck.source import with_connection_defaults
 
 if TYPE_CHECKING:
@@ -20,6 +21,12 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _MIN_MAX_OPEN = 1
+
+
+class DestinationConnectError(Exception):
+    """Connect/attach failure with credentials scrubbed from the message.
+    Raised `from None` so the original (password-bearing) exception text
+    cannot reach logs via the traceback chain."""
 
 
 class DestinationPool:
@@ -316,6 +323,13 @@ class DestinationPool:
                 data_path=dest_cfg.data_path,
                 properties=with_connection_defaults(dest_cfg.resolved_properties()),
             )
+            # Discovered tenants land in per-team schemas that don't
+            # pre-exist the way `posthog` does (e.g. `evilco.events` for a
+            # team whose schema_name is evilco) — ensure the namespace
+            # before the table. Idempotent; bare (unqualified) table names
+            # skip it.
+            if "." in dest_cfg.table:
+                catalog.create_namespace_if_not_exists(dest_cfg.table.rsplit(".", 1)[0])
             table = catalog.create_table_if_not_exists(dest_cfg.table, schema)
             _ensure_partition_spec(table, dest_cfg, destination_id)
             plan = self._maybe_build_projection(destination_id, dest_cfg, source_schema=schema, table=table)
@@ -323,13 +337,18 @@ class DestinationPool:
                 "Connected to destination %s (catalog=%s, table=%s)", destination_id, dest_cfg.name, dest_cfg.table
             )
             return catalog, table, plan
-        except Exception:
+        except Exception as e:
             if catalog is not None:
                 try:
                     catalog.close()
                 except Exception:
                     pass
-            raise
+            # DuckDB's ATTACH errors embed the FULL connection string —
+            # password included — and the flush-failure path logs
+            # exceptions with tracebacks. Scrub before re-raising, and
+            # break the chain (`from None`): the original exception's
+            # message would otherwise ride along in the traceback.
+            raise DestinationConnectError(f"destination {destination_id}: {scrub_credentials(str(e))}") from None
 
 
 # SQL metacharacters that should never appear in a pyducklake-returned

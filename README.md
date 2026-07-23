@@ -345,6 +345,26 @@ ON CONFLICT (destination_id) DO UPDATE
 
 A destination paused while it has never been seeded (cursor 0) skips seeding at startup and stays read-gated after resume until a restart seeds it (loud ERROR each cycle).
 
+## CP-Driven Destination Discovery (additive)
+
+With `discovery.enabled`, viaduck polls the duckgres control plane's read-only endpoint (`GET /api/v1/warehouses`, authenticated with the scoped read-only secret via `discovery.auth_header_name` + `discovery.auth_token_env`) at startup and extends the static destination set: one destination per (warehouse, team), id `org-<org_id>-team-<team_id>`, routing value = team id, **table = the payload's `events_table` verbatim** (the CP owns naming; renames are not allowed upstream). Metadata-store passwords resolve via a direct Kubernetes Secret read with viaduck's ServiceAccount (`password_secret_ref` — RBAC into the tenant namespace, no secret copies, no plaintext payloads).
+
+Semantics (M4): **additive, static wins, fixed set.** A static destination beats a discovered one on routing-value collision (cutover = delete the static entry). Discovered destinations initialize at the source head (`seed_mode`-independent: discovery starts the stream, never backfills) with convention defaults — schema projection on, `captured_at` dropped, `memory_limit` from `discovery.defaults`. The destination set is fixed at startup; a background poller detects drift (`viaduck_discovery_drift_destinations{kind}`) and a restart applies it. Fail-open at startup (CP unreachable → static-only + `viaduck_discovery_synced` 0); fail-safe per entry (`viaduck_discovery_broken_entries_total{reason}` — a broken tenant never takes down the rest; non-writable/resharding warehouses are skipped).
+
+Operational notes: use **https** for `discovery.url` where available — the payload directs which tenant Secret viaduck reads and which endpoint receives the resulting password in a libpq handshake, so an on-path spoof is a credential-exfiltration vector; the `allowed_endpoint_suffixes` (default `.ducklings.svc[.cluster.local]`) and `allowed_secret_namespaces` (default `ducklings`) allowlists are the defense-in-depth for exactly that. **Cutover** to discovery for a formerly-static tenant is gap-free only when the static destination's id already equals `org-<org_id>-team-<team_id>` (the cursor row carries over via `ON CONFLICT DO NOTHING`); otherwise the discovered twin initializes at head and the range between the static cursor and head is skipped. **Tenant password rotation** requires a viaduck restart (the Secret resolves once at startup). **Resharding**: when a startup org turns `writable=false` the drift watcher ERRORs — pause that org's destinations via the lifecycle table immediately (the fence-to-pause window is real exposure: flushes landing on the old store in that window advance the cursor but may not survive the cutover copy); after the reshard completes it surfaces as `changed` drift because the metadata endpoint moved — restart to pick up the new endpoint, then **un-pause** (the lifecycle state persists deliberately). Running on the old endpoint risks writing a decommissioned store. Under `instance.partition.mode: explicit`, discovered ids are never in the include list — use `hash` (or `all`) with discovery.
+
+```yaml
+discovery:
+  enabled: true
+  url: "http://duckgres-admin.duckgres.svc.cluster.local:8080/api/v1/warehouses"
+  auth_header_name: "X-Duckgres-Internal-Secret"
+  auth_token_env: "VIADUCK_DISCOVERY_TOKEN"   # the read-only secret, never the internal secret
+  poll_interval_s: 60
+  defaults:
+    memory_limit: "8GB"
+    sslmode: "disable"
+```
+
 ## New Destination Seeding
 
 When a new destination is added to the config, it needs the current source data. Three modes are available via `routing.seed_mode`:
