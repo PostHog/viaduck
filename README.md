@@ -113,7 +113,7 @@ Each poll cycle ([`main.py:_poll_cycle`](viaduck/main.py)):
 5. **Phase 1: Preimage Resolution** *(full CDC only)* — pair `update_preimage` with `update_postimage` rows by `rowid` (Arrow hash join). Cross-tenant mutations convert the preimage to a delete on the old destination; same-tenant preimages drop; orphaned preimages convert to deletes ([`main.py:_resolve_preimages`](viaduck/main.py)).
 6. **Route** — `split_and_count()` partitions the Arrow table by routing value in a single vectorized pass ([`router.py:split_and_count`](viaduck/router.py)).
 7. **Buffer** — routed batches accumulate in per-destination buffers; the read position advances in memory. Destinations with no routed rows advance position only — zero writes for idle destinations ([`delivery.py:buffer`](viaduck/delivery.py)).
-8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ `flush_max_rows`, bytes ≥ `flush_max_bytes`, per-destination queue (buffered + in-flight) at its cap (trigger label `memory`), or shutdown. The per-destination cap is `buffer_total_max_bytes / N` by default, or `buffer_max_bytes_per_destination` explicitly. Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)).
+8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ `flush_max_rows`, bytes ≥ `flush_max_bytes`, per-destination queue (buffered + in-flight) at its cap (trigger label `memory`), or shutdown. The per-destination cap is `buffer_total_max_bytes / N` by default, or `buffer_max_bytes_per_destination` explicitly. One flush takes at most `flush_batch_max_rows` rows (default 60K, sliced at chunk boundaries; the remainder drains immediately after — bounded append batches are what keep the fork's native layer out of its big-batch pathology). Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)).
 9. **Lag metrics + status** — per-destination snapshot lag from the delivery manager's authoritative in-memory view.
 
 Each flush (worker thread, [`delivery.py:_flush`](viaduck/delivery.py)):
@@ -255,6 +255,7 @@ delivery:
   flush_interval_seconds: 120               # per-destination max buffer age
   flush_max_rows: 500000                    # per-destination row trigger
   flush_max_bytes: 268435456                # per-destination byte trigger (256 MiB)
+  flush_batch_max_rows: 60000               # max rows ONE flush takes (0 = unlimited)
   buffer_total_max_bytes: 1073741824        # total budget (1 GiB); per-destination cap = total / N
   # buffer_max_bytes_per_destination: 0     # explicit per-destination cap (0 = auto: total / N)
   pool_max_open: 100                        # destination connection pool size

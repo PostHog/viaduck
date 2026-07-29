@@ -953,3 +953,123 @@ def test_draining_destination_still_flushes_under_active_filter():
     with patch.object(mgr, "_flush", fake):
         assert mgr.maybe_flush(shutdown=True) == 1
     assert calls[0][0] == "d1"
+
+
+# ---------------------------------------------------------------------------
+# Flush-batch slicing (2026-07-29: bounded append batches — the fork's
+# native layer corrupts on 170-440K-row appends; one swap takes at most
+# flush_batch_max_rows, cut at chunk boundaries)
+# ---------------------------------------------------------------------------
+
+
+def test_slice_takes_chunks_up_to_cap_with_boundary_cursor():
+    mgr, sm, _ = _manager(flush_batch_max_rows=5)
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(3), through_snapshot=10, epoch=epoch)
+    mgr.buffer("d1", _table(2), through_snapshot=20, epoch=epoch)
+    mgr.buffer("d1", _table(4), through_snapshot=30, epoch=epoch)
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush(shutdown=True) == 1
+    # 3+2=5 fits the cap; adding the 4-row chunk would exceed it.
+    dest, tables, through, _trigger = calls[0]
+    assert sum(t.num_rows for t in tables) == 5
+    # Cursor for a partial swap = last INCLUDED chunk's through, never
+    # the live position (which covers the chunk left behind).
+    assert through == 20
+    # Remainder stays buffered.
+    assert mgr.status_snapshot()["d1"].buffer_rows == 4
+
+
+def test_single_oversize_chunk_flushes_whole():
+    mgr, _, _ = _manager(flush_batch_max_rows=2)
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(7), through_snapshot=10, epoch=epoch)
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush(shutdown=True) == 1
+    assert sum(t.num_rows for t in calls[0][1]) == 7  # never splits a chunk
+    assert calls[0][2] == 10
+
+
+def test_full_swap_persists_through_position():
+    # No remainder: historical behavior — a position-only advance beyond
+    # the last chunk still persists (lazy cursor persist).
+    mgr, _, _ = _manager(flush_batch_max_rows=100)
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(3), through_snapshot=10, epoch=epoch)
+    mgr.advance_position("d1", 15, epoch=epoch)
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush(shutdown=True) == 1
+    assert calls[0][2] == 15
+
+
+def test_sliced_pile_drains_in_bounded_batches():
+    mgr, sm, _ = _manager(flush_batch_max_rows=2, flush_interval_seconds=0.0)
+    _, epoch = mgr.read_plan()["d1"]
+    for i in range(1, 5):
+        mgr.buffer("d1", _table(2), through_snapshot=i * 10, epoch=epoch)
+    seen = []
+
+    def _record(pool, d, b, **kw):
+        seen.append(b.num_rows)
+        return b.num_rows
+
+    with patch("viaduck.delivery.append_only", side_effect=_record):
+        for _ in range(6):
+            mgr.maybe_flush(shutdown=True)
+            assert mgr.wait_idle()
+            if mgr.is_clean("d1"):
+                break
+    assert seen == [2, 2, 2, 2]  # four bounded batches, never the pile
+    assert mgr.status_snapshot()["d1"].flushed_snapshot == 40
+
+
+def test_failure_drops_remainder_too():
+    # FlushFail semantics unchanged: the live buffer (incl. the sliced
+    # remainder) drops with the in-flight tables; the whole range
+    # re-reads from the durable cursor.
+    mgr, _, _ = _manager(flush_batch_max_rows=2)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(2), through_snapshot=10, epoch=epoch)
+    mgr.buffer("d1", _table(2), through_snapshot=20, epoch=epoch)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("down")):
+        assert mgr.maybe_flush(shutdown=True) == 1
+        assert mgr.wait_idle()
+    snap = mgr.status_snapshot()["d1"]
+    assert snap.buffer_rows == 0
+    assert snap.position_snapshot == snap.flushed_snapshot == 0
+
+
+def test_cap_zero_is_legacy_full_swap():
+    mgr, _, _ = _manager(flush_batch_max_rows=0)
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(3), through_snapshot=10, epoch=epoch)
+    mgr.buffer("d1", _table(4), through_snapshot=20, epoch=epoch)
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush(shutdown=True) == 1
+    assert sum(t.num_rows for t in calls[0][1]) == 7
+    assert calls[0][2] == 20
+
+
+def test_sliced_remainder_drains_without_waiting_for_interval():
+    # Review F1 (confirmed empirically): a remainder below the rows/bytes
+    # thresholds must NOT wait out flush_interval — realistic interval,
+    # non-shutdown maybe_flush calls only.
+    mgr, _, _ = _manager(flush_batch_max_rows=4, flush_max_rows=4, flush_interval_seconds=120.0)
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(4), through_snapshot=10, epoch=epoch)
+    mgr.buffer("d1", _table(2), through_snapshot=20, epoch=epoch)
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush() == 1  # rows trigger fires slice 1 (4 rows)
+        assert mgr.wait_idle()
+        # The 2-row remainder is below every ordinary trigger — the
+        # sliced fast-path submits it instead of waiting out 120s.
+        assert mgr.maybe_flush() == 1
+        assert mgr.wait_idle()
+    assert [sum(t.num_rows for t in c[1]) for c in calls] == [4, 2]
+    assert [c[3] for c in calls] == ["rows", "sliced"]
+    assert [c[2] for c in calls] == [10, 20]
