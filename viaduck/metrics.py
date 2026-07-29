@@ -244,6 +244,19 @@ _discovery_drift_destinations = Gauge(
     "Live payload vs this process (kind=added|removed|changed); nonzero = restart to apply",
     ["pipeline", "kind"],
 )
+_discovery_classified = Gauge(
+    "viaduck_discovery_classified",
+    "Destinations in the last classified CP view (startable|mentioned_only). Mentioned-only tenants "
+    "(fenced, degraded — see discovery_broken_entries_total for why) are never absent; ABSENT is "
+    "derived (registry-minus-view), never a payload classification",
+    ["pipeline", "classification"],
+)
+_discovery_view_poisoned = Gauge(
+    "viaduck_discovery_view_poisoned",
+    "1 when the last classified view contained un-enumerable content (unparseable warehouse or "
+    "unnameable team row) — absence evaluation is frozen for the whole view while it is set",
+    ["pipeline"],
+)
 _discovery_drift_transitions_total = Counter(
     "viaduck_discovery_drift_transitions_total",
     "Drift state transitions (kind=added|removed|changed|unwritable) — alertable, unlike gauge flaps",
@@ -351,6 +364,8 @@ discovery_broken_entries_total = _discovery_broken_entries_total
 discovery_destinations = _discovery_destinations
 discovery_drift_destinations = _discovery_drift_destinations
 discovery_drift_transitions_total = _discovery_drift_transitions_total
+discovery_classified = _discovery_classified
+discovery_view_poisoned = _discovery_view_poisoned
 
 partition_spec_total = _partition_spec_total
 projection_cast_null_fallback_total = _projection_cast_null_fallback_total
@@ -386,6 +401,7 @@ def init(pipeline: str):
     global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
     global discovery_poll_failures_total, discovery_broken_entries_total
     global discovery_destinations, discovery_drift_destinations, discovery_drift_transitions_total
+    global discovery_classified, discovery_view_poisoned
     global partition_spec_total, projection_cast_null_fallback_total
     global dest_write_retries_total, dest_write_retrying
     global pool_force_evictions_total
@@ -404,6 +420,8 @@ def init(pipeline: str):
     discovery_broken_entries_total = _AutoPipelineLabels(_discovery_broken_entries_total, pipeline)
     discovery_drift_destinations = _AutoPipelineLabels(_discovery_drift_destinations, pipeline)
     discovery_drift_transitions_total = _AutoPipelineLabels(_discovery_drift_transitions_total, pipeline)
+    discovery_classified = _AutoPipelineLabels(_discovery_classified, pipeline)
+    discovery_view_poisoned = _discovery_view_poisoned.labels(pipeline=pipeline)
     secret_cache_stale_fallback_total = _secret_cache_stale_fallback_total.labels(pipeline=pipeline)
     discovery_synced = _discovery_synced.labels(pipeline=pipeline)
     discovery_config_generation = _discovery_config_generation.labels(pipeline=pipeline)

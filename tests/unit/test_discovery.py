@@ -481,3 +481,198 @@ class TestMaterializeDeadline:
                 discovery.map_payload(_payload([_warehouse()])), set(), {}, heartbeat=lambda: beats.append(1)
             )
         assert beats == [1]
+
+
+class TestClassifiedView:
+    """C3 stage 3 (v6 two-predicate model): MENTIONED vs STARTABLE on the
+    RAW payload — a mentioned-but-unstartable tenant (fenced, degraded)
+    is never absent; the why lives in broken_entries counters only."""
+
+    def test_fenced_warehouse_teams_mentioned_not_startable(self):
+        wh = _warehouse()
+        wh["writable"] = False
+        wh["state"] = "resharding"
+        view = discovery.classify_payload(_payload([wh]))
+        e = view.entries["org-acme-team-666"]
+        assert not e.startable
+        assert e.mapped is None
+        assert not view.parse_poisoned
+
+    def test_degraded_warehouse_teams_mentioned_not_startable(self):
+        for mutate in (
+            lambda w: w.pop("bucket"),
+            lambda w: w["metadata_store"].pop("endpoint"),
+            lambda w: w["metadata_store"].pop("password_secret_ref"),
+        ):
+            wh = _warehouse()
+            mutate(wh)
+            view = discovery.classify_payload(_payload([wh]))
+            e = view.entries["org-acme-team-666"]
+            assert not e.startable
+            assert not view.parse_poisoned
+
+    def test_missing_events_table_is_mentioned_not_poison(self):
+        # The id is NAMEABLE (team_id present) — degraded, not absent,
+        # and not a whole-view freeze.
+        wh = _warehouse()
+        wh["teams"][0].pop("events_table")
+        view = discovery.classify_payload(_payload([wh]))
+        e = view.entries["org-acme-team-666"]
+        assert not e.startable
+        assert not view.parse_poisoned
+
+    def test_unnameable_content_poisons_the_view(self):
+        # A team row with no team_id cannot produce an id — that id would
+        # falsely read as ABSENT, so the WHOLE view freezes absence
+        # evaluation; parseable entries still classify.
+        wh = _warehouse()
+        wh["teams"].append({"events_table": "x.events"})  # no team_id
+        view = discovery.classify_payload(_payload([wh]))
+        assert view.parse_poisoned
+        assert view.entries["org-acme-team-666"].startable
+
+    def test_unparseable_warehouse_poisons_the_view(self):
+        view = discovery.classify_payload(_payload([_warehouse(), {"org_id": "bad", "writable": True, "teams": 7}]))
+        assert view.parse_poisoned
+        assert view.entries["org-acme-team-666"].startable
+
+    def test_duplicate_ids_first_wins_in_entries_preserved_in_list(self):
+        view = discovery.classify_payload(_payload([_warehouse(org="acme"), _warehouse(org="acme")]))
+        assert len(view.entry_list) == 2  # map_payload/materialize dedupe sees both
+        assert len(view.entries) == 1
+
+    def test_map_payload_is_the_startable_projection(self):
+        wh_ok = _warehouse()
+        wh_fenced = _warehouse(org="fenced")
+        wh_fenced["writable"] = False
+        mapped = discovery.map_payload(_payload([wh_ok, wh_fenced]))
+        assert [m.dest_id for m in mapped] == ["org-acme-team-666"]
+
+
+class TestDeriveAbsent:
+    def _registry(self, static_ids=(), discovered_ids=()):
+        from viaduck.config import DestinationConfig
+        from viaduck.registry import DestinationRegistry
+
+        def _cfg(did, rv):
+            return DestinationConfig(
+                id=did,
+                routing_value=rv,
+                name=did,
+                postgres_uri_env="X",
+                data_path="/d",
+                table="t",
+            )
+
+        reg = DestinationRegistry()
+        for i, did in enumerate(static_ids):
+            reg.add(_cfg(did, f"s{i}"), origin="static")
+        for i, did in enumerate(discovered_ids):
+            reg.add(_cfg(did, f"d{i}"), origin="discovered")
+        return reg
+
+    def _view(self, ids, poisoned=False):
+        return discovery.ClassifiedView(
+            generation=1,
+            fetched_at=0.0,
+            entry_list=tuple(discovery.ClassifiedEntry(dest_id=d, mapped=None) for d in ids),
+            parse_poisoned=poisoned,
+        )
+
+    def test_statics_never_enter_absence_evaluation(self):
+        # THE scoping invariant (C3 §4): statics are never in the CP view;
+        # without discovered-origin scoping the first evaluation would
+        # stop every static.
+        reg = self._registry(static_ids=("team-2", "s2"), discovered_ids=("dyn-a",))
+        absent = discovery.derive_absent(self._view([]), reg.snapshot())
+        assert absent == frozenset({"dyn-a"})
+
+    def test_any_classification_is_not_absent(self):
+        reg = self._registry(discovered_ids=("dyn-a", "dyn-b"))
+        # dyn-a mentioned (even unstartable) -> not absent; dyn-b missing.
+        assert discovery.derive_absent(self._view(["dyn-a"]), reg.snapshot()) == frozenset({"dyn-b"})
+
+    def test_poisoned_or_missing_view_freezes_absence(self):
+        reg = self._registry(discovered_ids=("dyn-a",))
+        assert discovery.derive_absent(self._view([], poisoned=True), reg.snapshot()) == frozenset()
+        assert discovery.derive_absent(None, reg.snapshot()) == frozenset()
+
+    def test_already_unroutable_ids_not_reported(self):
+        # A deactivated (removed-from-routing) id must not re-tick absence.
+        reg = self._registry(discovered_ids=("dyn-a", "dyn-b"))
+        reg.remove("dyn-a")
+        assert discovery.derive_absent(self._view([]), reg.snapshot()) == frozenset({"dyn-b"})
+
+
+class TestDriftWatcherPublishesView:
+    def test_latest_none_until_poll_then_replaced_whole(self):
+        w = discovery.DriftWatcher(
+            url="http://cp/x",
+            auth_header=None,
+            timeout_s=1.0,
+            poll_interval_s=60.0,
+            baseline={},
+            startup_generation=-1,
+        )
+        assert w.latest() is None
+        with patch("viaduck.discovery.fetch", return_value=_payload([_warehouse()])):
+            w._poll_once()
+        v1 = w.latest()
+        assert v1 is not None
+        assert v1.entries["org-acme-team-666"].startable
+        with patch("viaduck.discovery.fetch", return_value=_payload([_warehouse()])):
+            w._poll_once()
+        v2 = w.latest()
+        # Replaced whole: staleness is object identity, never generation
+        # equality (generations legitimately repeat).
+        assert v2 is not v1
+
+    def test_fenced_warehouse_unnameable_team_row_still_poisons(self):
+        # The id is unnameable regardless of fence state — poison applies
+        # under an unstartable warehouse too (deliberate cadence change
+        # vs the pre-v6 parser, which never scanned fenced teams).
+        wh = _warehouse()
+        wh["writable"] = False
+        wh["teams"].append({"events_table": "x.events"})  # no team_id
+        view = discovery.classify_payload(_payload([wh]))
+        assert view.parse_poisoned
+        assert not view.entries["org-acme-team-666"].startable
+
+    def test_unstartable_warehouse_counts_single_warehouse_reason(self, _mock_metrics):
+        # elif precedence: unwritable + missing bucket counts not_writable
+        # ONLY (same as the pre-v6 parser).
+        wh = _warehouse()
+        wh["writable"] = False
+        wh.pop("bucket")
+        discovery.classify_payload(_payload([wh]))
+        assert _mock_metrics.discovery_broken_entries_total.labels.call_count == 1
+        _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="not_writable")
+
+    def test_mixed_duplicate_prefers_startable_occurrence(self):
+        # F7: unstartable(acme) then startable(acme) for the same id —
+        # entries must agree with materialize (which dedupes over the
+        # startable-only list): the startable occurrence wins.
+        wh_fenced = _warehouse()
+        wh_fenced["writable"] = False
+        view = discovery.classify_payload(_payload([wh_fenced, _warehouse()]))
+        assert view.entries["org-acme-team-666"].startable
+
+    def test_failed_fetch_keeps_previous_view(self):
+        w = discovery.DriftWatcher(
+            url="http://cp/x",
+            auth_header=None,
+            timeout_s=1.0,
+            poll_interval_s=60.0,
+            baseline={},
+            startup_generation=-1,
+        )
+        with patch("viaduck.discovery.fetch", return_value=_payload([_warehouse()])):
+            w._poll_once()
+        v1 = w.latest()
+        with (
+            patch("viaduck.discovery.fetch", side_effect=discovery.DiscoveryError("cp down")),
+            pytest.raises(discovery.DiscoveryError),
+        ):
+            w._poll_once()
+        # The consumer detects staleness by identity: same object.
+        assert w.latest() is v1
