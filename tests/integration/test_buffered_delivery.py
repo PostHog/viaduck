@@ -48,6 +48,10 @@ def _dest_config(tmp_path, dest_id: str, *, data_path: str | None = None):
     d.data_path = data_path if data_path is not None else str(base / "data")
     d.table = "events"
     d.resolved_properties.return_value = {}
+    # A real DestinationConfig defaults uri_source=None; on a MagicMock the
+    # auto-attr is truthy and _resolve_uri would take the deferred-secret
+    # path into the k8s machinery (CI-only failure: docker-gated tests).
+    d.uri_source = None
     return d
 
 

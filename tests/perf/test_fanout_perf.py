@@ -320,6 +320,10 @@ def _make_fanout_pool(tmp_path, n_dests: int, max_open: int):
         d.data_path = str(base / "data")
         d.table = "events"
         d.resolved_properties.return_value = {}
+        # A real DestinationConfig defaults uri_source=None; on a MagicMock
+        # the auto-attr is truthy and _resolve_uri would take the
+        # deferred-secret path into the k8s machinery.
+        d.uri_source = None
         dests[dest_id] = d
 
     cfg = MagicMock()
