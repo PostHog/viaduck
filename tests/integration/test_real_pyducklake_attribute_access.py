@@ -64,6 +64,7 @@ def test_destination_pool_get_source_schema_against_real_catalog(tmp_path, monke
 
     from viaduck import metrics
     from viaduck.destination import DestinationPool
+    from viaduck.registry import DestinationRegistry
 
     metrics.init("test")
 
@@ -87,7 +88,7 @@ def test_destination_pool_get_source_schema_against_real_catalog(tmp_path, monke
     cfg.source.table = "default.events"
     cfg.source.resolved_properties.return_value = {}
 
-    pool = DestinationPool(cfg, max_open=50)
+    pool = DestinationPool(cfg, DestinationRegistry.from_configs(cfg.destinations), max_open=50)
     pool._source_schema = None
 
     schema = pool._get_source_schema()

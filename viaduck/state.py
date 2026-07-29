@@ -229,7 +229,7 @@ class StateManager:
                 len(destination_ids),
             )
 
-    def advance_cursor(self, destination_id: str, snapshot_id: int, cumulative_rows: int | None = None) -> None:
+    def advance_cursor(self, destination_id: str, snapshot_id: int, cumulative_rows: int | None = None) -> int:
         """Update a destination's cursor after successful replication.
 
         A single upsert — atomic by construction. If cumulative_rows is
@@ -239,11 +239,16 @@ class StateManager:
         (CursorMonotonicity in tla/Viaduck.tla); per-destination flush
         serialization should prevent out-of-order acks, this is
         defense-in-depth.
+
+        Returns the affected row count: 0 means the monotonic guard
+        dropped the write (a concurrent advance got there first) — the
+        retention clamp uses this to detect a lost race instead of
+        recording a phantom data-loss note.
         """
         now = datetime.now(UTC)
 
         def _op(conn: psycopg.Connection):
-            conn.execute(
+            cur = conn.execute(
                 f"""
                 INSERT INTO {self._qualified}
                     (destination_id, instance_id, last_snapshot_id, last_replicated_at,
@@ -260,8 +265,26 @@ class StateManager:
                 """,
                 (destination_id, self._instance_id, snapshot_id, now, cumulative_rows, now, cumulative_rows),
             )
+            return cur.rowcount
 
-        self._run(_op)
+        return self._run(_op)
+
+    def max_cursor_any_instance(self, destination_id: str) -> int | None:
+        """MAX(last_snapshot_id) across ALL instance rows for one
+        destination, or None when no row exists anywhere. The
+        reconciler's activate uses this when a fleet resize reshuffled
+        hash assignment: the new owner has no row of its own, and
+        initializing at head would silently skip everything between the
+        old owner's cursor and head (C3 §4 step 3)."""
+
+        def _op(conn: psycopg.Connection):
+            row = conn.execute(
+                f"SELECT MAX(last_snapshot_id) FROM {self._qualified} WHERE destination_id = %s",
+                (destination_id,),
+            ).fetchone()
+            return None if row is None or row[0] is None else int(row[0])
+
+        return self._run(_op)
 
     def advance_cursors(self, destination_ids: list[str], snapshot_id: int) -> None:
         """Advance multiple destinations to the same snapshot atomically.

@@ -11,6 +11,12 @@ class _AutoPipelineLabels:
     def labels(self, **kwargs):
         return self._metric.labels(pipeline=self._pipeline, **kwargs)
 
+    def remove(self, *label_values):
+        """Remove one child series (label values AFTER the auto-injected
+        pipeline, in declaration order). Raises KeyError for an absent
+        child — callers treat removal as best-effort."""
+        self._metric.remove(self._pipeline, *label_values)
+
 
 # --- Raw metric definitions (with pipeline as first label) ---
 
@@ -195,6 +201,20 @@ _lifecycle_discarded_rows_total = Counter(
     "Buffered rows discarded by a lifecycle pause/retire (durable in the source; re-read from the cursor on resume)",
     ["pipeline", "destination"],
 )
+_retention_clamp_total = Counter(
+    "viaduck_retention_clamp_total",
+    "Retention-edge cursor clamps: the destination's cursor fell below the earliest retained source "
+    "snapshot and was advanced to the edge. outcome=lost — the range was never read: unrecoverable "
+    "data loss, alert on it. outcome=at_risk — the range is buffered/in-flight and is lost only if "
+    "its pending flush fails",
+    ["pipeline", "destination", "outcome"],
+)
+_secret_cache_stale_fallback_total = Counter(
+    "viaduck_secret_cache_stale_fallback_total",
+    "Secret reads served from the stale cache after an API failure (k8s_secrets.read_secret_key_cached). "
+    "Sustained increments = flushing on possibly-rotated credentials during an API-server outage — alertable",
+    ["pipeline"],
+)
 _discovery_synced = Gauge(
     "viaduck_discovery_synced",
     "1 after a successful discovery poll; 0 = static-only (CP unreachable at startup) or stale drift view",
@@ -227,8 +247,45 @@ _discovery_destinations = Gauge(
 )
 _discovery_drift_destinations = Gauge(
     "viaduck_discovery_drift_destinations",
-    "Live payload vs this process (kind=added|removed|changed); nonzero = restart to apply",
+    "Live payload vs the STARTUP baseline (kind=added|removed|changed). With discovery.apply_enabled "
+    "this gauge is not updated (the reconciler applies changes; pending work is on "
+    "viaduck_reconciler_pending); without it, nonzero = restart to apply",
     ["pipeline", "kind"],
+)
+_discovery_applied_generation = Gauge(
+    "viaduck_discovery_applied_generation",
+    "config_generation of the last CP view the reconciler FULLY applied (every fired primitive "
+    "succeeded; deliberate deferrals excluded). applied == served is the new discovery_synced",
+    ["pipeline"],
+)
+_discovery_applied_total = Counter(
+    "viaduck_discovery_applied_total",
+    "Reconciler primitives executed (kind=start|stop|restart)",
+    ["pipeline", "kind"],
+)
+_reconciler_pending = Gauge(
+    "viaduck_reconciler_pending",
+    "Deliberately deferred reconciler work by reason (debounce|static_suppressed|floor|pending_restart|failure)",
+    ["pipeline", "reason"],
+)
+_discovery_stop_countdown = Gauge(
+    "viaduck_discovery_stop_countdown",
+    "Clean fetches remaining before a running-but-absent discovered destination deactivates "
+    "(absent_stop_fetches minus the current absent streak); removed when the id is mentioned again or stopped",
+    ["pipeline", "destination"],
+)
+_discovery_classified = Gauge(
+    "viaduck_discovery_classified",
+    "Destinations in the last classified CP view (startable|mentioned_only). Mentioned-only tenants "
+    "(fenced, degraded — see discovery_broken_entries_total for why) are never absent; ABSENT is "
+    "derived (registry-minus-view), never a payload classification",
+    ["pipeline", "classification"],
+)
+_discovery_view_poisoned = Gauge(
+    "viaduck_discovery_view_poisoned",
+    "1 when the last classified view contained un-enumerable content (unparseable warehouse or "
+    "unnameable team row) — absence evaluation is frozen for the whole view while it is set",
+    ["pipeline"],
 )
 _discovery_drift_transitions_total = Counter(
     "viaduck_discovery_drift_transitions_total",
@@ -327,6 +384,8 @@ delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 delivery_reads_paused = _delivery_reads_paused
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
+retention_clamp_total = _retention_clamp_total
+secret_cache_stale_fallback_total = _secret_cache_stale_fallback_total
 discovery_synced = _discovery_synced
 discovery_config_generation = _discovery_config_generation
 discovery_last_success_timestamp_seconds = _discovery_last_success_timestamp_seconds
@@ -335,6 +394,12 @@ discovery_broken_entries_total = _discovery_broken_entries_total
 discovery_destinations = _discovery_destinations
 discovery_drift_destinations = _discovery_drift_destinations
 discovery_drift_transitions_total = _discovery_drift_transitions_total
+discovery_classified = _discovery_classified
+discovery_view_poisoned = _discovery_view_poisoned
+discovery_applied_generation = _discovery_applied_generation
+discovery_applied_total = _discovery_applied_total
+reconciler_pending = _reconciler_pending
+discovery_stop_countdown = _discovery_stop_countdown
 
 partition_spec_total = _partition_spec_total
 projection_cast_null_fallback_total = _projection_cast_null_fallback_total
@@ -366,9 +431,12 @@ def init(pipeline: str):
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
+    global retention_clamp_total, secret_cache_stale_fallback_total
     global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
     global discovery_poll_failures_total, discovery_broken_entries_total
     global discovery_destinations, discovery_drift_destinations, discovery_drift_transitions_total
+    global discovery_classified, discovery_view_poisoned
+    global discovery_applied_generation, discovery_applied_total, reconciler_pending, discovery_stop_countdown
     global partition_spec_total, projection_cast_null_fallback_total
     global dest_write_retries_total, dest_write_retrying
     global pool_force_evictions_total
@@ -383,9 +451,17 @@ def init(pipeline: str):
     delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
     destination_lifecycle_state = _AutoPipelineLabels(_destination_lifecycle_state, pipeline)
     lifecycle_discarded_rows_total = _AutoPipelineLabels(_lifecycle_discarded_rows_total, pipeline)
+    retention_clamp_total = _AutoPipelineLabels(_retention_clamp_total, pipeline)
     discovery_broken_entries_total = _AutoPipelineLabels(_discovery_broken_entries_total, pipeline)
     discovery_drift_destinations = _AutoPipelineLabels(_discovery_drift_destinations, pipeline)
     discovery_drift_transitions_total = _AutoPipelineLabels(_discovery_drift_transitions_total, pipeline)
+    discovery_classified = _AutoPipelineLabels(_discovery_classified, pipeline)
+    discovery_view_poisoned = _discovery_view_poisoned.labels(pipeline=pipeline)
+    discovery_applied_generation = _discovery_applied_generation.labels(pipeline=pipeline)
+    discovery_applied_total = _AutoPipelineLabels(_discovery_applied_total, pipeline)
+    reconciler_pending = _AutoPipelineLabels(_reconciler_pending, pipeline)
+    discovery_stop_countdown = _AutoPipelineLabels(_discovery_stop_countdown, pipeline)
+    secret_cache_stale_fallback_total = _secret_cache_stale_fallback_total.labels(pipeline=pipeline)
     discovery_synced = _discovery_synced.labels(pipeline=pipeline)
     discovery_config_generation = _discovery_config_generation.labels(pipeline=pipeline)
     discovery_last_success_timestamp_seconds = _discovery_last_success_timestamp_seconds.labels(pipeline=pipeline)
@@ -420,3 +496,35 @@ def init(pipeline: str):
     cdc_conflicts_resolved_total = _cdc_conflicts_resolved_total.labels(pipeline=pipeline)
     cdc_tombstones_emitted_total = _cdc_tombstones_emitted_total.labels(pipeline=pipeline)
     cdc_orphaned_preimages_total = _cdc_orphaned_preimages_total.labels(pipeline=pipeline)
+
+
+def remove_destination_series(dest_id: str) -> None:
+    """Best-effort removal of a deactivated destination's per-destination
+    series, so a stopped tenant doesn't read as lagging forever. Callers
+    (the reconciler) defer this until the id has nothing in flight — an
+    in-flight flush calling .labels() after a remove re-creates the
+    series frozen. Absent children are fine (KeyError swallowed):
+    removal is re-applied idempotently per reconcile cycle."""
+    per_dest = (
+        dest_lag_snapshots,
+        dest_time_lag_seconds,
+        dest_last_snapshot_id,
+        delivery_buffer_rows,
+        delivery_buffer_bytes,
+        delivery_reads_paused,
+        discovery_stop_countdown,
+    )
+    for m in per_dest:
+        try:
+            m.remove(dest_id)
+        except KeyError:
+            pass
+    # Function-level import: lifecycle imports metrics at module top, so a
+    # module-level import here would be circular.
+    from viaduck import lifecycle as _lc
+
+    for state in _lc.VALID_STATES:
+        try:
+            destination_lifecycle_state.remove(dest_id, state)
+        except KeyError:
+            pass

@@ -22,6 +22,7 @@ from viaduck import metrics
 from viaduck.config import DeliveryConfig, StateConfig
 from viaduck.delivery import DeliveryManager
 from viaduck.destination import DestinationPool
+from viaduck.registry import DestinationRegistry
 from viaduck.state import StateManager
 
 pytestmark = pytest.mark.integration
@@ -47,6 +48,10 @@ def _dest_config(tmp_path, dest_id: str, *, data_path: str | None = None):
     d.data_path = data_path if data_path is not None else str(base / "data")
     d.table = "events"
     d.resolved_properties.return_value = {}
+    # A real DestinationConfig defaults uri_source=None; on a MagicMock the
+    # auto-attr is truthy and _resolve_uri would take the deferred-secret
+    # path into the k8s machinery (CI-only failure: docker-gated tests).
+    d.uri_source = None
     return d
 
 
@@ -61,8 +66,10 @@ def _make_pool(tmp_path, dest_ids: list[str], broken: set[str] = frozenset()):
         )
         for d in dest_ids
     }
-    cfg.destination_by_id = lambda d: dests[d]
-    pool = DestinationPool(cfg, max_open=10)
+    registry = DestinationRegistry.from_configs(list(dests.values()))
+    for did in dest_ids:
+        assert registry.config_for(did).id == did  # fixture wiring guard
+    pool = DestinationPool(cfg, registry, max_open=10)
     pool.set_source_schema(SCHEMA)
     return pool
 

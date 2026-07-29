@@ -17,7 +17,7 @@ def setup_module():
 @pytest.fixture()
 def pool():
     config = MagicMock()
-    return DestinationPool(config, max_open=3)
+    return DestinationPool(config, MagicMock(), max_open=3)
 
 
 # --- Basic pool operations ---
@@ -138,12 +138,12 @@ def test_pool_close_all(pool):
 def test_pool_max_open_zero_raises():
     """max_open < 1 should be rejected at construction (H7)."""
     with pytest.raises(ValueError, match="max_open"):
-        DestinationPool(MagicMock(), max_open=0)
+        DestinationPool(MagicMock(), MagicMock(), max_open=0)
 
 
 def test_pool_max_open_one_works():
     """max_open=1 should work: evict on every new connection."""
-    pool = DestinationPool(MagicMock(), max_open=1)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=1)
     catalogs = {}
 
     def mock_create(dest_id):
@@ -197,7 +197,7 @@ def test_pool_eviction_close_failure_continues(pool):
 
 def test_pool_set_source_schema():
     config = MagicMock()
-    pool = DestinationPool(config, max_open=50)
+    pool = DestinationPool(config, MagicMock(), max_open=50)
     mock_schema = MagicMock()
     pool.set_source_schema(mock_schema)
     assert pool._source_schema is mock_schema
@@ -205,7 +205,7 @@ def test_pool_set_source_schema():
 
 def test_pool_get_source_schema_cached():
     config = MagicMock()
-    pool = DestinationPool(config, max_open=50)
+    pool = DestinationPool(config, MagicMock(), max_open=50)
     mock_schema = MagicMock()
     pool._source_schema = mock_schema
     assert pool._get_source_schema() is mock_schema
@@ -240,7 +240,7 @@ def test_pool_get_source_schema_live_treats_schema_as_property():
     fake_catalog = MagicMock()
     fake_catalog.load_table.return_value = fake_table
 
-    pool = DestinationPool(config, max_open=50)
+    pool = DestinationPool(config, MagicMock(), max_open=50)
     pool._source_schema = None
 
     with patch("pyducklake.Catalog", return_value=fake_catalog):
@@ -259,7 +259,7 @@ def test_pool_lru_correctness_at_scale():
     Tests OrderedDict LRU logic, not connection open/close latency (which is
     DuckDB-bound at ~50-100ms per Catalog).
     """
-    pool = DestinationPool(MagicMock(), max_open=10)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=10)
     mock_catalog = MagicMock()
 
     with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock(), None)):
@@ -280,7 +280,7 @@ def test_pool_lru_correctness_at_scale():
 
 def test_pool_pinned_entry_not_lru_evicted():
     """A pinned (leased, unreleased) entry must survive LRU pressure."""
-    pool = DestinationPool(MagicMock(), max_open=2)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=2)
     catalogs = {}
 
     def mock_create(dest_id):
@@ -302,7 +302,7 @@ def test_pool_pinned_entry_not_lru_evicted():
 
 def test_pool_evict_while_pinned_defers_close():
     """Force-evict of a pinned entry defers the close to the final release."""
-    pool = DestinationPool(MagicMock(), max_open=3)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=3)
     cat = MagicMock()
 
     with patch.object(pool, "_create", return_value=(cat, MagicMock(), None)):
@@ -445,7 +445,7 @@ def test_pool_projection_stress_concurrent_get_release(pool):
 
 
 def test_pool_all_pinned_overshoots_instead_of_deadlock():
-    pool = DestinationPool(MagicMock(), max_open=1)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=1)
     with patch.object(pool, "_create", side_effect=lambda d: (MagicMock(), MagicMock(), None)):
         pool.get("a")  # pinned
         pool.get("b")  # capacity exceeded but "a" is pinned -> overshoot
@@ -870,3 +870,193 @@ def test_scrub_is_linear_on_adversarial_input():
     scrub_credentials(hostile)
     scrub_credentials('{"password":"' + "\\!" * 20000)
     assert _time.monotonic() - t0 < 1.0
+
+
+# --- Registry indirection (C3: stale-capture class) ---
+
+
+def test_create_resolves_via_registry_never_frozen_config():
+    """The stale-capture pin: _create resolves the destination through the
+    LIVE registry, never through the frozen startup config. Three separate
+    stale-captured-config defects motivated this — a pool holding a
+    pre-merge config made every discovered destination buffer forever."""
+    from viaduck.config import DestinationConfig
+    from viaduck.registry import DestinationRegistry
+
+    config = MagicMock()  # the frozen startup config: must never be asked
+    registry = DestinationRegistry()
+    registry.add(
+        DestinationConfig(
+            id="dyn-1",
+            routing_value="acme",
+            name="cat-dyn-1",
+            postgres_uri_env="UNUSED",
+            data_path="s3://bucket/dyn-1",
+            table="events",
+            postgres_uri_direct="postgresql://u:p@h/db",
+        ),
+        origin="discovered",
+    )
+    pool = DestinationPool(config, registry, max_open=3)
+    pool.set_source_schema(MagicMock())
+
+    fake_catalog = MagicMock()
+    with patch("pyducklake.Catalog", return_value=fake_catalog):
+        catalog, table, _plan = pool._create("dyn-1")
+
+    assert catalog is fake_catalog
+    config.destination_by_id.assert_not_called()
+
+
+# --- Deferred credential resolution (C3 §5 secret-ref deferral) ---
+
+
+class TestDeferredResolution:
+    def teardown_method(self):
+        # Real-cache tests must not leak entries into later files
+        # (verification finding 2: latent order-coupling).
+        from viaduck import k8s_secrets
+
+        k8s_secrets._cache_clear()
+
+    def _deferred_cfg(self):
+        from viaduck.config import DeferredUriSource, DestinationConfig
+
+        return DestinationConfig(
+            id="dyn-1",
+            routing_value="acme",
+            name="cat-dyn-1",
+            postgres_uri_env="",
+            data_path="s3://bucket/dyn-1",
+            table="events",
+            uri_source=DeferredUriSource(
+                pg_endpoint="pooler.cnpg-shards.svc.cluster.local",
+                pg_port=5432,
+                pg_database="acme",
+                pg_username="acme_user",
+                secret_namespace="ducklings",
+                secret_name="cnpg-tenant-acme-password",
+                secret_key="password",
+                sslmode="require",
+            ),
+        )
+
+    def _pool_with(self, cfg_obj):
+        from viaduck.registry import DestinationRegistry
+
+        registry = DestinationRegistry()
+        registry.add(cfg_obj, origin="discovered")
+        config = MagicMock()
+        config.discovery.secret_cache_ttl_s = 300.0
+        config.discovery.request_timeout_s = 10.0
+        pool = DestinationPool(config, registry, max_open=3)
+        pool.set_source_schema(MagicMock())
+        return pool
+
+    def test_create_resolves_ref_and_builds_uri_per_connect(self):
+        pool = self._pool_with(self._deferred_cfg())
+        fake_catalog = MagicMock()
+        with (
+            patch("viaduck.k8s_secrets.read_secret_key_cached", return_value="p'w") as rd,
+            patch("pyducklake.Catalog", return_value=fake_catalog) as cat,
+        ):
+            pool._create("dyn-1")
+        rd.assert_called_once_with("ducklings", "cnpg-tenant-acme-password", "password", ttl_s=300.0, timeout_s=10.0)
+        uri = cat.call_args.args[1]
+        # The two stacked parse layers (libpq keyword form + SQL-doubled
+        # quotes) apply at connect time now.
+        assert uri.startswith("postgres:host=")
+        assert "password=''p\\''w''" in uri
+        assert "sslmode=''require''" in uri
+
+    def test_secret_failure_becomes_scrubbed_connect_error(self):
+        from viaduck.destination import DestinationConnectError
+        from viaduck.k8s_secrets import SecretReadError
+
+        pool = self._pool_with(self._deferred_cfg())
+        with (
+            patch(
+                "viaduck.k8s_secrets.read_secret_key_cached",
+                side_effect=SecretReadError("RBAC denied"),
+            ),
+            pytest.raises(DestinationConnectError, match="dyn-1"),
+        ):
+            pool._create("dyn-1")
+
+    def test_static_config_path_unchanged(self):
+        from viaduck.config import DestinationConfig
+        from viaduck.registry import DestinationRegistry
+
+        static = DestinationConfig(
+            id="s1",
+            routing_value="2",
+            name="cat-s1",
+            postgres_uri_env="UNUSED",
+            data_path="s3://bucket/s1",
+            table="events",
+            postgres_uri_direct="postgres:host=rds",
+        )
+        registry = DestinationRegistry()
+        registry.add(static, origin="static")
+        pool = DestinationPool(MagicMock(), registry, max_open=3)
+        pool.set_source_schema(MagicMock())
+        with (
+            patch("viaduck.k8s_secrets.read_secret_key_cached") as rd,
+            patch("pyducklake.Catalog", return_value=MagicMock()) as cat,
+        ):
+            pool._create("s1")
+        rd.assert_not_called()
+        assert cat.call_args.args[1] == "postgres:host=rds"
+
+    def test_probe_warms_cache_so_first_connect_does_no_api_read(self):
+        # The materialize->_create seam: the probe's cached read means the
+        # pool's first connect resolves from the cache — exactly one API
+        # call end-to-end. Patches the INNER reader so the real cache
+        # engages across both calls.
+        from viaduck import discovery, k8s_secrets
+
+        k8s_secrets._cache_clear()
+        payload = {
+            "config_generation": 1,
+            "warehouses": [
+                {
+                    "org_id": "acme",
+                    "writable": True,
+                    "state": "ready",
+                    "bucket": "b",
+                    "metadata_store": {
+                        "endpoint": "pooler.cnpg-shards.svc.cluster.local",
+                        "database": "acme",
+                        "username": "acme_user",
+                        "password_secret_ref": {"namespace": "ducklings", "name": "s", "key": "password"},
+                    },
+                    "teams": [{"team_id": 7, "events_table": "t.events"}],
+                }
+            ],
+        }
+        with patch("viaduck.k8s_secrets.read_secret_key", return_value="pw") as rd:
+            mapped = discovery.map_payload(payload)
+            configs = discovery.materialize(mapped, set(), {})
+            assert len(configs) == 1
+            pool = self._pool_with(configs[0])
+            with patch("pyducklake.Catalog", return_value=MagicMock()):
+                pool._create(configs[0].id)
+        rd.assert_called_once()
+
+    def test_connect_failure_invalidates_cached_secret(self):
+        from viaduck import k8s_secrets
+        from viaduck.destination import DestinationConnectError
+
+        k8s_secrets._cache_clear()
+        pool = self._pool_with(self._deferred_cfg())
+        with patch("viaduck.k8s_secrets.read_secret_key", side_effect=["rotated-away", "fresh"]) as rd:
+            with (
+                patch("pyducklake.Catalog", side_effect=RuntimeError("password authentication failed")),
+                pytest.raises(DestinationConnectError),
+            ):
+                pool._create("dyn-1")
+            # Next attempt re-reads the API (cache invalidated), not the
+            # stale entry — rotation heals in one flush cycle.
+            with patch("pyducklake.Catalog", return_value=MagicMock()):
+                pool._create("dyn-1")
+        assert rd.call_count == 2

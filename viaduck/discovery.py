@@ -37,10 +37,11 @@ M4 semantics — ADDITIVE, STATIC WINS, FIXED SET:
   secret) is skipped and counted on
   ``viaduck_discovery_broken_entries_total{reason}`` — one broken
   tenant must not take down discovery for the rest.
-- Warehouses in a non-writable state (resharding) are skipped with a
-  metric: the write fence says nothing may write to them, and in a
-  fixed-set world "skip at startup" is the only lever. C3 maps this
-  onto the lifecycle machinery instead.
+- Warehouses in a non-writable state (resharding) are not startable:
+  their teams stay MENTIONED (never absent) but get no config. During a
+  reshard viaduck simply keeps failing against the DB-side NOLOGIN
+  fence until the changed config arrives (C3 v6 — rare, fast,
+  operationally routine).
 """
 
 from __future__ import annotations
@@ -50,11 +51,13 @@ import logging
 import threading
 import time
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from viaduck import metrics
-from viaduck.config import DestinationConfig
-from viaduck.k8s_secrets import SecretReadError, read_secret_key
+from viaduck.config import DeferredUriSource, DestinationConfig
+from viaduck.k8s_secrets import SecretReadError, read_secret_key_cached, read_secret_key_fresh
 from viaduck.scrub import scrub_credentials
 
 log = logging.getLogger(__name__)
@@ -148,7 +151,7 @@ def _libpq_quote(value: str) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def build_attach_uri(m: MappedDestination, password: str, sslmode: str) -> str:
+def build_attach_uri(m: MappedDestination | DeferredUriSource, password: str, sslmode: str) -> str:
     """DuckLake ATTACH connection string. TWO parsing layers stack here
     and each has bitten a review round:
 
@@ -180,38 +183,159 @@ def build_attach_uri(m: MappedDestination, password: str, sslmode: str) -> str:
     return conninfo.replace("'", "''")
 
 
-def map_payload(payload: dict, *, count_broken: bool = True) -> list[MappedDestination]:
-    """Map the payload onto destination candidates. Per-entry failures
-    are counted and skipped; this never raises on data problems (a
-    malformed warehouse degrades that warehouse, not the process).
-    `count_broken=False` is the DriftWatcher's quiet mode — a warehouse
-    stuck resharding for hours must not increment the materialization
-    counter or WARN once per poll."""
-    out: list[MappedDestination] = []
+# Per-destination classification of the RAW payload (C3 §4). At the
+# mapped level a fenced/broken tenant is indistinguishable from an
+# absent one (map_payload historically returned before emitting rows for
+# unwritable orgs). The consumer model is TWO predicates (C3 v6):
+# MENTIONED (the id appears in the payload at all — never absent, no
+# matter why it isn't startable; the WHY lives in the existing
+# discovery_broken_entries_total{reason} counters) and STARTABLE
+# (mentioned with a complete, usable config — `mapped` is populated).
+# ABSENT is deliberately NOT a payload property: it is derived by the
+# consumer via derive_absent() (registry-minus-view).
+
+
+@dataclass(frozen=True)
+class ClassifiedEntry:
+    dest_id: str
+    mapped: MappedDestination | None  # populated iff startable
+
+    @property
+    def startable(self) -> bool:
+        return self.mapped is not None
+
+
+@dataclass(frozen=True)
+class ClassifiedView:
+    """Immutable per-fetch view the DriftWatcher publishes and the
+    reconciler consumes.
+
+    ``parse_poisoned`` — some payload content failed to parse into
+    NAMEABLE destination ids (unparseable warehouse entry, malformed
+    team row). Those ids would otherwise read as ABSENT and tick stop
+    debounces; a poisoned view freezes absence evaluation for the WHOLE
+    view (fetch-failed-for-absence-purposes-only) while adds/changes
+    from parseable entries still apply (C3 §4, v4 review QE F7).
+
+    ``generation`` is the payload's config_generation — an opaque change
+    token, compare for equality only; staleness detection is by view
+    OBJECT identity, never generation equality (generations legitimately
+    repeat)."""
+
+    generation: float
+    fetched_at: float
+    entry_list: tuple[ClassifiedEntry, ...]
+    parse_poisoned: bool
+    entries: Mapping[str, ClassifiedEntry] = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Dedupe on duplicate ids (a CP bug serving one team twice):
+        # first STARTABLE occurrence wins, falling back to first
+        # occurrence — exactly materialize()'s dedupe over the
+        # startable-only list, so stage-4 rule 1 and startup can never
+        # disagree on a mixed-startability duplicate (F7, stage-3
+        # review). entry_list preserves duplicates so map_payload/
+        # materialize keep their existing duplicate counting.
+        first: dict[str, ClassifiedEntry] = {}
+        for e in self.entry_list:
+            held = first.get(e.dest_id)
+            if held is None or (not held.startable and e.startable):
+                first[e.dest_id] = e
+        object.__setattr__(self, "entries", MappingProxyType(first))
+
+
+def classify_payload(payload: dict, *, count_broken: bool = True) -> ClassifiedView:
+    """Classify every enumerable destination id in the raw payload as
+    startable (mapped config) or merely mentioned (fenced, degraded —
+    the reason is counted, not carried). Never raises on data problems:
+    un-enumerable content poisons the view (see ClassifiedView).
+    `count_broken` keeps the startup/loud vs drift-poll/quiet split of
+    map_payload."""
+    entries: list[ClassifiedEntry] = []
+    poisoned = False
     for wh in payload.get("warehouses", []):
         try:
-            _map_warehouse(wh, out, count_broken)
+            if not _classify_warehouse(wh, entries, count_broken):
+                poisoned = True
         except Exception as e:
             _broken("malformed", f"warehouse entry unparseable: {e!r}", count=count_broken)
-    return out
+            poisoned = True
+    return ClassifiedView(
+        # fetch() validates the key for every production payload; the .get
+        # keeps classify/map_payload's never-raise-on-data-problems
+        # contract for direct callers (F5, stage-3 review).
+        generation=payload.get("config_generation", -1),
+        fetched_at=time.monotonic(),
+        entry_list=tuple(entries),
+        parse_poisoned=poisoned,
+    )
 
 
-def _map_warehouse(wh: dict, out: list[MappedDestination], count_broken: bool) -> None:
+def derive_absent(view: ClassifiedView | None, registry_snapshot) -> frozenset[str]:
+    """Discovered-origin routable ids the view does not mention — the
+    ONLY correct ABSENT derivation (C3 §4):
+
+    - statics are never in the CP view and must never enter absence
+      evaluation (their exclusion here is what the scoping line in the
+      design means mechanically);
+    - a poisoned or missing view yields NO absences (freeze, don't stop
+      on unattributable parse failures);
+    - a MENTIONED destination is never absent, startable or not — a
+      fenced or degraded tenant must not tick a stop debounce.
+    """
+    if view is None or view.parse_poisoned:
+        return frozenset()
+    discovered = registry_snapshot.discovered_ids()
+    routable_discovered = discovered & registry_snapshot.routable_ids
+    return frozenset(d for d in routable_discovered if d not in view.entries)
+
+
+def map_payload(payload: dict, *, count_broken: bool = True) -> list[MappedDestination]:
+    """STARTABLE entries of the classified view, in payload order with
+    duplicates preserved (materialize() owns dedupe + its counter).
+    Startup-compatible shape; the classification is the single parsing
+    path so the two can never drift."""
+    view = classify_payload(payload, count_broken=count_broken)
+    return [e.mapped for e in view.entry_list if e.mapped is not None]
+
+
+def _classify_warehouse(wh: dict, entries: list[ClassifiedEntry], count_broken: bool) -> bool:
+    """Classify one warehouse's teams into `entries`. Returns False when
+    any content was UN-ENUMERABLE (a team id we cannot even name — that
+    id would falsely read as ABSENT, so the caller poisons the view).
+    Everything nameable is MENTIONED; it is additionally STARTABLE when
+    the warehouse is writable and its config is complete. The WHY of a
+    mentioned-but-unstartable tenant (reshard fence, missing bucket,
+    partial metadata store, no secret ref) lives in the _broken
+    counters/logs, which keep map_payload's historical reasons and
+    cadence — the consumer doesn't branch on it (C3 v6: during a
+    reshard we simply keep failing against the DB-side fence; rare,
+    fast, operationally routine)."""
     org = wh.get("org_id", "?")
-    if not wh.get("writable", False):
-        _broken(
-            "not_writable",
-            f"org {org} state={wh.get('state')} (reshard fence; C3 maps this to lifecycle)",
-            count=count_broken,
-        )
-        return
+    teams = wh.get("teams", [])
+    enumerable = True
+
+    # Startability: writable + bucket + complete metadata store + secret
+    # ref. The first failed check counts the warehouse-level reason once
+    # (historical cadence) and makes every team mentioned-only.
+    startable = True
     bucket = wh.get("bucket")
-    if not bucket:
-        _broken("no_bucket", f"org {org} has no bucket in the payload", count=count_broken)
-        return
     ms = wh.get("metadata_store") or {}
     ref = ms.get("password_secret_ref") or {}
-    if not (ms.get("endpoint") and ms.get("database") and ms.get("username")):
+    if not wh.get("writable", False):
+        # Reshard fence: the warehouse (and its teams) stays in the
+        # payload throughout the operation (duckgres #1005 runbook
+        # contract), so its teams stay MENTIONED — never absent.
+        _broken(
+            "not_writable",
+            f"org {org} state={wh.get('state')} (reshard fence; flushes fail against the DB fence until it lifts)",
+            count=count_broken,
+        )
+        startable = False
+    elif not bucket:
+        _broken("no_bucket", f"org {org} has no bucket in the payload", count=count_broken)
+        startable = False
+    elif not (ms.get("endpoint") and ms.get("database") and ms.get("username")):
         # cnpg rows carry only the store KIND until the provisioner
         # backfills connection details onto the row (duckgres
         # CLAUDE.md, Discovery Endpoints). Skip-and-count keeps this
@@ -221,36 +345,55 @@ def _map_warehouse(wh: dict, out: list[MappedDestination], count_broken: bool) -
             f"org {org} metadata_store missing endpoint/database/username",
             count=count_broken,
         )
-        return
-    if not (ref.get("namespace") and ref.get("name") and ref.get("key")):
+        startable = False
+    elif not (ref.get("namespace") and ref.get("name") and ref.get("key")):
         _broken("no_secret_ref", f"org {org} metadata_store has no usable password_secret_ref", count=count_broken)
-        return
-    for team in wh.get("teams", []):
+        startable = False
+
+    for team in teams:
         team_id = team.get("team_id")
         events_table = team.get("events_table")
-        if team_id is None or not events_table:
-            _broken("bad_team_row", f"org {org} team row missing team_id/events_table", count=count_broken)
+        if team_id is None:
+            # An id we cannot name — the poison case. Deliberate cadence
+            # change vs the pre-v6 parser: this fires for unstartable
+            # warehouses too (the old code early-returned before the team
+            # loop), because the row must be scanned to poison — the id
+            # is unnameable regardless of fence state.
+            _broken("bad_team_row", f"org {org} team row missing team_id", count=count_broken)
+            enumerable = False
+            continue
+        dest_id = f"org-{org}-team-{team_id}"
+        if startable and not events_table:
+            _broken("bad_team_row", f"org {org} team row missing events_table", count=count_broken)
+            entries.append(ClassifiedEntry(dest_id=dest_id, mapped=None))
+            continue
+        if not startable:
+            entries.append(ClassifiedEntry(dest_id=dest_id, mapped=None))
             continue
         # `enabled` is the QUERY-SERVING switch, deliberately ignored:
         # row presence is the only ingestion signal (duckgres
         # migration 000024 contract — deriving ingestion-stop from a
         # serving hold would turn it into permanent event loss).
-        out.append(
-            MappedDestination(
-                dest_id=f"org-{org}-team-{team_id}",
-                org_id=org,
-                team_id=team_id,
-                table=events_table,
-                data_path=f"s3://{bucket}/",
-                pg_endpoint=ms["endpoint"],
-                pg_port=ms.get("port") or 5432,
-                pg_database=ms["database"],
-                pg_username=ms["username"],
-                secret_namespace=ref["namespace"],
-                secret_name=ref["name"],
-                secret_key=ref["key"],
+        entries.append(
+            ClassifiedEntry(
+                dest_id=dest_id,
+                mapped=MappedDestination(
+                    dest_id=dest_id,
+                    org_id=org,
+                    team_id=team_id,
+                    table=events_table,
+                    data_path=f"s3://{bucket}/",
+                    pg_endpoint=ms["endpoint"],
+                    pg_port=ms.get("port") or 5432,
+                    pg_database=ms["database"],
+                    pg_username=ms["username"],
+                    secret_namespace=ref["namespace"],
+                    secret_name=ref["name"],
+                    secret_key=ref["key"],
+                ),
             )
         )
+    return enumerable
 
 
 def materialize(
@@ -262,6 +405,7 @@ def materialize(
     deadline_s: float = 60.0,
     heartbeat=None,
     secret_timeout_s: float = 10.0,
+    secret_cache_ttl_s: float = 300.0,
     allowed_endpoint_suffixes: tuple[str, ...] = (),
     allowed_secret_namespaces: tuple[str, ...] = (),
 ) -> list[DestinationConfig]:
@@ -288,60 +432,117 @@ def materialize(
         if heartbeat is not None:
             heartbeat()
         rv = str(m.team_id)
-        if rv in static_routing_values:
-            log.warning(
-                "Discovered destination %s: routing value %s owned by a static destination — static wins "
-                "(delete the static entry to cut this tenant over to discovery; gap-free cutover requires "
-                "the static id to already equal %s so the cursor row carries over)",
-                m.dest_id,
-                rv,
-                m.dest_id,
-            )
-            continue
-        if m.dest_id in static_ids:
-            _broken("id_collision", f"{m.dest_id} collides with a static destination id (different routing value)")
-            continue
-        # Defense-in-depth against a spoofed payload (it directs which
-        # Secret we read and where the password gets sent in a libpq
-        # handshake): endpoints and secret namespaces must match the
-        # configured allowlists.
-        if allowed_endpoint_suffixes and not any(m.pg_endpoint.endswith(sfx) for sfx in allowed_endpoint_suffixes):
-            _broken("endpoint_not_allowed", f"{m.dest_id}: endpoint {m.pg_endpoint!r} outside allowed suffixes")
-            continue
-        if allowed_secret_namespaces and m.secret_namespace not in allowed_secret_namespaces:
-            _broken("namespace_not_allowed", f"{m.dest_id}: secret namespace {m.secret_namespace!r} not allowed")
-            continue
         if rv in seen_rvs or m.dest_id in seen_ids:
             _broken("duplicate", f"{m.dest_id}: payload served routing value {rv} or id more than once (first wins)")
             continue
-        try:
-            password = read_secret_key(m.secret_namespace, m.secret_name, m.secret_key, timeout_s=secret_timeout_s)
-        except SecretReadError as e:
-            _broken("secret_unreadable", f"{m.dest_id}: {e}")
+        cfg = materialize_one(
+            m,
+            static_routing_values,
+            defaults,
+            static_ids,
+            secret_timeout_s=secret_timeout_s,
+            secret_cache_ttl_s=secret_cache_ttl_s,
+            allowed_endpoint_suffixes=allowed_endpoint_suffixes,
+            allowed_secret_namespaces=allowed_secret_namespaces,
+        )
+        if cfg is None:
             continue
         seen_rvs.add(rv)
         seen_ids.add(m.dest_id)
-        uri = build_attach_uri(m, password, defaults.get("sslmode", "disable"))
-        props = {"memory_limit": defaults.get("memory_limit", "8GB")}
-        props.update(defaults.get("properties", {}))
-        out.append(
-            DestinationConfig(
-                id=m.dest_id,
-                routing_value=rv,
-                name=m.dest_id,
-                postgres_uri_env="",
-                postgres_uri_direct=uri,
-                data_path=m.data_path,
-                table=m.table,
-                properties=props,
-                # Canonical shape is uniform across discovered tenants:
-                # projection on, captured_at dropped (plan C2 convention
-                # defaults; per-org exceptions stay static-config-only).
-                schema_projection_enabled=True,
-                drop_source_columns=tuple(defaults.get("drop_source_columns", ("captured_at",))),
-            )
-        )
+        out.append(cfg)
     return out
+
+
+def materialize_one(
+    m: MappedDestination,
+    static_routing_values: set[str],
+    defaults: dict,
+    static_ids: set[str] | None = None,
+    *,
+    secret_timeout_s: float = 10.0,
+    secret_cache_ttl_s: float = 300.0,
+    allowed_endpoint_suffixes: tuple[str, ...] = (),
+    allowed_secret_namespaces: tuple[str, ...] = (),
+    probe_fresh: bool = False,
+) -> DestinationConfig | None:
+    """One candidate -> DestinationConfig, or None (reason counted).
+    Shared by startup materialize() and the reconciler's activate
+    (which passes probe_fresh=True: an activation must prove the secret
+    is readable NOW — no TTL hit, no stale-fallback)."""
+    static_ids = static_ids or set()
+    rv = str(m.team_id)
+    if rv in static_routing_values:
+        log.warning(
+            "Discovered destination %s: routing value %s owned by a static destination — static wins "
+            "(delete the static entry to cut this tenant over to discovery; gap-free cutover requires "
+            "the static id to already equal %s so the cursor row carries over)",
+            m.dest_id,
+            rv,
+            m.dest_id,
+        )
+        return None
+    if m.dest_id in static_ids:
+        _broken("id_collision", f"{m.dest_id} collides with a static destination id (different routing value)")
+        return None
+    # Defense-in-depth against a spoofed payload (it directs which
+    # Secret we read and where the password gets sent in a libpq
+    # handshake): endpoints and secret namespaces must match the
+    # configured allowlists.
+    if allowed_endpoint_suffixes and not any(m.pg_endpoint.endswith(sfx) for sfx in allowed_endpoint_suffixes):
+        _broken("endpoint_not_allowed", f"{m.dest_id}: endpoint {m.pg_endpoint!r} outside allowed suffixes")
+        return None
+    if allowed_secret_namespaces and m.secret_namespace not in allowed_secret_namespaces:
+        _broken("namespace_not_allowed", f"{m.dest_id}: secret namespace {m.secret_namespace!r} not allowed")
+        return None
+    try:
+        # Materializability PROBE (C3 §4/§5): the password is NOT baked
+        # into the config — the pool resolves the ref at
+        # connection-create time (TTL cache, stale-fallback), so
+        # rotation heals via ordinary evict/recreate. The probe keeps
+        # RBAC/absence validation loud (secret_unreadable counter) and
+        # warms the cache so the first flush does no API read. Startup
+        # probes through the TTL cache (cold at process start — a real
+        # read); the reconciler's activate passes probe_fresh=True
+        # ("validate now": always hits the API, never stale-falls-back).
+        if probe_fresh:
+            read_secret_key_fresh(m.secret_namespace, m.secret_name, m.secret_key, timeout_s=secret_timeout_s)
+        else:
+            read_secret_key_cached(
+                m.secret_namespace,
+                m.secret_name,
+                m.secret_key,
+                ttl_s=secret_cache_ttl_s,
+                timeout_s=secret_timeout_s,
+            )
+    except SecretReadError as e:
+        _broken("secret_unreadable", f"{m.dest_id}: {e}")
+        return None
+    props = {"memory_limit": defaults.get("memory_limit", "8GB")}
+    props.update(defaults.get("properties", {}))
+    return DestinationConfig(
+        id=m.dest_id,
+        routing_value=rv,
+        name=m.dest_id,
+        postgres_uri_env="",
+        uri_source=DeferredUriSource(
+            pg_endpoint=m.pg_endpoint,
+            pg_port=m.pg_port,
+            pg_database=m.pg_database,
+            pg_username=m.pg_username,
+            secret_namespace=m.secret_namespace,
+            secret_name=m.secret_name,
+            secret_key=m.secret_key,
+            sslmode=defaults.get("sslmode", "disable"),
+        ),
+        data_path=m.data_path,
+        table=m.table,
+        properties=props,
+        # Canonical shape is uniform across discovered tenants:
+        # projection on, captured_at dropped (plan C2 convention
+        # defaults; per-org exceptions stay static-config-only).
+        schema_projection_enabled=True,
+        drop_source_columns=tuple(defaults.get("drop_source_columns", ("captured_at",))),
+    )
 
 
 @dataclass
@@ -373,11 +574,34 @@ class DriftWatcher:
     poll_interval_s: float
     baseline: dict[str, MappedDestination]
     startup_generation: int
+    # True when the C3 reconciler is applying views (discovery.
+    # apply_enabled): the vs-STARTUP drift comparison below is then
+    # permanently wrong after the first applied change (an applied add
+    # reads as drift forever, and "restart to apply" is false guidance),
+    # so it is skipped — pending UNAPPLIED work is exported by the
+    # reconciler on viaduck_reconciler_pending{reason} instead. The
+    # applied-registry-baseline rework lands with the dashboards PR.
+    apply_mode: bool = False
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
     _last_drift: tuple[frozenset, frozenset, frozenset] = (frozenset(), frozenset(), frozenset())
     _unwritable_reported: set[str] = field(default_factory=set)
     _recovery_logged: bool = False
+    _poison_reported: bool = False
+    # Published classified view (C3 stage 3): replaced WHOLE per
+    # successful fetch; a failed fetch publishes nothing (the consumer
+    # detects staleness by object identity — same view object means
+    # frozen counters). The reconciler (stage 4) pulls latest() once per
+    # poll cycle; until then this is detect-only output.
+    _view: ClassifiedView | None = None
+    _view_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def latest(self) -> ClassifiedView | None:
+        """Most recent classified view, or None before the first
+        successful poll (incl. a failed-startup process — the reconciler
+        treats None as no-view: nothing fires)."""
+        with self._view_lock:
+            return self._view
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="discovery-drift", daemon=True)
@@ -412,7 +636,35 @@ class DriftWatcher:
         # static-only alert (round-2 review).
         metrics.discovery_config_generation.set(payload["config_generation"])
         metrics.discovery_last_success_timestamp_seconds.set_to_current_time()
-        current = {m.dest_id: m for m in map_payload(payload, count_broken=False)}
+        view = classify_payload(payload, count_broken=False)
+        with self._view_lock:
+            self._view = view
+        startable = sum(1 for e in view.entries.values() if e.startable)
+        metrics.discovery_classified.labels(classification="startable").set(startable)
+        metrics.discovery_classified.labels(classification="mentioned_only").set(len(view.entries) - startable)
+        metrics.discovery_view_poisoned.set(1 if view.parse_poisoned else 0)
+        if view.parse_poisoned and not self._poison_reported:
+            self._poison_reported = True
+            log.warning(
+                "Discovery view is POISONED (un-nameable payload content, e.g. a team row missing "
+                "team_id): absence evaluation is frozen for every view until the CP data is fixed — "
+                "deprovisioned tenants will NOT be stopped while this persists (alert on "
+                "viaduck_discovery_view_poisoned)"
+            )
+        elif not view.parse_poisoned and self._poison_reported:
+            self._poison_reported = False
+            log.info("Discovery view poison cleared; absence evaluation resumes")
+        # Baseline drift comparison (skipped in apply_mode below) stays
+        # on the startable/mapped level — last-wins dict over the raw
+        # list, same construction as always.
+        current = {e.dest_id: e.mapped for e in view.entry_list if e.mapped is not None}
+        if self.apply_mode:
+            # Reconciler active: the classified view IS the handoff; the
+            # vs-startup comparison below would read every applied change
+            # as permanent drift. The fence ERROR escalation is also
+            # obsolete (no fixed set to protect — flushes fail against
+            # the DB fence and rule 2 restarts on the changed config).
+            return
         if not self.baseline and self.startup_generation == -1 and current and not self._recovery_logged:
             self._recovery_logged = True
             log.warning(

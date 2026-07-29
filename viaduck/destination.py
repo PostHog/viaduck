@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from pyducklake.schema import Schema
 
     from viaduck.config import DestinationConfig, ViaduckConfig
+    from viaduck.registry import DestinationRegistry
     from viaduck.schema_projection import ProjectionPlan
 
 log = logging.getLogger(__name__)
@@ -45,10 +46,16 @@ class DestinationPool:
     practice — the counting is defensive.
     """
 
-    def __init__(self, config: ViaduckConfig, max_open: int = 50):
+    def __init__(self, config: ViaduckConfig, registry: DestinationRegistry, max_open: int = 50):
         if max_open < _MIN_MAX_OPEN:
             raise ValueError(f"max_open must be >= {_MIN_MAX_OPEN}, got {max_open}")
         self._config = config
+        # Destination configs resolve through the LIVE registry at _create
+        # time — never through the frozen startup config (three historical
+        # stale-capture defects; see viaduck/registry.py). self._config is
+        # retained for source/routing settings only, which are genuinely
+        # process-constant.
+        self._registry = registry
         self._max_open = max_open
         self._lock = threading.Lock()
         self._pool: OrderedDict[str, tuple[Catalog, Table]] = OrderedDict()
@@ -302,6 +309,30 @@ class DestinationPool:
         )
         return plan
 
+    def _resolve_uri(self, dest_cfg: DestinationConfig) -> str:
+        """Attach URI for a destination. Discovered destinations carry a
+        secret REF (C3 §5 deferral): resolve the password here — per
+        connect, TTL-cached with stale-fallback (an API-server outage on
+        this now-routine path must not become fleet-wide flush failures)
+        — and build the URI in memory. A SecretReadError propagates into
+        _create's scrubbed DestinationConnectError path: flush failure →
+        evict → ordinary retry. Static destinations keep the env
+        indirection unchanged."""
+        if dest_cfg.uri_source is None:
+            return dest_cfg.postgres_uri
+        from viaduck.discovery import build_attach_uri
+        from viaduck.k8s_secrets import read_secret_key_cached
+
+        src = dest_cfg.uri_source
+        password = read_secret_key_cached(
+            src.secret_namespace,
+            src.secret_name,
+            src.secret_key,
+            ttl_s=self._config.discovery.secret_cache_ttl_s,
+            timeout_s=self._config.discovery.request_timeout_s,
+        )
+        return build_attach_uri(src, password, src.sslmode)
+
     def _create(self, destination_id: str) -> tuple[Catalog, Table, ProjectionPlan | None]:
         """Create a new Catalog and load/create the destination table.
 
@@ -312,14 +343,14 @@ class DestinationPool:
         """
         from pyducklake import Catalog
 
-        dest_cfg: DestinationConfig = self._config.destination_by_id(destination_id)
+        dest_cfg: DestinationConfig = self._registry.config_for(destination_id)
         schema = self._get_source_schema()
 
         catalog = None
         try:
             catalog = Catalog(
                 dest_cfg.name,
-                dest_cfg.postgres_uri,
+                self._resolve_uri(dest_cfg),
                 data_path=dest_cfg.data_path,
                 properties=with_connection_defaults(dest_cfg.resolved_properties()),
             )
@@ -343,6 +374,15 @@ class DestinationPool:
                     catalog.close()
                 except Exception:
                     pass
+            if dest_cfg.uri_source is not None:
+                # Deferred destination: a connect failure may be a rotated
+                # password served from the warm cache — invalidate so the
+                # next attempt re-reads the API and heals in one flush
+                # cycle instead of waiting out the TTL.
+                from viaduck import k8s_secrets
+
+                src = dest_cfg.uri_source
+                k8s_secrets.invalidate(src.secret_namespace, src.secret_name, src.secret_key)
             # DuckDB's ATTACH errors embed the FULL connection string —
             # password included — and the flush-failure path logs
             # exceptions with tracebacks. Scrub before re-raising, and

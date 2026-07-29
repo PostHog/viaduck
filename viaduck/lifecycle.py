@@ -95,6 +95,40 @@ class LifecycleTracker:
     def __post_init__(self) -> None:
         self._states = {d: ACTIVE for d in self.dest_ids}
 
+    # -- membership (C3 reconciler; poll-thread only) ------------------------
+
+    def add(self, dest_id: str, state: str | None = None) -> None:
+        """Track a dynamically added destination. Without this the tracker's
+        membership is frozen at construction and a later pause/retire of a
+        dynamically added id would never apply (v4 review F2). The
+        reconciler passes the freshly loaded lifecycle row's raw state so
+        operator intent applies from the FIRST cycle (a paused id enters
+        paused, not active-for-one-cycle); a bare add preserves any
+        existing state and defaults to active."""
+        if dest_id not in self.dest_ids:
+            self.dest_ids.append(dest_id)
+        if state is None:
+            self._states.setdefault(dest_id, ACTIVE)
+        else:
+            self._states[dest_id] = normalize(state, dest_id, log_unknown=True)
+        metrics.set_destination_lifecycle(dest_id, self._states[dest_id], VALID_STATES)
+
+    def remove(self, dest_id: str) -> None:
+        """Stop tracking a deactivated destination. Its lifecycle ROW is
+        untouched (operator intent is durable and re-honored on re-add);
+        only this process's per-cycle tracking ends. Idempotent.
+
+        The state gauge's labels are intentionally NOT removed here —
+        deferred label removal is the reconciler's job (C3 §4: removal
+        waits until the id has nothing in flight and is re-applied
+        idempotently per cycle; an inline remove races a concurrent
+        `.labels()` call, which re-creates the child frozen)."""
+        if dest_id in self.dest_ids:
+            self.dest_ids.remove(dest_id)
+        self._states.pop(dest_id, None)
+        self._evicted.discard(dest_id)
+        self._drain_reported.discard(dest_id)
+
     # -- queries -------------------------------------------------------------
 
     def state(self, dest_id: str) -> str:

@@ -208,3 +208,35 @@ class TestStateManagerRefusal:
         sm = StateManager.__new__(StateManager)
         with pytest.raises(ValueError):
             StateManager.set_lifecycle_state(sm, "d1", "wat", reason="x", updated_by="test")
+
+
+# ---------------------------------------------------------------------------
+# Membership (C3 reconciler)
+# ---------------------------------------------------------------------------
+
+
+def test_tracker_add_makes_id_visible_to_apply():
+    tracker = LifecycleTracker(["d1"])
+    tracker.add("d2")
+    assert "d2" in tracker.readable_ids()
+    # A later pause of the dynamically added id applies — the frozen-
+    # membership defect (v4 review F2) is what this pins.
+    tracker.apply({"d2": PAUSED}, MagicMock(), MagicMock(), None)
+    assert "d2" not in tracker.readable_ids()
+    assert "d2" in tracker.suspended_ids()
+    tracker.add("d2")  # idempotent; state preserved
+    assert "d2" in tracker.suspended_ids()
+
+
+def test_tracker_remove_stops_tracking():
+    tracker = LifecycleTracker(["d1", "d2"])
+    tracker.apply({"d2": PAUSED}, MagicMock(), MagicMock(), None)
+    tracker.remove("d2")
+    assert "d2" not in tracker.readable_ids()
+    assert "d2" not in tracker.suspended_ids()
+    assert "d2" not in tracker.states()
+    tracker.remove("d2")  # idempotent
+    # Re-add starts ACTIVE; the caller honors the durable lifecycle row at
+    # activation and the next apply() absorbs it.
+    tracker.add("d2")
+    assert "d2" in tracker.readable_ids()

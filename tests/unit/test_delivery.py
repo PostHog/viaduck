@@ -652,3 +652,304 @@ def test_flush_success_after_discard_restores_position():
     snap = mgr.status_snapshot()["d1"]
     assert snap.flushed_snapshot == 9
     assert mgr.is_clean("d1")
+
+
+# ---------------------------------------------------------------------------
+# Retention-edge clamp
+# ---------------------------------------------------------------------------
+
+
+def test_clamp_to_retention_advances_cursor_and_persists():
+    mgr, sm, _ = _manager(cursors={"d1": 10})
+    old = mgr.clamp_to_retention("d1", 99)
+    assert old == 10
+    # Durable persist first, count preserved, loss recorded on the row.
+    sm.advance_cursor.assert_called_once_with("d1", 99, cumulative_rows=None)
+    sm.record_error.assert_called_once()
+    snap = mgr.status_snapshot()["d1"]
+    assert snap.flushed_snapshot == 99
+    assert snap.position_snapshot == 99
+    assert "clamped to retention edge" in snap.last_error
+
+
+def test_clamp_to_retention_noop_when_at_or_past_floor():
+    mgr, sm, _ = _manager(cursors={"d1": 99})
+    assert mgr.clamp_to_retention("d1", 99) is None
+    assert mgr.clamp_to_retention("d1", 50) is None
+    sm.advance_cursor.assert_not_called()
+
+
+def test_clamp_keeps_buffer_and_epoch_when_position_ahead_of_floor():
+    # Flushed expired but position past the floor (buffered data): buffered
+    # rows are valid reads and are kept; no epoch bump (no read-overlap
+    # hazard — position was not moved). Only flushed comes up to the floor,
+    # so a later failure rewind targets the floor, not the expired cursor.
+    mgr, _, _ = _manager(cursors={"d1": 10})
+    _, epoch0 = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(3), through_snapshot=120, epoch=epoch0)
+    assert mgr.clamp_to_retention("d1", 99) == 10
+    snap = mgr.status_snapshot()["d1"]
+    assert snap.flushed_snapshot == 99
+    assert snap.position_snapshot == 120
+    assert snap.buffer_rows == 3
+    _, epoch1 = mgr.read_plan()["d1"]
+    assert epoch1 == epoch0
+
+
+def test_clamp_discards_overlapping_read_via_epoch():
+    # A CDC read captured before the clamp lands after it: buffer() stamps
+    # position unconditionally, so without the epoch bump the read would
+    # rewind position below the floor. The stale epoch rejects it.
+    mgr, _, _ = _manager(cursors={"d1": 10})
+    _, epoch0 = mgr.read_plan()["d1"]
+    mgr.clamp_to_retention("d1", 99)
+    mgr.buffer("d1", _table(2), through_snapshot=40, epoch=epoch0)
+    assert mgr.positions() == {"d1": 99}
+    assert mgr.status_snapshot()["d1"].buffer_rows == 0
+
+
+def test_flush_failure_after_clamp_rewinds_to_floor():
+    mgr, _, _ = _manager(cursors={"d1": 10})
+    mgr.clamp_to_retention("d1", 99)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(2), through_snapshot=150, epoch=epoch)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("down")):
+        assert mgr.maybe_flush(shutdown=True) == 1
+        assert mgr.wait_idle()
+    # The failure rewind targets the clamped cursor, not the expired one —
+    # the re-read starts inside retention instead of raising again.
+    assert mgr.positions() == {"d1": 99}
+
+
+def test_zombie_flush_cannot_regress_clamp():
+    # A flush submitted BEFORE the clamp completes AFTER it with
+    # through < floor: the success path's max-guard on flushed keeps the
+    # clamp, the cursor gauge is not regressed, and the clamp's loss note
+    # survives (a zombie flush must not clear an error it knows nothing
+    # about). The gate blocks only the worker's advance (through=40); the
+    # clamp's own durable write (through=99) proceeds.
+    mgr, sm, _ = _manager(cursors={"d1": 10})
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(2), through_snapshot=40, epoch=epoch)
+
+    gate = threading.Event()
+    entered = threading.Event()
+
+    def _gated_advance(dest_id, through, cumulative, attempts=3):
+        if through == 40:
+            entered.set()
+            gate.wait(timeout=10)
+        return 1
+
+    with (
+        patch.object(mgr, "_advance_cursor_with_retry", _gated_advance),
+        patch("viaduck.delivery.append_only", return_value=2),
+    ):
+        assert mgr.maybe_flush(shutdown=True) == 1
+        assert entered.wait(timeout=5)
+        assert mgr.clamp_to_retention("d1", 99) == 10
+        gate.set()
+        assert mgr.wait_idle()
+    snap = mgr.status_snapshot()["d1"]
+    assert snap.flushed_snapshot == 99
+    assert snap.position_snapshot >= 99
+    assert snap.last_error is not None and "clamped to retention edge" in snap.last_error
+
+
+def test_clamp_lost_race_returns_none_without_loss_note():
+    # TOCTOU guard: a concurrent flush advanced the durable cursor past
+    # the floor between the clamp's check and its write — the monotonic
+    # guard reports 0 rows. Nothing was lost; no phantom loss note.
+    mgr, sm, _ = _manager(cursors={"d1": 10})
+    sm.advance_cursor.return_value = 0
+    assert mgr.clamp_to_retention("d1", 99) is None
+    sm.record_error.assert_not_called()
+    snap = mgr.status_snapshot()["d1"]
+    assert snap.flushed_snapshot == 10  # memory untouched
+    assert snap.last_error is None
+
+
+def test_clamp_memory_race_recheck_under_lock():
+    # The durable write landed (rowcount 1) but a flush success updated
+    # the in-memory cursor past the floor before the clamp's stamp: the
+    # under-lock re-check bails without stamping a stale loss note.
+    mgr, sm, _ = _manager(cursors={"d1": 10})
+
+    def _advance_then_race(dest_id, snapshot_id, cumulative_rows=None):
+        with mgr._lock:
+            mgr._flushed[dest_id] = 150
+            mgr._position[dest_id] = 150
+        return 1
+
+    sm.advance_cursor.side_effect = _advance_then_race
+    assert mgr.clamp_to_retention("d1", 99) is None
+    sm.record_error.assert_not_called()
+    assert mgr.status_snapshot()["d1"].last_error is None
+
+
+def test_clamp_durable_write_precedes_memory_stamp():
+    # Pins durable-before-memory ordering: at advance_cursor time the
+    # in-memory cursor must still be the old value (crash between the two
+    # re-runs the clamp as a no-op; the reverse order would not).
+    mgr, sm, _ = _manager(cursors={"d1": 10})
+    seen = []
+
+    def _observe(dest_id, snapshot_id, cumulative_rows=None):
+        seen.append(mgr.flushed_snapshots()["d1"])
+        return 1
+
+    sm.advance_cursor.side_effect = _observe
+    assert mgr.clamp_to_retention("d1", 99) == 10
+    assert seen == [10]
+    assert mgr.flushed_snapshots()["d1"] == 99
+
+
+def test_clamp_durable_failure_leaves_memory_untouched():
+    # Failure atomicity: if the durable write fails (after the retry
+    # budget), the exception propagates to the caller (which excludes the
+    # destination from the cycle) and NO in-memory state moved.
+    mgr, sm, _ = _manager(cursors={"d1": 10})
+    sm.advance_cursor.side_effect = RuntimeError("pg down")
+    with patch("viaduck.delivery.time.sleep"), pytest.raises(RuntimeError):
+        mgr.clamp_to_retention("d1", 99)
+    sm.record_error.assert_not_called()
+    snap = mgr.status_snapshot()["d1"]
+    assert snap.flushed_snapshot == 10
+    assert snap.position_snapshot == 10
+    assert snap.last_error is None
+
+
+def test_clamp_outcome_wording_lost_vs_at_risk():
+    # Never-read range: hard loss. Read-but-buffered range: at risk only —
+    # the note must not claim "unread" for rows sitting in the buffer.
+    mgr, _, _ = _manager(dests=("lost", "risk"), cursors={"lost": 10, "risk": 10})
+    _, epoch = mgr.read_plan()["risk"]
+    mgr.buffer("risk", _table(3), through_snapshot=120, epoch=epoch)
+
+    assert mgr.clamp_to_retention("lost", 99) == 10
+    assert mgr.clamp_to_retention("risk", 99) == 10
+    snaps = mgr.status_snapshot()
+    assert "expired UNREAD" in snaps["lost"].last_error
+    assert "lost only if" in snaps["risk"].last_error
+
+
+# ---------------------------------------------------------------------------
+# Membership (C3 §1 stop contract: active set, dicts persist)
+# ---------------------------------------------------------------------------
+
+
+def test_remove_destination_stops_submissions_but_keeps_state():
+    mgr, _, _ = _manager(dests=("d1", "d2"))
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(3), through_snapshot=7, epoch=epoch)
+    mgr.remove_destination("d1")
+    with patch.object(mgr, "_flush", fake):
+        # No submission for the removed id, even at shutdown pressure —
+        # without the active filter a stopped dest with position > flushed
+        # would submit position-persist flushes forever.
+        assert mgr.maybe_flush(shutdown=True) == 0
+    assert calls == []
+    # Out of the read plan and status; dict family retained underneath.
+    assert "d1" not in mgr.read_plan()
+    assert "d1" not in mgr.status_snapshot()
+    assert "d1" in mgr._buffers
+    assert mgr.is_clean("d1") is False  # still queryable (pending drain latch)
+    mgr.remove_destination("d1")  # idempotent
+
+
+def test_re_add_max_merges_and_preserves_epoch():
+    mgr, sm, _ = _manager(cursors={"d1": 5})
+    _, epoch0 = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(2), through_snapshot=9, epoch=epoch0)
+    mgr.remove_destination("d1")
+    sm.load_cursors.reset_mock()
+    mgr.add_destination("d1")
+    # Max-merge: surviving entries reused — no cursor reload, no epoch
+    # reset (a reset would let a pre-stop read regress position), no
+    # position/flushed rewind.
+    sm.load_cursors.assert_not_called()
+    pos, epoch1 = mgr.read_plan()["d1"]
+    assert pos == 9
+    assert epoch1 == epoch0
+    assert mgr.status_snapshot()["d1"].flushed_snapshot == 5
+
+
+def test_add_destination_new_id_initializes_from_cursor():
+    mgr, sm, _ = _manager(dests=("d1",))
+    c = MagicMock()
+    c.last_snapshot_id = 42
+    c.rows_replicated = 7
+    c.last_error = None
+    sm.load_cursors.return_value = {"dyn": c}
+    mgr.add_destination("dyn")
+    snap = mgr.status_snapshot()["dyn"]
+    assert snap.flushed_snapshot == 42
+    assert snap.position_snapshot == 42
+    assert snap.rows_replicated == 7
+
+
+def test_membership_change_recomputes_auto_cap():
+    mgr, _, _ = _manager(dests=("d1", "d2"), buffer_total_max_bytes=100)
+    assert mgr._per_dest_cap == 50
+    mgr.remove_destination("d2")
+    assert mgr._per_dest_cap == 100
+    mgr.add_destination("d2")
+    assert mgr._per_dest_cap == 50
+
+
+def test_membership_change_shrinks_oversubscribed_explicit_cap():
+    # Startup honors an oversubscribed explicit cap (WARN only — existing
+    # contract); a MEMBERSHIP CHANGE enforces the total as the bound and
+    # shrinks to fair share, because dynamic growth would otherwise erode
+    # buffer_total_max_bytes as the effective memory limit.
+    mgr, sm, _ = _manager(
+        dests=("d1", "d2"),
+        buffer_total_max_bytes=100,
+        buffer_max_bytes_per_destination=80,
+    )
+    assert mgr._per_dest_cap == 80  # startup: honored
+    c = MagicMock()
+    c.last_snapshot_id = 0
+    c.rows_replicated = 0
+    c.last_error = None
+    sm.load_cursors.return_value = {"d3": c}
+    mgr.add_destination("d3")
+    assert mgr._per_dest_cap == 100 // 3  # 3 x 80 > 100 -> fair share
+    mgr.remove_destination("d3")
+    mgr.remove_destination("d2")
+    assert mgr._per_dest_cap == 80  # 1 x 80 <= 100 -> explicit honored again
+
+
+def test_add_destination_loads_cursor_outside_lock_and_fails_atomically():
+    mgr, sm, _ = _manager(dests=("d1",))
+
+    def _probe_lock(ids):
+        # The module's lock discipline: no state-store I/O under _lock. If
+        # the manager lock were held here, this acquire would fail and a
+        # real PG stall would freeze every flush worker.
+        assert mgr._lock.acquire(blocking=False), "state-store read under the manager lock"
+        mgr._lock.release()
+        raise RuntimeError("pg down")
+
+    sm.load_cursors.side_effect = _probe_lock
+    with pytest.raises(RuntimeError):
+        mgr.add_destination("dyn")
+    # Failure atomicity: not activated, no partial dict entries.
+    assert "dyn" not in mgr.active_ids()
+    assert "dyn" not in mgr._buffers
+
+
+def test_draining_destination_still_flushes_under_active_filter():
+    # Draining is in _active and NOT in _suspended; the new active filter
+    # in maybe_flush must not stop its flush-out (parity invariant from
+    # the stage-2 no-op review).
+    mgr, _, _ = _manager()
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(3), through_snapshot=7, epoch=epoch)
+    # Lifecycle 'draining': excluded from reads by the caller, not
+    # suspended, still active.
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush(shutdown=True) == 1
+    assert calls[0][0] == "d1"

@@ -306,6 +306,7 @@ def _make_fanout_pool(tmp_path, n_dests: int, max_open: int):
     from unittest.mock import MagicMock
 
     from viaduck.destination import DestinationPool
+    from viaduck.registry import DestinationRegistry
 
     dests = {}
     for i in range(n_dests):
@@ -319,11 +320,15 @@ def _make_fanout_pool(tmp_path, n_dests: int, max_open: int):
         d.data_path = str(base / "data")
         d.table = "events"
         d.resolved_properties.return_value = {}
+        # A real DestinationConfig defaults uri_source=None; on a MagicMock
+        # the auto-attr is truthy and _resolve_uri would take the
+        # deferred-secret path into the k8s machinery.
+        d.uri_source = None
         dests[dest_id] = d
 
     cfg = MagicMock()
-    cfg.destination_by_id = lambda d: dests[d]
-    pool = DestinationPool(cfg, max_open=max_open)
+    registry = DestinationRegistry.from_configs(list(dests.values()))
+    pool = DestinationPool(cfg, registry, max_open=max_open)
 
     from pyducklake import Schema
     from pyducklake.types import IntegerType, NestedField, StringType

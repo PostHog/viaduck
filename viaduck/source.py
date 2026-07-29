@@ -199,6 +199,26 @@ def snapshot_times(table: Table, snapshot_ids: list[int]) -> dict[int, datetime]
     return out
 
 
+def snapshot_bounds(table: Table) -> tuple[int, int] | None:
+    """(earliest, current) snapshot ids in ONE statement, or None if the
+    catalog has no snapshots.
+
+    The poll cycle needs both every cycle (current for the read ceiling,
+    earliest for the retention-edge clamp). DuckDB's postgres scanner does
+    no aggregate pushdown — MIN or MAX each cost a full single-column pull
+    of ducklake_snapshot — so issuing them separately doubles the per-cycle
+    metadata-table tax for nothing. One scan yields both.
+    """
+    catalog_name = table._catalog.name
+    meta_schema = f"__ducklake_metadata_{catalog_name}".replace('"', '""')
+    row = table._catalog.connection.execute(
+        f'SELECT MIN(snapshot_id), MAX(snapshot_id) FROM "{meta_schema}".ducklake_snapshot'
+    ).fetchone()
+    if row is None or row[0] is None or row[1] is None:
+        return None
+    return int(row[0]), int(row[1])
+
+
 def earliest_snapshot_id(table: Table) -> int | None:
     """Get the earliest available snapshot ID, or None if no snapshots exist.
 

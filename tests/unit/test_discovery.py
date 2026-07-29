@@ -141,30 +141,41 @@ class TestMaterialize:
     def _mapped(self):
         return discovery.map_payload(_payload([_warehouse()]))
 
-    def test_builds_destination_with_direct_uri_and_defaults(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="s3cr3t"):
+    def test_builds_destination_with_deferred_uri_source(self):
+        # C3 §5 secret-ref deferral: materialize PROBES the secret (RBAC/
+        # absence validated loudly at startup, cache warmed) but the
+        # config carries the REF — the pool builds the URI per connect,
+        # so rotation heals via evict/recreate. The URI's two stacked
+        # parse layers are covered where the URI is now built:
+        # test_attach_uri_survives_real_attach_parser +
+        # TestDeferredResolution in test_destination.py.
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="s3cr3t") as probe:
             dests = discovery.materialize(self._mapped(), set(), {})
         assert len(dests) == 1
         d = dests[0]
         assert d.id == "org-acme-team-666"
         assert d.routing_value == "666"
         assert d.table == "evilco.events"
-        # TWO stacked parse layers (see build_attach_uri): libpq keyword
-        # form with `postgres:` prefix (round-1 FATAL: postgresql:// URL
-        # hits the FILE backend), then SQL-doubled quotes because
-        # pyducklake embeds this raw inside ATTACH '...' (round-2 FATAL:
-        # un-doubled quotes close the SQL literal → ParserException).
-        # test_attach_uri_survives_real_attach_parser runs it for real.
-        assert d.postgres_uri == (
-            "postgres:host=''cnpg-shard-1-rw.ducklings.svc'' port=''5432'' user=''acme_user'' "
-            "password=''s3cr3t'' dbname=''acme'' sslmode=''disable''"
+        probe.assert_called_once()
+        assert d.postgres_uri_direct is None
+        src = d.uri_source
+        assert src.pg_endpoint == "cnpg-shard-1-rw.ducklings.svc"
+        assert src.pg_username == "acme_user"
+        assert (src.secret_namespace, src.secret_name, src.secret_key) == (
+            "ducklings",
+            "cnpg-tenant-acme-password",
+            "password",
         )
+        assert src.sslmode == "disable"
+        # The property refuses: deferred configs must resolve at the pool.
+        with pytest.raises(Exception, match="deferred credential resolution"):
+            _ = d.postgres_uri
         assert d.schema_projection_enabled is True
         assert d.drop_source_columns == ("captured_at",)
         assert d.properties["memory_limit"] == "8GB"
 
     def test_defaults_overridable(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(
                 self._mapped(),
                 set(),
@@ -172,20 +183,22 @@ class TestMaterialize:
             )
         d = dests[0]
         assert d.properties["memory_limit"] == "4GB"
-        assert d.postgres_uri.endswith("sslmode=''require''")
+        assert d.uri_source.sslmode == "require"
         assert d.drop_source_columns == ()
 
     def test_static_wins_routing_collision(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(self._mapped(), {"666"}, {})
         assert dests == []
 
     def test_password_special_characters_are_quoted(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="p'w\\x @:/"):
-            dests = discovery.materialize(self._mapped(), set(), {})
+        # Quoting now happens where the URI is built — per connect. The
+        # direct build_attach_uri path is the contract:
+        m = self._mapped()[0]
+        uri = discovery.build_attach_uri(m, "p'w\\x @:/", "disable")
         # libpq quoting (backslash-escaped) then SQL doubling of every
         # single quote for the raw ATTACH '...' embedding.
-        assert "password=''p\\''w\\\\x @:/''" in dests[0].postgres_uri
+        assert "password=''p\\''w\\\\x @:/''" in uri
 
     def test_attach_uri_survives_real_attach_parser(self):
         # THE regression test both FATALs demanded: run the produced
@@ -218,29 +231,35 @@ class TestMaterialize:
         assert "Cannot open file" not in msg, f"fell through to the FILE backend: {msg[:200]}"
         assert "Unable to connect" in msg or "Connection refused" in msg, msg[:200]
 
-    def test_uri_never_in_repr(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="SUPERSECRET"):
+    def test_secret_never_in_config_at_all(self):
+        # Stronger than the old repr guard: with the ref deferral the
+        # credential is not IN the config object anywhere — repr, fields,
+        # or otherwise.
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="SUPERSECRET"):
             dests = discovery.materialize(self._mapped(), set(), {})
-        assert "SUPERSECRET" not in repr(dests[0])
+        d = dests[0]
+        assert "SUPERSECRET" not in repr(d)
+        assert d.postgres_uri_direct is None
+        assert "SUPERSECRET" not in repr(d.uri_source)
 
     def test_duplicate_routing_values_deduped_not_crashing(self, _mock_metrics):
         # A CP bug serving the same team twice must degrade the entry,
         # never reach ViaduckConfig validation and crashloop startup.
         mapped = discovery.map_payload(_payload([_warehouse(org="a1"), _warehouse(org="a2")]))
         assert len(mapped) == 2  # same team 666 under two orgs
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(mapped, set(), {})
         assert len(dests) == 1  # first wins
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="duplicate")
 
     def test_static_id_collision_skipped(self, _mock_metrics):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(self._mapped(), set(), {}, static_ids={"org-acme-team-666"})
         assert dests == []
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="id_collision")
 
     def test_secret_failure_skips_and_counts(self, _mock_metrics):
-        with patch("viaduck.discovery.read_secret_key", side_effect=SecretReadError("RBAC denied")):
+        with patch("viaduck.discovery.read_secret_key_cached", side_effect=SecretReadError("RBAC denied")):
             dests = discovery.materialize(self._mapped(), set(), {})
         assert dests == []
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="secret_unreadable")
@@ -408,19 +427,19 @@ class TestAllowlists:
         return discovery.map_payload(_payload([_warehouse()]))
 
     def test_endpoint_outside_suffixes_skipped(self, _mock_metrics):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(self._mapped(), set(), {}, allowed_endpoint_suffixes=(".other.svc",))
         assert dests == []
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="endpoint_not_allowed")
 
     def test_namespace_not_allowed_skipped(self, _mock_metrics):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(self._mapped(), set(), {}, allowed_secret_namespaces=("elsewhere",))
         assert dests == []
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="namespace_not_allowed")
 
     def test_defaults_pass_the_standard_convention(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(
                 self._mapped(),
                 set(),
@@ -449,7 +468,7 @@ class TestMaterializeDeadline:
         def slow_read(*a, **k):
             return "pw"
 
-        with patch("viaduck.discovery.read_secret_key", side_effect=slow_read):
+        with patch("viaduck.discovery.read_secret_key_cached", side_effect=slow_read):
             with patch("viaduck.discovery.time.monotonic", side_effect=lambda: next(clock, 100.0)):
                 dests = discovery.materialize(mapped, set(), {}, deadline_s=10.0)
         assert len(dests) == 1
@@ -457,8 +476,203 @@ class TestMaterializeDeadline:
 
     def test_heartbeat_called_per_entry(self):
         beats = []
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             discovery.materialize(
                 discovery.map_payload(_payload([_warehouse()])), set(), {}, heartbeat=lambda: beats.append(1)
             )
         assert beats == [1]
+
+
+class TestClassifiedView:
+    """C3 stage 3 (v6 two-predicate model): MENTIONED vs STARTABLE on the
+    RAW payload — a mentioned-but-unstartable tenant (fenced, degraded)
+    is never absent; the why lives in broken_entries counters only."""
+
+    def test_fenced_warehouse_teams_mentioned_not_startable(self):
+        wh = _warehouse()
+        wh["writable"] = False
+        wh["state"] = "resharding"
+        view = discovery.classify_payload(_payload([wh]))
+        e = view.entries["org-acme-team-666"]
+        assert not e.startable
+        assert e.mapped is None
+        assert not view.parse_poisoned
+
+    def test_degraded_warehouse_teams_mentioned_not_startable(self):
+        for mutate in (
+            lambda w: w.pop("bucket"),
+            lambda w: w["metadata_store"].pop("endpoint"),
+            lambda w: w["metadata_store"].pop("password_secret_ref"),
+        ):
+            wh = _warehouse()
+            mutate(wh)
+            view = discovery.classify_payload(_payload([wh]))
+            e = view.entries["org-acme-team-666"]
+            assert not e.startable
+            assert not view.parse_poisoned
+
+    def test_missing_events_table_is_mentioned_not_poison(self):
+        # The id is NAMEABLE (team_id present) — degraded, not absent,
+        # and not a whole-view freeze.
+        wh = _warehouse()
+        wh["teams"][0].pop("events_table")
+        view = discovery.classify_payload(_payload([wh]))
+        e = view.entries["org-acme-team-666"]
+        assert not e.startable
+        assert not view.parse_poisoned
+
+    def test_unnameable_content_poisons_the_view(self):
+        # A team row with no team_id cannot produce an id — that id would
+        # falsely read as ABSENT, so the WHOLE view freezes absence
+        # evaluation; parseable entries still classify.
+        wh = _warehouse()
+        wh["teams"].append({"events_table": "x.events"})  # no team_id
+        view = discovery.classify_payload(_payload([wh]))
+        assert view.parse_poisoned
+        assert view.entries["org-acme-team-666"].startable
+
+    def test_unparseable_warehouse_poisons_the_view(self):
+        view = discovery.classify_payload(_payload([_warehouse(), {"org_id": "bad", "writable": True, "teams": 7}]))
+        assert view.parse_poisoned
+        assert view.entries["org-acme-team-666"].startable
+
+    def test_duplicate_ids_first_wins_in_entries_preserved_in_list(self):
+        view = discovery.classify_payload(_payload([_warehouse(org="acme"), _warehouse(org="acme")]))
+        assert len(view.entry_list) == 2  # map_payload/materialize dedupe sees both
+        assert len(view.entries) == 1
+
+    def test_map_payload_is_the_startable_projection(self):
+        wh_ok = _warehouse()
+        wh_fenced = _warehouse(org="fenced")
+        wh_fenced["writable"] = False
+        mapped = discovery.map_payload(_payload([wh_ok, wh_fenced]))
+        assert [m.dest_id for m in mapped] == ["org-acme-team-666"]
+
+
+class TestDeriveAbsent:
+    def _registry(self, static_ids=(), discovered_ids=()):
+        from viaduck.config import DestinationConfig
+        from viaduck.registry import DestinationRegistry
+
+        def _cfg(did, rv):
+            return DestinationConfig(
+                id=did,
+                routing_value=rv,
+                name=did,
+                postgres_uri_env="X",
+                data_path="/d",
+                table="t",
+            )
+
+        reg = DestinationRegistry()
+        for i, did in enumerate(static_ids):
+            reg.add(_cfg(did, f"s{i}"), origin="static")
+        for i, did in enumerate(discovered_ids):
+            reg.add(_cfg(did, f"d{i}"), origin="discovered")
+        return reg
+
+    def _view(self, ids, poisoned=False):
+        return discovery.ClassifiedView(
+            generation=1,
+            fetched_at=0.0,
+            entry_list=tuple(discovery.ClassifiedEntry(dest_id=d, mapped=None) for d in ids),
+            parse_poisoned=poisoned,
+        )
+
+    def test_statics_never_enter_absence_evaluation(self):
+        # THE scoping invariant (C3 §4): statics are never in the CP view;
+        # without discovered-origin scoping the first evaluation would
+        # stop every static.
+        reg = self._registry(static_ids=("team-2", "s2"), discovered_ids=("dyn-a",))
+        absent = discovery.derive_absent(self._view([]), reg.snapshot())
+        assert absent == frozenset({"dyn-a"})
+
+    def test_any_classification_is_not_absent(self):
+        reg = self._registry(discovered_ids=("dyn-a", "dyn-b"))
+        # dyn-a mentioned (even unstartable) -> not absent; dyn-b missing.
+        assert discovery.derive_absent(self._view(["dyn-a"]), reg.snapshot()) == frozenset({"dyn-b"})
+
+    def test_poisoned_or_missing_view_freezes_absence(self):
+        reg = self._registry(discovered_ids=("dyn-a",))
+        assert discovery.derive_absent(self._view([], poisoned=True), reg.snapshot()) == frozenset()
+        assert discovery.derive_absent(None, reg.snapshot()) == frozenset()
+
+    def test_already_unroutable_ids_not_reported(self):
+        # A deactivated (removed-from-routing) id must not re-tick absence.
+        reg = self._registry(discovered_ids=("dyn-a", "dyn-b"))
+        reg.remove("dyn-a")
+        assert discovery.derive_absent(self._view([]), reg.snapshot()) == frozenset({"dyn-b"})
+
+
+class TestDriftWatcherPublishesView:
+    def test_latest_none_until_poll_then_replaced_whole(self):
+        w = discovery.DriftWatcher(
+            url="http://cp/x",
+            auth_header=None,
+            timeout_s=1.0,
+            poll_interval_s=60.0,
+            baseline={},
+            startup_generation=-1,
+        )
+        assert w.latest() is None
+        with patch("viaduck.discovery.fetch", return_value=_payload([_warehouse()])):
+            w._poll_once()
+        v1 = w.latest()
+        assert v1 is not None
+        assert v1.entries["org-acme-team-666"].startable
+        with patch("viaduck.discovery.fetch", return_value=_payload([_warehouse()])):
+            w._poll_once()
+        v2 = w.latest()
+        # Replaced whole: staleness is object identity, never generation
+        # equality (generations legitimately repeat).
+        assert v2 is not v1
+
+    def test_fenced_warehouse_unnameable_team_row_still_poisons(self):
+        # The id is unnameable regardless of fence state — poison applies
+        # under an unstartable warehouse too (deliberate cadence change
+        # vs the pre-v6 parser, which never scanned fenced teams).
+        wh = _warehouse()
+        wh["writable"] = False
+        wh["teams"].append({"events_table": "x.events"})  # no team_id
+        view = discovery.classify_payload(_payload([wh]))
+        assert view.parse_poisoned
+        assert not view.entries["org-acme-team-666"].startable
+
+    def test_unstartable_warehouse_counts_single_warehouse_reason(self, _mock_metrics):
+        # elif precedence: unwritable + missing bucket counts not_writable
+        # ONLY (same as the pre-v6 parser).
+        wh = _warehouse()
+        wh["writable"] = False
+        wh.pop("bucket")
+        discovery.classify_payload(_payload([wh]))
+        assert _mock_metrics.discovery_broken_entries_total.labels.call_count == 1
+        _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="not_writable")
+
+    def test_mixed_duplicate_prefers_startable_occurrence(self):
+        # F7: unstartable(acme) then startable(acme) for the same id —
+        # entries must agree with materialize (which dedupes over the
+        # startable-only list): the startable occurrence wins.
+        wh_fenced = _warehouse()
+        wh_fenced["writable"] = False
+        view = discovery.classify_payload(_payload([wh_fenced, _warehouse()]))
+        assert view.entries["org-acme-team-666"].startable
+
+    def test_failed_fetch_keeps_previous_view(self):
+        w = discovery.DriftWatcher(
+            url="http://cp/x",
+            auth_header=None,
+            timeout_s=1.0,
+            poll_interval_s=60.0,
+            baseline={},
+            startup_generation=-1,
+        )
+        with patch("viaduck.discovery.fetch", return_value=_payload([_warehouse()])):
+            w._poll_once()
+        v1 = w.latest()
+        with (
+            patch("viaduck.discovery.fetch", side_effect=discovery.DiscoveryError("cp down")),
+            pytest.raises(discovery.DiscoveryError),
+        ):
+            w._poll_once()
+        # The consumer detects staleness by identity: same object.
+        assert w.latest() is v1

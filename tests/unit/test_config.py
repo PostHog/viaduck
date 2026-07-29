@@ -914,3 +914,32 @@ def test_load_destination_partition_by_defaults_to_empty(config_file):
     cfg = load(config_file)
     for dest in cfg.destinations:
         assert dest.partition_by == ()
+
+
+def test_discovery_secret_cache_ttl_loads_from_yaml(tmp_path):
+    # Review F1: a YAML key the loader ignores is a silent misconfig —
+    # the validation in __post_init__ would be dead code for the YAML
+    # path without this wiring.
+    import yaml
+
+    from viaduck.config import load
+
+    cfg_yaml = {
+        "source": {"name": "s", "postgres_uri_env": "SRC", "data_path": "/d", "table": "t"},
+        "routing": {"field": "company", "mode": "append_only"},
+        "destinations": [
+            {
+                "id": "d1",
+                "routing_value": "a",
+                "name": "n",
+                "postgres_uri_env": "DST",
+                "data_path": "/d",
+                "table": "t",
+            }
+        ],
+        "discovery": {"secret_cache_ttl_s": 600},
+    }
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(yaml.safe_dump(cfg_yaml))
+    cfg = load(str(p))
+    assert cfg.discovery.secret_cache_ttl_s == 600.0

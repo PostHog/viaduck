@@ -65,6 +65,7 @@ from viaduck.apply import _require_non_null_rowids
 from viaduck.arrowutil import full_bool, row_indices
 from viaduck.delivery import DeliveryManager
 from viaduck.destination import DestinationPool
+from viaduck.registry import DestinationRegistry
 from viaduck.router import Router, RoutingError
 from viaduck.server import DestStatus, health, status
 from viaduck.state import StateManager
@@ -499,6 +500,10 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
     key_columns = cfg.routing.key_columns
 
     for dest_id in new_dest_ids:
+        # Startup-only path with the post-merge cfg passed per call — the
+        # same object the registry was built from, so this is not the
+        # stale-STARTUP-capture class. If seeding is ever reused for a
+        # mid-run add, resolve via the registry instead.
         dest_cfg = cfg.destination_by_id(dest_id)
         routing_value = dest_cfg.routing_value
 
@@ -722,6 +727,8 @@ def run(cfg: config.ViaduckConfig) -> None:
         baseline: dict[str, disco.MappedDestination] = {}
         generation = -1
         discovered: list = []
+        static_routing_values = {d.routing_value for d in cfg.destinations}
+        static_only_ids = {d.id for d in cfg.destinations}
         try:
             auth = cfg.discovery.auth_header()
             payload = None
@@ -745,9 +752,9 @@ def run(cfg: config.ViaduckConfig) -> None:
                 )
             discovered = disco.materialize(
                 mapped,
-                {d.routing_value for d in cfg.destinations},
+                static_routing_values,
                 cfg.discovery.defaults,
-                static_ids={d.id for d in cfg.destinations},
+                static_ids=static_only_ids,
                 # Bounded wall time: N sequential Secret reads against a
                 # blackholed API server must not eat the liveness grace
                 # and crashloop static tenants (round-2 review). The
@@ -755,6 +762,7 @@ def run(cfg: config.ViaduckConfig) -> None:
                 deadline_s=cfg.discovery.materialize_deadline_s,
                 heartbeat=health.record_poll,
                 secret_timeout_s=cfg.discovery.request_timeout_s,
+                secret_cache_ttl_s=cfg.discovery.secret_cache_ttl_s,
                 allowed_endpoint_suffixes=cfg.discovery.allowed_endpoint_suffixes,
                 allowed_secret_namespaces=cfg.discovery.allowed_secret_namespaces,
             )
@@ -807,20 +815,19 @@ def run(cfg: config.ViaduckConfig) -> None:
             poll_interval_s=cfg.discovery.poll_interval_s,
             baseline=baseline,
             startup_generation=generation,
+            apply_mode=cfg.discovery.apply_enabled,
         )
-    # The pool and everything below MUST see the post-merge cfg — the
-    # pool resolves destination configs by id at flush time, and a pool
-    # holding the pre-merge cfg makes every discovered destination buffer
-    # forever without ever flushing (round-2 review CRITICAL; the third
-    # stale-captured-config defect in this effort — construct consumers
-    # AFTER the last cfg rebind).
-    dest_pool = DestinationPool(cfg, max_open=cfg.delivery.pool_max_open)
+    # The registry is built from the post-merge cfg and is THE runtime
+    # resolution path for destination configs — the pool, the poll cycle,
+    # and the status export all read through it (or a per-cycle snapshot
+    # of it), never through the frozen startup cfg. That capture-at-
+    # startup pattern produced three separate stale-config defects in the
+    # discovery effort; see viaduck/registry.py.
+    registry = DestinationRegistry.from_configs(cfg.destinations, discovered_ids=discovered_ids)
+    dest_pool = DestinationPool(cfg, registry, max_open=cfg.delivery.pool_max_open)
     # Cache source schema for destination table creation.
     # `Table.schema` is a property in pyducklake — do not call it.
     dest_pool.set_source_schema(src_table.schema)
-
-    # Build routing_value -> dest_id mapping
-    rv_to_dest: dict[str, str] = {d.routing_value: d.id for d in cfg.destinations}
 
     assigned_ids = cfg.assigned_destination_ids()
 
@@ -839,8 +846,12 @@ def run(cfg: config.ViaduckConfig) -> None:
             retired_ids,
         )
     assigned_ids = [d for d in assigned_ids if d not in retired_ids]
-    rv_to_dest = {rv: did for rv, did in rv_to_dest.items() if did not in retired_ids}
     for did in retired_ids:
+        # Retired = not routable. The registry retains the config entry
+        # (never-delete: an in-flight anything must still resolve it) but
+        # drops it from the routing index, which is what excludes it from
+        # every per-cycle rv_to_dest below.
+        registry.remove(did)
         # Sever the resume point: re-add = new tenant = fresh seed. Also
         # done per-cycle for a mid-run retire; this is the restart backstop.
         state_mgr.delete_destination_state(did)
@@ -927,6 +938,33 @@ def run(cfg: config.ViaduckConfig) -> None:
         cfg.instance.id,
     )
 
+    reconciler = None
+    if drift_watcher is not None and cfg.discovery.apply_enabled:
+        from viaduck.reconciler import Reconciler
+
+        reconciler = Reconciler(
+            cfg,
+            registry,
+            delivery,
+            dest_pool,
+            tracker,
+            state_mgr,
+            static_routing_values=static_routing_values,
+            static_ids=static_only_ids,
+            baseline_mapped=dict(baseline),
+            src_head_fn=lambda: source.current_snapshot_id(src_table),
+            heartbeat=health.record_poll,
+        )
+        log.info(
+            "C3 reconciler ACTIVE (discovery.apply_enabled=true): CP-driven start/stop/restart, "
+            "k=%d clean fetches to stop, floor=%.0f%% (min_destinations=%d), "
+            "restart_min_interval_s=%.0f",
+            cfg.discovery.absent_stop_fetches,
+            cfg.discovery.stop_floor_fraction * 100,
+            cfg.discovery.min_destinations,
+            cfg.discovery.restart_min_interval_s,
+        )
+
     if drift_watcher is not None:
         drift_watcher.start()
 
@@ -942,12 +980,24 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     while not shutdown:
         try:
+            # C3 reconciler: apply the latest classified view BEFORE this
+            # cycle's lifecycle load and read planning, so an activation
+            # delivers this cycle and the retention-edge clamp covers a
+            # re-added stale cursor before its first read.
+            if reconciler is not None:
+                reconciler.apply(drift_watcher.latest())
+            # LIVE membership: the delivery manager's active set is the
+            # single authority (statics + reconciler adds − reconciler
+            # removes); with the reconciler off it equals the startup
+            # capture. Feeds the lifecycle load, read gating, and the
+            # status export.
+            current_ids = sorted(delivery.active_ids())
             # Refresh operator lifecycle intent. A state-store blip keeps
             # the last-known states (fail-safe: intent changes rarely; not
             # delivering on a stale ACTIVE would be worse than delivering
             # one cycle late on a stale PAUSE).
             try:
-                lifecycle_rows = state_mgr.load_lifecycle_rows(assigned_ids)
+                lifecycle_rows = state_mgr.load_lifecycle_rows(current_ids)
                 raw_lifecycle = {d: r["state"] for d, r in lifecycle_rows.items()}
             except Exception:
                 log.warning("Lifecycle state load failed; keeping last-known states", exc_info=True)
@@ -964,18 +1014,23 @@ def run(cfg: config.ViaduckConfig) -> None:
                         d,
                     )
 
+            # ONE immutable registry snapshot per cycle: routing, config
+            # resolution, and status all read this view — no mid-cycle
+            # reads of the live registry (C3 §5).
+            reg_snap = registry.snapshot()
             _poll_cycle(
                 src_table,
                 delivery,
                 dest_pool,
                 router,
                 cfg,
-                assigned_ids,
-                rv_to_dest,
+                current_ids,
+                reg_snap.rv_to_dest,
                 key_columns,
                 mode,
                 read_ids=read_ids,
                 lifecycle_states=tracker.states(),
+                dest_configs=reg_snap.configs,
             )
         except Exception:
             log.exception("Fatal error in poll cycle")
@@ -1069,6 +1124,58 @@ def _export_dest_time_lag(src_table, delivery_snapshot, assigned_ids, snap_now: 
             log.debug("time-lag export failed; skipping this cycle", exc_info=True)
 
 
+def _clamp_expired_cursors(delivery, dest_ids, earliest_snapshot) -> set[str]:
+    """Retention-edge clamp (bug fix, not policy): advance any cursor that
+    has fallen below the earliest retained source snapshot up to the edge,
+    acknowledging the expired range — loudly (WARNING + counter, emitted
+    by DeliveryManager.clamp_to_retention, which owns the race-safe
+    check-and-stamp).
+
+    Without this, the CDC read from an expired cursor raises inside the
+    poll cycle and the run loop's fatal-error handler exits the loop: ONE
+    destination whose cursor outlived snapshot retention (re-add after a
+    long stop, a pause that outlived retention, a multi-day flush-failure
+    loop) takes delivery down for the WHOLE instance.
+
+    The clamp floor is earliest-1: reads are exclusive of the cursor, so a
+    cursor at earliest-1 reads from the oldest retained snapshot. Keyed on
+    the durable cursor (not position): flushed below the floor with
+    position above it is the flush-failure rewind hazard — the rewind goes
+    to flushed, and the next read from there would be the fatal one.
+
+    Failures are contained PER DESTINATION: one candidate's state-store
+    blip must not abort its peers' clamps, and a destination whose clamp
+    failed is returned so the caller excludes it from this cycle's reads —
+    proceeding to read from its still-expired cursor would be the exact
+    fatal path this function exists to remove. Retried next cycle.
+    """
+    still_expired: set[str] = set()
+    if earliest_snapshot is None:
+        return still_expired
+    floor = earliest_snapshot - 1
+    try:
+        flushed = delivery.flushed_snapshots()
+    except Exception:
+        log.warning("Retention-edge clamp check failed; skipping this cycle", exc_info=True)
+        return still_expired
+    for did in dest_ids:
+        if flushed.get(did, floor) >= floor:
+            continue
+        try:
+            delivery.clamp_to_retention(did, floor)
+        except Exception:
+            still_expired.add(did)
+            log.warning(
+                "Retention-edge clamp for %s failed (cursor %d < earliest retained %d); "
+                "excluding it from this cycle's reads, retrying next cycle",
+                did,
+                flushed[did],
+                earliest_snapshot,
+                exc_info=True,
+            )
+    return still_expired
+
+
 def _poll_cycle(
     src_table,
     delivery,
@@ -1082,6 +1189,7 @@ def _poll_cycle(
     *,
     read_ids=None,
     lifecycle_states=None,
+    dest_configs=None,
 ):
     # Local boolean so the existing branch sites stay terse. Threading mode
     # (not full_cdc) through the call signature avoids reconstructing the
@@ -1093,6 +1201,12 @@ def _poll_cycle(
         read_ids = assigned_ids
     if lifecycle_states is None:
         lifecycle_states = {}
+    # Production passes the per-cycle registry snapshot's config view; the
+    # per-call cfg derivation is the test-harness convenience (deriving
+    # from an argument passed each call is not the stale-STARTUP-capture
+    # defect the registry exists to prevent).
+    if dest_configs is None:
+        dest_configs = {d.id: d for d in cfg.destinations}
     """One poll cycle: read CDC from each position group into buffers,
     advance in-memory positions, evaluate flush triggers.
 
@@ -1107,7 +1221,11 @@ def _poll_cycle(
     cycle_rows_read = 0
     cycle_groups_processed = 0
 
-    current_id = source.current_snapshot_id(src_table)
+    # One combined MIN/MAX statement: the postgres scanner does no aggregate
+    # pushdown, so separate earliest/current queries would each pull the
+    # full snapshot-id column per cycle.
+    bounds = source.snapshot_bounds(src_table)
+    earliest_id, current_id = bounds if bounds is not None else (None, None)
     if current_id is not None:
         metrics.source_snapshot_id.set(current_id)
 
@@ -1117,6 +1235,14 @@ def _poll_cycle(
             _log_watermark_paused("all destinations at buffer cap")
         else:
             _log_watermark_cleared()
+            # Retention-edge clamp BEFORE the plan snapshot, so a clamped
+            # destination's read starts from the clamped cursor this cycle.
+            # A destination whose clamp FAILED sits out this cycle's reads:
+            # reading from its still-expired cursor would raise, and the
+            # run loop treats poll-cycle errors as fatal.
+            still_expired = _clamp_expired_cursors(delivery, read_ids, earliest_id)
+            if still_expired:
+                read_ids = [d for d in read_ids if d not in still_expired]
             plan = delivery.read_plan()
             positions = {d: pos for d, (pos, _epoch) in plan.items()}
             epochs = {d: epoch for d, (_pos, epoch) in plan.items()}
@@ -1172,7 +1298,7 @@ def _poll_cycle(
                     if not readable:
                         log.debug("Pausing reads for group at %d: all destinations at buffer cap", start_snap)
                         break
-                    routing_values = [cfg.destination_by_id(d).routing_value for d in readable]
+                    routing_values = [dest_configs[d].routing_value for d in readable]
                     filter_expr = router.build_filter_expr(routing_values)
                     group_read_anything = True
                     chunk_end = min(chunk_start + chunk_size, current_id)
@@ -1262,6 +1388,24 @@ def _poll_cycle(
                         delivery.maybe_flush()
                         chunk_start = chunk_end
 
+                    except Exception:
+                        # Contain read/route/buffer failures to THIS group:
+                        # letting them propagate makes the run loop exit for
+                        # the whole instance. The residual retention-expiry
+                        # race lands here too (the floor is computed once
+                        # per cycle; an expiry job advancing it mid-cycle
+                        # makes this group's read raise — next cycle's clamp
+                        # absorbs it). Source-connection death still exits
+                        # via snapshot_bounds at the top of the cycle, so a
+                        # dead catalog connection keeps its restart-to-heal
+                        # behavior.
+                        log.exception(
+                            "CDC read failed for group at %d (chunk %s); skipping group this cycle",
+                            start_snap,
+                            snap_range,
+                        )
+                        metrics.errors_total.labels(type="cdc_read", destination="").inc()
+                        break
                     finally:
                         _hb.set()
 
@@ -1279,8 +1423,14 @@ def _poll_cycle(
     snap_now = current_id if current_id is not None else 0
     dest_statuses = []
     delivery_snapshot = delivery.status_snapshot()
-    _export_dest_time_lag(src_table, delivery_snapshot, assigned_ids, snap_now)
-    for did in assigned_ids:
+    # status_snapshot() is active-filtered and assigned_ids is the
+    # caller's per-cycle membership (delivery.active_ids() in production).
+    # The two are computed a few lines apart, so the intersection keeps a
+    # reconciler mutation landing between them from KeyError-ing the
+    # cycle (which the run loop treats as fatal).
+    status_ids = [d for d in assigned_ids if d in delivery_snapshot]
+    _export_dest_time_lag(src_table, delivery_snapshot, status_ids, snap_now)
+    for did in status_ids:
         d = delivery_snapshot[did]
         lag = max(snap_now - d.flushed_snapshot, 0)
         metrics.dest_lag_snapshots.labels(destination=did).set(lag)
@@ -1290,7 +1440,7 @@ def _poll_cycle(
         dest_statuses.append(
             DestStatus(
                 id=did,
-                routing_value=cfg.destination_by_id(did).routing_value,
+                routing_value=dest_configs[did].routing_value,
                 snapshot=d.flushed_snapshot,
                 lag=lag,
                 rows_replicated=d.rows_replicated,
@@ -1329,8 +1479,8 @@ def _poll_cycle(
     # idleness doesn't flood the log; verbose when there's work to report.
     cycle_secs = time.monotonic() - cycle_t0
     if cycle_groups_processed > 0 or cycle_rows_read > 0 or flushes_submitted > 0:
-        max_lag = max((snap_now - delivery_snapshot[did].flushed_snapshot) for did in assigned_ids)
-        buffered_rows = sum(delivery_snapshot[did].buffer_rows for did in assigned_ids)
+        max_lag = max(((snap_now - delivery_snapshot[did].flushed_snapshot) for did in status_ids), default=0)
+        buffered_rows = sum(delivery_snapshot[did].buffer_rows for did in status_ids)
         log.info(
             "Poll cycle: snapshot=%d, groups=%d, cdc_rows_read=%d, buffered_rows=%d, "
             "flushes_submitted=%d, max_lag=%d, duration=%.2fs",
