@@ -239,6 +239,25 @@ class RoutingConfig:
 
 
 @dataclass(frozen=True)
+class DeferredUriSource:
+    """Connection parts + k8s Secret reference for a discovered
+    destination whose password is resolved at connection-create time
+    (C3 §5 secret-ref deferral) instead of baked into a URI at startup.
+    Field names deliberately mirror discovery.MappedDestination so
+    discovery.build_attach_uri accepts either. Carries NO credential
+    material — safe to repr/log."""
+
+    pg_endpoint: str
+    pg_port: int
+    pg_database: str
+    pg_username: str
+    secret_namespace: str
+    secret_name: str
+    secret_key: str
+    sslmode: str = "disable"
+
+
+@dataclass(frozen=True)
 class DestinationConfig:
     id: str
     routing_value: str
@@ -282,9 +301,21 @@ class DestinationConfig:
     # keep the env indirection). NEVER log this value — unlike
     # postgres_uri_env it IS the credential, not a pointer to one.
     postgres_uri_direct: str | None = field(default=None, repr=False)
+    # Deferred credential resolution (C3 §5): discovered destinations
+    # carry the secret REF + connection parts; DestinationPool._create
+    # resolves the password (TTL-cached, stale-fallback) and builds the
+    # attach URI per connect. Password rotation heals via ordinary
+    # evict/recreate instead of a pod restart. Mutually exclusive with
+    # postgres_uri_direct in practice (discovery sets exactly one).
+    uri_source: DeferredUriSource | None = None
 
     @property
     def postgres_uri(self) -> str:
+        if self.uri_source is not None:
+            raise ConfigError(
+                f"destination {self.id!r} uses deferred credential resolution; "
+                "the attach URI must be built at connection-create time (DestinationPool._create)"
+            )
         if self.postgres_uri_direct is not None:
             return self.postgres_uri_direct
         return _resolve_env_value(self.postgres_uri_env)
@@ -444,6 +475,15 @@ class DiscoveryConfig:
     # allow anything (NOT recommended outside tests).
     allowed_endpoint_suffixes: tuple[str, ...] = (".ducklings.svc", ".ducklings.svc.cluster.local")
     allowed_secret_namespaces: tuple[str, ...] = ("ducklings",)
+    # TTL for the k8s Secret read cache on the pool's connect path
+    # (viaduck/k8s_secrets.py). Discovered destinations carry a secret
+    # REF, resolved at connection-create time — with fleets above
+    # pool_max_open, LRU churn makes that a routine flush-path event, so
+    # the cache (with stale-fallback on API failure) keeps an API-server
+    # outage from becoming fleet-wide flush failures. Password rotation
+    # heals within one TTL, or immediately via the flush-failure
+    # evict/recreate path (which hits the API once the TTL lapses).
+    secret_cache_ttl_s: float = 300.0
     defaults: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -453,6 +493,8 @@ class DiscoveryConfig:
             raise ConfigError("discovery.auth_header_name and discovery.auth_token_env must be set together")
         if self.poll_interval_s <= 0 or self.request_timeout_s <= 0 or self.materialize_deadline_s <= 0:
             raise ConfigError("discovery poll_interval_s/request_timeout_s/materialize_deadline_s must be positive")
+        if self.secret_cache_ttl_s <= 0:
+            raise ConfigError("discovery.secret_cache_ttl_s must be positive")
         if self.min_destinations < 0:
             raise ConfigError("discovery.min_destinations must be >= 0")
         d = self.defaults
@@ -767,6 +809,7 @@ def load(path: str | Path) -> ViaduckConfig:
             request_timeout_s=float(disc_raw.get("request_timeout_s", 10.0)),
             min_destinations=int(disc_raw.get("min_destinations", 1)),
             materialize_deadline_s=float(disc_raw.get("materialize_deadline_s", 60.0)),
+            secret_cache_ttl_s=float(disc_raw.get("secret_cache_ttl_s", 300.0)),
             allowed_endpoint_suffixes=tuple(
                 disc_raw.get("allowed_endpoint_suffixes", [".ducklings.svc", ".ducklings.svc.cluster.local"])
             ),

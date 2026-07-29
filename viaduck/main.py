@@ -760,6 +760,7 @@ def run(cfg: config.ViaduckConfig) -> None:
                 deadline_s=cfg.discovery.materialize_deadline_s,
                 heartbeat=health.record_poll,
                 secret_timeout_s=cfg.discovery.request_timeout_s,
+                secret_cache_ttl_s=cfg.discovery.secret_cache_ttl_s,
                 allowed_endpoint_suffixes=cfg.discovery.allowed_endpoint_suffixes,
                 allowed_secret_namespaces=cfg.discovery.allowed_secret_namespaces,
             )

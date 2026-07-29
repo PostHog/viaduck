@@ -53,8 +53,8 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from viaduck import metrics
-from viaduck.config import DestinationConfig
-from viaduck.k8s_secrets import SecretReadError, read_secret_key
+from viaduck.config import DeferredUriSource, DestinationConfig
+from viaduck.k8s_secrets import SecretReadError, read_secret_key_cached
 from viaduck.scrub import scrub_credentials
 
 log = logging.getLogger(__name__)
@@ -148,7 +148,7 @@ def _libpq_quote(value: str) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def build_attach_uri(m: MappedDestination, password: str, sslmode: str) -> str:
+def build_attach_uri(m: MappedDestination | DeferredUriSource, password: str, sslmode: str) -> str:
     """DuckLake ATTACH connection string. TWO parsing layers stack here
     and each has bitten a review round:
 
@@ -262,6 +262,7 @@ def materialize(
     deadline_s: float = 60.0,
     heartbeat=None,
     secret_timeout_s: float = 10.0,
+    secret_cache_ttl_s: float = 300.0,
     allowed_endpoint_suffixes: tuple[str, ...] = (),
     allowed_secret_namespaces: tuple[str, ...] = (),
 ) -> list[DestinationConfig]:
@@ -315,13 +316,29 @@ def materialize(
             _broken("duplicate", f"{m.dest_id}: payload served routing value {rv} or id more than once (first wins)")
             continue
         try:
-            password = read_secret_key(m.secret_namespace, m.secret_name, m.secret_key, timeout_s=secret_timeout_s)
+            # Materializability PROBE (C3 §4/§5): the password is NOT
+            # baked into the config — the pool resolves the ref at
+            # connection-create time (TTL cache, stale-fallback), so
+            # rotation heals via ordinary evict/recreate. The probe keeps
+            # startup RBAC/absence validation loud (secret_unreadable
+            # counter) and warms the cache so the first flush does no
+            # API read. STAGE-4 NOTE: at startup the cache is always cold,
+            # so this genuinely validates. A stage-4 activate/fence-release
+            # materializability check must probe with ttl_s=0 and must NOT
+            # stale-fallback — "validate now" and "keep flushing" want
+            # different failure semantics; don't reuse this call shape.
+            read_secret_key_cached(
+                m.secret_namespace,
+                m.secret_name,
+                m.secret_key,
+                ttl_s=secret_cache_ttl_s,
+                timeout_s=secret_timeout_s,
+            )
         except SecretReadError as e:
             _broken("secret_unreadable", f"{m.dest_id}: {e}")
             continue
         seen_rvs.add(rv)
         seen_ids.add(m.dest_id)
-        uri = build_attach_uri(m, password, defaults.get("sslmode", "disable"))
         props = {"memory_limit": defaults.get("memory_limit", "8GB")}
         props.update(defaults.get("properties", {}))
         out.append(
@@ -330,7 +347,16 @@ def materialize(
                 routing_value=rv,
                 name=m.dest_id,
                 postgres_uri_env="",
-                postgres_uri_direct=uri,
+                uri_source=DeferredUriSource(
+                    pg_endpoint=m.pg_endpoint,
+                    pg_port=m.pg_port,
+                    pg_database=m.pg_database,
+                    pg_username=m.pg_username,
+                    secret_namespace=m.secret_namespace,
+                    secret_name=m.secret_name,
+                    secret_key=m.secret_key,
+                    sslmode=defaults.get("sslmode", "disable"),
+                ),
                 data_path=m.data_path,
                 table=m.table,
                 properties=props,

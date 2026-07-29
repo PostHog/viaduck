@@ -141,30 +141,41 @@ class TestMaterialize:
     def _mapped(self):
         return discovery.map_payload(_payload([_warehouse()]))
 
-    def test_builds_destination_with_direct_uri_and_defaults(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="s3cr3t"):
+    def test_builds_destination_with_deferred_uri_source(self):
+        # C3 §5 secret-ref deferral: materialize PROBES the secret (RBAC/
+        # absence validated loudly at startup, cache warmed) but the
+        # config carries the REF — the pool builds the URI per connect,
+        # so rotation heals via evict/recreate. The URI's two stacked
+        # parse layers are covered where the URI is now built:
+        # test_attach_uri_survives_real_attach_parser +
+        # TestDeferredResolution in test_destination.py.
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="s3cr3t") as probe:
             dests = discovery.materialize(self._mapped(), set(), {})
         assert len(dests) == 1
         d = dests[0]
         assert d.id == "org-acme-team-666"
         assert d.routing_value == "666"
         assert d.table == "evilco.events"
-        # TWO stacked parse layers (see build_attach_uri): libpq keyword
-        # form with `postgres:` prefix (round-1 FATAL: postgresql:// URL
-        # hits the FILE backend), then SQL-doubled quotes because
-        # pyducklake embeds this raw inside ATTACH '...' (round-2 FATAL:
-        # un-doubled quotes close the SQL literal → ParserException).
-        # test_attach_uri_survives_real_attach_parser runs it for real.
-        assert d.postgres_uri == (
-            "postgres:host=''cnpg-shard-1-rw.ducklings.svc'' port=''5432'' user=''acme_user'' "
-            "password=''s3cr3t'' dbname=''acme'' sslmode=''disable''"
+        probe.assert_called_once()
+        assert d.postgres_uri_direct is None
+        src = d.uri_source
+        assert src.pg_endpoint == "cnpg-shard-1-rw.ducklings.svc"
+        assert src.pg_username == "acme_user"
+        assert (src.secret_namespace, src.secret_name, src.secret_key) == (
+            "ducklings",
+            "cnpg-tenant-acme-password",
+            "password",
         )
+        assert src.sslmode == "disable"
+        # The property refuses: deferred configs must resolve at the pool.
+        with pytest.raises(Exception, match="deferred credential resolution"):
+            _ = d.postgres_uri
         assert d.schema_projection_enabled is True
         assert d.drop_source_columns == ("captured_at",)
         assert d.properties["memory_limit"] == "8GB"
 
     def test_defaults_overridable(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(
                 self._mapped(),
                 set(),
@@ -172,20 +183,22 @@ class TestMaterialize:
             )
         d = dests[0]
         assert d.properties["memory_limit"] == "4GB"
-        assert d.postgres_uri.endswith("sslmode=''require''")
+        assert d.uri_source.sslmode == "require"
         assert d.drop_source_columns == ()
 
     def test_static_wins_routing_collision(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(self._mapped(), {"666"}, {})
         assert dests == []
 
     def test_password_special_characters_are_quoted(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="p'w\\x @:/"):
-            dests = discovery.materialize(self._mapped(), set(), {})
+        # Quoting now happens where the URI is built — per connect. The
+        # direct build_attach_uri path is the contract:
+        m = self._mapped()[0]
+        uri = discovery.build_attach_uri(m, "p'w\\x @:/", "disable")
         # libpq quoting (backslash-escaped) then SQL doubling of every
         # single quote for the raw ATTACH '...' embedding.
-        assert "password=''p\\''w\\\\x @:/''" in dests[0].postgres_uri
+        assert "password=''p\\''w\\\\x @:/''" in uri
 
     def test_attach_uri_survives_real_attach_parser(self):
         # THE regression test both FATALs demanded: run the produced
@@ -218,29 +231,35 @@ class TestMaterialize:
         assert "Cannot open file" not in msg, f"fell through to the FILE backend: {msg[:200]}"
         assert "Unable to connect" in msg or "Connection refused" in msg, msg[:200]
 
-    def test_uri_never_in_repr(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="SUPERSECRET"):
+    def test_secret_never_in_config_at_all(self):
+        # Stronger than the old repr guard: with the ref deferral the
+        # credential is not IN the config object anywhere — repr, fields,
+        # or otherwise.
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="SUPERSECRET"):
             dests = discovery.materialize(self._mapped(), set(), {})
-        assert "SUPERSECRET" not in repr(dests[0])
+        d = dests[0]
+        assert "SUPERSECRET" not in repr(d)
+        assert d.postgres_uri_direct is None
+        assert "SUPERSECRET" not in repr(d.uri_source)
 
     def test_duplicate_routing_values_deduped_not_crashing(self, _mock_metrics):
         # A CP bug serving the same team twice must degrade the entry,
         # never reach ViaduckConfig validation and crashloop startup.
         mapped = discovery.map_payload(_payload([_warehouse(org="a1"), _warehouse(org="a2")]))
         assert len(mapped) == 2  # same team 666 under two orgs
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(mapped, set(), {})
         assert len(dests) == 1  # first wins
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="duplicate")
 
     def test_static_id_collision_skipped(self, _mock_metrics):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(self._mapped(), set(), {}, static_ids={"org-acme-team-666"})
         assert dests == []
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="id_collision")
 
     def test_secret_failure_skips_and_counts(self, _mock_metrics):
-        with patch("viaduck.discovery.read_secret_key", side_effect=SecretReadError("RBAC denied")):
+        with patch("viaduck.discovery.read_secret_key_cached", side_effect=SecretReadError("RBAC denied")):
             dests = discovery.materialize(self._mapped(), set(), {})
         assert dests == []
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="secret_unreadable")
@@ -408,19 +427,19 @@ class TestAllowlists:
         return discovery.map_payload(_payload([_warehouse()]))
 
     def test_endpoint_outside_suffixes_skipped(self, _mock_metrics):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(self._mapped(), set(), {}, allowed_endpoint_suffixes=(".other.svc",))
         assert dests == []
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="endpoint_not_allowed")
 
     def test_namespace_not_allowed_skipped(self, _mock_metrics):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(self._mapped(), set(), {}, allowed_secret_namespaces=("elsewhere",))
         assert dests == []
         _mock_metrics.discovery_broken_entries_total.labels.assert_called_with(reason="namespace_not_allowed")
 
     def test_defaults_pass_the_standard_convention(self):
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             dests = discovery.materialize(
                 self._mapped(),
                 set(),
@@ -449,7 +468,7 @@ class TestMaterializeDeadline:
         def slow_read(*a, **k):
             return "pw"
 
-        with patch("viaduck.discovery.read_secret_key", side_effect=slow_read):
+        with patch("viaduck.discovery.read_secret_key_cached", side_effect=slow_read):
             with patch("viaduck.discovery.time.monotonic", side_effect=lambda: next(clock, 100.0)):
                 dests = discovery.materialize(mapped, set(), {}, deadline_s=10.0)
         assert len(dests) == 1
@@ -457,7 +476,7 @@ class TestMaterializeDeadline:
 
     def test_heartbeat_called_per_entry(self):
         beats = []
-        with patch("viaduck.discovery.read_secret_key", return_value="pw"):
+        with patch("viaduck.discovery.read_secret_key_cached", return_value="pw"):
             discovery.materialize(
                 discovery.map_payload(_payload([_warehouse()])), set(), {}, heartbeat=lambda: beats.append(1)
             )

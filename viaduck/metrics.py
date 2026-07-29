@@ -203,6 +203,12 @@ _retention_clamp_total = Counter(
     "its pending flush fails",
     ["pipeline", "destination", "outcome"],
 )
+_secret_cache_stale_fallback_total = Counter(
+    "viaduck_secret_cache_stale_fallback_total",
+    "Secret reads served from the stale cache after an API failure (k8s_secrets.read_secret_key_cached). "
+    "Sustained increments = flushing on possibly-rotated credentials during an API-server outage — alertable",
+    ["pipeline"],
+)
 _discovery_synced = Gauge(
     "viaduck_discovery_synced",
     "1 after a successful discovery poll; 0 = static-only (CP unreachable at startup) or stale drift view",
@@ -336,6 +342,7 @@ delivery_reads_paused = _delivery_reads_paused
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
 retention_clamp_total = _retention_clamp_total
+secret_cache_stale_fallback_total = _secret_cache_stale_fallback_total
 discovery_synced = _discovery_synced
 discovery_config_generation = _discovery_config_generation
 discovery_last_success_timestamp_seconds = _discovery_last_success_timestamp_seconds
@@ -375,7 +382,7 @@ def init(pipeline: str):
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
-    global retention_clamp_total
+    global retention_clamp_total, secret_cache_stale_fallback_total
     global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
     global discovery_poll_failures_total, discovery_broken_entries_total
     global discovery_destinations, discovery_drift_destinations, discovery_drift_transitions_total
@@ -397,6 +404,7 @@ def init(pipeline: str):
     discovery_broken_entries_total = _AutoPipelineLabels(_discovery_broken_entries_total, pipeline)
     discovery_drift_destinations = _AutoPipelineLabels(_discovery_drift_destinations, pipeline)
     discovery_drift_transitions_total = _AutoPipelineLabels(_discovery_drift_transitions_total, pipeline)
+    secret_cache_stale_fallback_total = _secret_cache_stale_fallback_total.labels(pipeline=pipeline)
     discovery_synced = _discovery_synced.labels(pipeline=pipeline)
     discovery_config_generation = _discovery_config_generation.labels(pipeline=pipeline)
     discovery_last_success_timestamp_seconds = _discovery_last_success_timestamp_seconds.labels(pipeline=pipeline)
