@@ -193,6 +193,21 @@ docs-check:
 tlc:
     cd tla && tlc Viaduck.tla -config Viaduck.cfg -workers auto
 
+# C3 membership-epoch extension (joinSnap): bounded, ~2min. Extends the
+# main spec without touching it.
+tlc-join:
+    cd tla && tlc ViaduckJoin.tla -config ViaduckJoin.cfg -workers auto
+
+# C3 reshard config-swap quiesce: guarded run must PASS (~5s).
+tlc-reshard:
+    cd tla && tlc Reshard.tla -config Reshard.cfg -workers auto
+
+# Negative proof: the UNGUARDED swap must FAIL with a NoStaleEndpointWrite
+# violation trace — if this ever passes, the model stopped proving the
+# is_clean guard is load-bearing.
+tlc-reshard-unguarded:
+    cd tla && tlc Reshard.tla -config ReshardUnguarded.cfg -workers auto
+
 # Run TLA+ model checker with verbose output (shows state count per depth)
 [group('verify')]
 tlc-verbose:
