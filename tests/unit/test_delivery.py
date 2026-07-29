@@ -831,3 +831,125 @@ def test_clamp_outcome_wording_lost_vs_at_risk():
     snaps = mgr.status_snapshot()
     assert "expired UNREAD" in snaps["lost"].last_error
     assert "lost only if" in snaps["risk"].last_error
+
+
+# ---------------------------------------------------------------------------
+# Membership (C3 §1 stop contract: active set, dicts persist)
+# ---------------------------------------------------------------------------
+
+
+def test_remove_destination_stops_submissions_but_keeps_state():
+    mgr, _, _ = _manager(dests=("d1", "d2"))
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(3), through_snapshot=7, epoch=epoch)
+    mgr.remove_destination("d1")
+    with patch.object(mgr, "_flush", fake):
+        # No submission for the removed id, even at shutdown pressure —
+        # without the active filter a stopped dest with position > flushed
+        # would submit position-persist flushes forever.
+        assert mgr.maybe_flush(shutdown=True) == 0
+    assert calls == []
+    # Out of the read plan and status; dict family retained underneath.
+    assert "d1" not in mgr.read_plan()
+    assert "d1" not in mgr.status_snapshot()
+    assert "d1" in mgr._buffers
+    assert mgr.is_clean("d1") is False  # still queryable (pending drain latch)
+    mgr.remove_destination("d1")  # idempotent
+
+
+def test_re_add_max_merges_and_preserves_epoch():
+    mgr, sm, _ = _manager(cursors={"d1": 5})
+    _, epoch0 = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(2), through_snapshot=9, epoch=epoch0)
+    mgr.remove_destination("d1")
+    sm.load_cursors.reset_mock()
+    mgr.add_destination("d1")
+    # Max-merge: surviving entries reused — no cursor reload, no epoch
+    # reset (a reset would let a pre-stop read regress position), no
+    # position/flushed rewind.
+    sm.load_cursors.assert_not_called()
+    pos, epoch1 = mgr.read_plan()["d1"]
+    assert pos == 9
+    assert epoch1 == epoch0
+    assert mgr.status_snapshot()["d1"].flushed_snapshot == 5
+
+
+def test_add_destination_new_id_initializes_from_cursor():
+    mgr, sm, _ = _manager(dests=("d1",))
+    c = MagicMock()
+    c.last_snapshot_id = 42
+    c.rows_replicated = 7
+    c.last_error = None
+    sm.load_cursors.return_value = {"dyn": c}
+    mgr.add_destination("dyn")
+    snap = mgr.status_snapshot()["dyn"]
+    assert snap.flushed_snapshot == 42
+    assert snap.position_snapshot == 42
+    assert snap.rows_replicated == 7
+
+
+def test_membership_change_recomputes_auto_cap():
+    mgr, _, _ = _manager(dests=("d1", "d2"), buffer_total_max_bytes=100)
+    assert mgr._per_dest_cap == 50
+    mgr.remove_destination("d2")
+    assert mgr._per_dest_cap == 100
+    mgr.add_destination("d2")
+    assert mgr._per_dest_cap == 50
+
+
+def test_membership_change_shrinks_oversubscribed_explicit_cap():
+    # Startup honors an oversubscribed explicit cap (WARN only — existing
+    # contract); a MEMBERSHIP CHANGE enforces the total as the bound and
+    # shrinks to fair share, because dynamic growth would otherwise erode
+    # buffer_total_max_bytes as the effective memory limit.
+    mgr, sm, _ = _manager(
+        dests=("d1", "d2"),
+        buffer_total_max_bytes=100,
+        buffer_max_bytes_per_destination=80,
+    )
+    assert mgr._per_dest_cap == 80  # startup: honored
+    c = MagicMock()
+    c.last_snapshot_id = 0
+    c.rows_replicated = 0
+    c.last_error = None
+    sm.load_cursors.return_value = {"d3": c}
+    mgr.add_destination("d3")
+    assert mgr._per_dest_cap == 100 // 3  # 3 x 80 > 100 -> fair share
+    mgr.remove_destination("d3")
+    mgr.remove_destination("d2")
+    assert mgr._per_dest_cap == 80  # 1 x 80 <= 100 -> explicit honored again
+
+
+def test_add_destination_loads_cursor_outside_lock_and_fails_atomically():
+    mgr, sm, _ = _manager(dests=("d1",))
+
+    def _probe_lock(ids):
+        # The module's lock discipline: no state-store I/O under _lock. If
+        # the manager lock were held here, this acquire would fail and a
+        # real PG stall would freeze every flush worker.
+        assert mgr._lock.acquire(blocking=False), "state-store read under the manager lock"
+        mgr._lock.release()
+        raise RuntimeError("pg down")
+
+    sm.load_cursors.side_effect = _probe_lock
+    with pytest.raises(RuntimeError):
+        mgr.add_destination("dyn")
+    # Failure atomicity: not activated, no partial dict entries.
+    assert "dyn" not in mgr.active_ids()
+    assert "dyn" not in mgr._buffers
+
+
+def test_draining_destination_still_flushes_under_active_filter():
+    # Draining is in _active and NOT in _suspended; the new active filter
+    # in maybe_flush must not stop its flush-out (parity invariant from
+    # the stage-2 no-op review).
+    mgr, _, _ = _manager()
+    fake, calls = _recording_flush(mgr)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(3), through_snapshot=7, epoch=epoch)
+    # Lifecycle 'draining': excluded from reads by the caller, not
+    # suspended, still active.
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush(shutdown=True) == 1
+    assert calls[0][0] == "d1"

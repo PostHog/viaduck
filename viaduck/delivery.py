@@ -87,7 +87,33 @@ class DestDeliveryStatus:
 
 
 class DeliveryManager:
-    """Per-destination buffers + flush triggers + worker pool."""
+    """Per-destination buffers + flush triggers + worker pool.
+
+    Membership invariants (C3 stage-2 review; pinned so nobody "fixes"
+    them into a second authority):
+
+    - I1: ``_active ⊆ _buffers.keys()`` — add_destination creates the dict
+      entries under the lock BEFORE activating; nothing ever deletes a
+      dict key (never-delete, §1 stop contract).
+    - I2: all ten per-destination dicts share one monotonically-growing
+      "ever-member" key set; constructor and add_destination write all
+      ten atomically under the lock.
+    - I3: ``_suspended`` is NOT constrained relative to ``_active`` — it
+      is replaced wholesale from the lifecycle tracker (a different
+      authority, operator intent). Its only reader consults it after the
+      active filter, so suspended-but-removed is inert. It must never
+      become a second membership authority.
+    - I4: ``_inflight`` may contain inactive ids (in-flight flushes finish
+      naturally); maybe_flush submits active-only, so removed ids drain
+      to none.
+    - Queries (``is_clean``, ``last_error``, ``discard_buffer``,
+      ``clamp_to_retention``) accept any ever-member id, active or not —
+      the reconciler's pending-restart loop polls ``is_clean`` on
+      deactivated ids and depends on this.
+    - A removed destination's leftover buffer bytes still count toward
+      the watermark until the caller composes ``discard_buffer()`` — the
+      deactivate recipe (§4) does; nothing here enforces it.
+    """
 
     def __init__(
         self,
@@ -123,6 +149,16 @@ class DeliveryManager:
 
         self._lock = threading.Lock()
         self._buffers: dict[str, _Buffer] = {d: _Buffer() for d in assigned_ids}
+        # Explicit membership (C3 §1 stop contract): the active set is the
+        # ONLY authority on which destinations participate in reads,
+        # flush submission, drain, and status. The per-destination dict
+        # family deliberately persists past removal — the flush worker
+        # touches ~10 dict sites after the point a stop can land, and
+        # deleting entries turns an in-flight flush into a KeyError after
+        # the destination write committed but before the cursor advanced
+        # (deterministic duplicates on re-add); a delete-and-recreate also
+        # resets the epoch and lets a pre-stop CDC read regress position.
+        self._active: set[str] = set(assigned_ids)
         self._inflight: set[str] = set()
         self._executor = ThreadPoolExecutor(max_workers=cfg.workers, thread_name_prefix="flush")
         # Per-destination byte cap: the bound on each destination's CDC
@@ -156,6 +192,11 @@ class DeliveryManager:
             "explicit" if cfg.buffer_max_bytes_per_destination > 0 else "auto: buffer_total_max_bytes / N",
             len(assigned_ids),
         )
+        # Startup semantics above are unchanged (explicit oversubscription
+        # only warns — existing deployments keep their contract);
+        # _recompute_per_dest_cap_locked enforces the bound on MEMBERSHIP
+        # CHANGES, where dynamic growth would otherwise erode
+        # buffer_total_max_bytes as the effective memory bound.
         # Shutdown signal threaded into apply._write_with_retry: a worker
         # deep in the OCC retry backoff (up to ~30s per sleep, ~5 min per
         # flush worst case) would otherwise ignore SIGTERM and get SIGKILLed
@@ -308,11 +349,11 @@ class DeliveryManager:
         return old_flushed
 
     def read_plan(self) -> dict[str, tuple[int, int]]:
-        """Atomic snapshot of (position, epoch) per destination. The epoch
-        must be passed back to buffer()/advance_position() so reads that
-        overlapped a failure reset are discarded."""
+        """Atomic snapshot of (position, epoch) per ACTIVE destination. The
+        epoch must be passed back to buffer()/advance_position() so reads
+        that overlapped a failure reset are discarded."""
         with self._lock:
-            return {d: (self._position[d], self._epoch[d]) for d in self._position}
+            return {d: (self._position[d], self._epoch[d]) for d in self._position if d in self._active}
 
     def buffer(self, dest_id: str, table: pa.Table, through_snapshot: int, epoch: int | None = None) -> None:
         """Accumulate a routed, Phase-1-resolved batch (BufferRead).
@@ -380,12 +421,12 @@ class DeliveryManager:
         wedged" log signal; per-destination pauses are routine operation
         and intentionally quiet (gauge, not WARN)."""
         with self._lock:
-            if not self._buffers:
+            if not self._active:
                 # A partitioned instance can legitimately own zero
                 # destinations; vacuous all() would report it permanently
                 # wedged and spam the watermark WARN state machine.
                 return False
-            return all(self._dest_bytes_locked(d) >= self._per_dest_cap for d in self._buffers)
+            return all(self._dest_bytes_locked(d) >= self._per_dest_cap for d in self._active)
 
     def maybe_flush(self, *, shutdown: bool = False) -> int:
         """Evaluate flush triggers and submit eligible flushes (FlushStart).
@@ -399,8 +440,15 @@ class DeliveryManager:
         with self._lock:
             over_watermark = self._total_bytes_locked() >= self._cfg.buffer_total_max_bytes
             # Largest-first when over the watermark so forced flushes
-            # relieve the most memory soonest.
-            order = sorted(self._buffers, key=lambda d: self._buffers[d].bytes, reverse=over_watermark)
+            # relieve the most memory soonest. Active only: a removed
+            # destination gets no NEW submissions — without the filter, a
+            # stopped destination with position > flushed would keep
+            # submitting position-persist flushes forever.
+            order = sorted(
+                (d for d in self._buffers if d in self._active),
+                key=lambda d: self._buffers[d].bytes,
+                reverse=over_watermark,
+            )
             for dest_id in order:
                 if dest_id in self._inflight:
                     continue
@@ -449,13 +497,13 @@ class DeliveryManager:
             self.maybe_flush(shutdown=True)
             with self._lock:
                 quiet = not self._inflight and all(
-                    b.rows == 0 and self._position[d] <= self._flushed[d] for d, b in self._buffers.items()
+                    self._buffers[d].rows == 0 and self._position[d] <= self._flushed[d] for d in self._active
                 )
             if quiet:
                 break
             time.sleep(0.05)
         with self._lock:
-            leftover = {d: b.rows for d, b in self._buffers.items() if b.rows} or None
+            leftover = {d: self._buffers[d].rows for d in self._active if self._buffers[d].rows} or None
             still_inflight = set(self._inflight) or None
         if leftover or still_inflight:
             log.warning(
@@ -491,6 +539,7 @@ class DeliveryManager:
                     else 0.0,
                 )
                 for d in self._buffers
+                if d in self._active
             }
 
     # ------------------------------------------------------------------ #
@@ -672,6 +721,89 @@ class DeliveryManager:
                     dest_id,
                     self._flushed[dest_id],
                 )
+
+    # ------------------------------------------------------------------ #
+    # Membership (C3 reconciler; poll-thread only)
+    # ------------------------------------------------------------------ #
+
+    def add_destination(self, dest_id: str) -> None:
+        """Add (or re-activate) a destination. MAX-MERGE on a returning id:
+        surviving dict entries are reused, never recreated — recreating
+        would reset the epoch (letting a pre-stop CDC read land in the
+        post-re-add buffer and regress position) and could rewind
+        flushed/position below values a zombie flush is about to confirm.
+        A genuinely new id initializes from its persisted cursor (the
+        caller persists any resume adjustment BEFORE calling this — the
+        clamp-persist → register ordering from C3 §4 step 6).
+
+        The cursor load happens OUTSIDE the lock (this module's uniform
+        discipline: no state-store I/O under self._lock — a PG stall here
+        would freeze every flush worker's success path plus buffer()/
+        read_plan()). Race-free without the lock: membership mutations are
+        poll-thread-only, so the check-then-load-then-install split cannot
+        interleave with another add; the under-lock re-check is
+        belt-and-suspenders."""
+        with self._lock:
+            known = dest_id in self._buffers
+        cursors = {} if known else self._state.load_cursors([dest_id])
+        with self._lock:
+            if dest_id not in self._buffers:
+                cursor = cursors[dest_id].last_snapshot_id if dest_id in cursors else 0
+                self._buffers[dest_id] = _Buffer()
+                self._flushed[dest_id] = cursor
+                self._position[dest_id] = cursor
+                self._rows_replicated[dest_id] = cursors[dest_id].rows_replicated if dest_id in cursors else 0
+                self._last_error[dest_id] = cursors[dest_id].last_error if dest_id in cursors else None
+                self._position_dirty_since[dest_id] = None
+                self._epoch[dest_id] = 0
+                self._inflight_bytes[dest_id] = 0
+                self._applied[dest_id] = {"inserts": 0, "updates": 0, "deletes": 0}
+                self._buffered_rows_total[dest_id] = 0
+            self._active.add(dest_id)
+            self._recompute_per_dest_cap_locked()
+
+    def remove_destination(self, dest_id: str) -> None:
+        """Deactivate a destination (C3 §1 stop contract): membership-set
+        removal ONLY. Every dict entry persists for the process lifetime;
+        an in-flight flush finishes naturally and harmlessly (durable
+        state: delivered is delivered). The caller composes this with
+        discard_buffer() and the is-clean-latched pool evict. Idempotent."""
+        with self._lock:
+            self._active.discard(dest_id)
+            self._recompute_per_dest_cap_locked()
+
+    def active_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._active)
+
+    def _recompute_per_dest_cap_locked(self) -> None:
+        """Re-derive the per-destination cap on membership change. The sum
+        of per-dest caps is the effective memory bound (backpressure is
+        destination-local), so a growing fleet under a frozen cap
+        oversubscribes buffer_total_max_bytes — an OOM path once dynamic
+        adds arrive. Auto mode re-derives the fair share; an explicit cap
+        that oversubscribes shrinks to the fair share with a WARN (unlike
+        at startup, where the explicit value is honored with a WARN —
+        membership changes are dynamic-fleet territory and the total is
+        the contract there)."""
+        n = max(1, len(self._active))
+        fair = max(1, self._cfg.buffer_total_max_bytes // n)
+        if self._cfg.buffer_max_bytes_per_destination > 0:
+            explicit = self._cfg.buffer_max_bytes_per_destination
+            if n * explicit > self._cfg.buffer_total_max_bytes:
+                log.warning(
+                    "buffer_max_bytes_per_destination=%d x %d active destinations exceeds "
+                    "buffer_total_max_bytes=%d; shrinking per-destination cap to fair share %d",
+                    explicit,
+                    n,
+                    self._cfg.buffer_total_max_bytes,
+                    fair,
+                )
+                self._per_dest_cap = fair
+            else:
+                self._per_dest_cap = explicit
+        else:
+            self._per_dest_cap = fair
 
     # ------------------------------------------------------------------ #
     # Destination lifecycle (viaduck/lifecycle.py; poll-thread only)
