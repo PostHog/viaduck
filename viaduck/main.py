@@ -65,6 +65,7 @@ from viaduck.apply import _require_non_null_rowids
 from viaduck.arrowutil import full_bool, row_indices
 from viaduck.delivery import DeliveryManager
 from viaduck.destination import DestinationPool
+from viaduck.registry import DestinationRegistry
 from viaduck.router import Router, RoutingError
 from viaduck.server import DestStatus, health, status
 from viaduck.state import StateManager
@@ -499,6 +500,10 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
     key_columns = cfg.routing.key_columns
 
     for dest_id in new_dest_ids:
+        # Startup-only path with the post-merge cfg passed per call — the
+        # same object the registry was built from, so this is not the
+        # stale-STARTUP-capture class. If seeding is ever reused for a
+        # mid-run add, resolve via the registry instead.
         dest_cfg = cfg.destination_by_id(dest_id)
         routing_value = dest_cfg.routing_value
 
@@ -808,19 +813,17 @@ def run(cfg: config.ViaduckConfig) -> None:
             baseline=baseline,
             startup_generation=generation,
         )
-    # The pool and everything below MUST see the post-merge cfg — the
-    # pool resolves destination configs by id at flush time, and a pool
-    # holding the pre-merge cfg makes every discovered destination buffer
-    # forever without ever flushing (round-2 review CRITICAL; the third
-    # stale-captured-config defect in this effort — construct consumers
-    # AFTER the last cfg rebind).
-    dest_pool = DestinationPool(cfg, max_open=cfg.delivery.pool_max_open)
+    # The registry is built from the post-merge cfg and is THE runtime
+    # resolution path for destination configs — the pool, the poll cycle,
+    # and the status export all read through it (or a per-cycle snapshot
+    # of it), never through the frozen startup cfg. That capture-at-
+    # startup pattern produced three separate stale-config defects in the
+    # discovery effort; see viaduck/registry.py.
+    registry = DestinationRegistry.from_configs(cfg.destinations, discovered_ids=discovered_ids)
+    dest_pool = DestinationPool(cfg, registry, max_open=cfg.delivery.pool_max_open)
     # Cache source schema for destination table creation.
     # `Table.schema` is a property in pyducklake — do not call it.
     dest_pool.set_source_schema(src_table.schema)
-
-    # Build routing_value -> dest_id mapping
-    rv_to_dest: dict[str, str] = {d.routing_value: d.id for d in cfg.destinations}
 
     assigned_ids = cfg.assigned_destination_ids()
 
@@ -839,8 +842,12 @@ def run(cfg: config.ViaduckConfig) -> None:
             retired_ids,
         )
     assigned_ids = [d for d in assigned_ids if d not in retired_ids]
-    rv_to_dest = {rv: did for rv, did in rv_to_dest.items() if did not in retired_ids}
     for did in retired_ids:
+        # Retired = not routable. The registry retains the config entry
+        # (never-delete: an in-flight anything must still resolve it) but
+        # drops it from the routing index, which is what excludes it from
+        # every per-cycle rv_to_dest below.
+        registry.remove(did)
         # Sever the resume point: re-add = new tenant = fresh seed. Also
         # done per-cycle for a mid-run retire; this is the restart backstop.
         state_mgr.delete_destination_state(did)
@@ -947,6 +954,14 @@ def run(cfg: config.ViaduckConfig) -> None:
             # delivering on a stale ACTIVE would be worse than delivering
             # one cycle late on a stale PAUSE).
             try:
+                # STAGE-4 DEPENDENCY: this load iterates the STARTUP
+                # capture. The reconciler must rewire it (and the tracker
+                # construction above) to the live registry snapshot, or a
+                # dynamically added id's lifecycle row is never fetched
+                # and a later pause/retire of it never applies — the
+                # frozen-membership defect (v4 review F2). Until then the
+                # membership APIs (delivery.add/remove_destination,
+                # tracker.add/remove) must have no production callers.
                 lifecycle_rows = state_mgr.load_lifecycle_rows(assigned_ids)
                 raw_lifecycle = {d: r["state"] for d, r in lifecycle_rows.items()}
             except Exception:
@@ -964,6 +979,10 @@ def run(cfg: config.ViaduckConfig) -> None:
                         d,
                     )
 
+            # ONE immutable registry snapshot per cycle: routing, config
+            # resolution, and status all read this view — no mid-cycle
+            # reads of the live registry (C3 §5).
+            reg_snap = registry.snapshot()
             _poll_cycle(
                 src_table,
                 delivery,
@@ -971,11 +990,12 @@ def run(cfg: config.ViaduckConfig) -> None:
                 router,
                 cfg,
                 assigned_ids,
-                rv_to_dest,
+                reg_snap.rv_to_dest,
                 key_columns,
                 mode,
                 read_ids=read_ids,
                 lifecycle_states=tracker.states(),
+                dest_configs=reg_snap.configs,
             )
         except Exception:
             log.exception("Fatal error in poll cycle")
@@ -1134,6 +1154,7 @@ def _poll_cycle(
     *,
     read_ids=None,
     lifecycle_states=None,
+    dest_configs=None,
 ):
     # Local boolean so the existing branch sites stay terse. Threading mode
     # (not full_cdc) through the call signature avoids reconstructing the
@@ -1145,6 +1166,12 @@ def _poll_cycle(
         read_ids = assigned_ids
     if lifecycle_states is None:
         lifecycle_states = {}
+    # Production passes the per-cycle registry snapshot's config view; the
+    # per-call cfg derivation is the test-harness convenience (deriving
+    # from an argument passed each call is not the stale-STARTUP-capture
+    # defect the registry exists to prevent).
+    if dest_configs is None:
+        dest_configs = {d.id: d for d in cfg.destinations}
     """One poll cycle: read CDC from each position group into buffers,
     advance in-memory positions, evaluate flush triggers.
 
@@ -1236,7 +1263,7 @@ def _poll_cycle(
                     if not readable:
                         log.debug("Pausing reads for group at %d: all destinations at buffer cap", start_snap)
                         break
-                    routing_values = [cfg.destination_by_id(d).routing_value for d in readable]
+                    routing_values = [dest_configs[d].routing_value for d in readable]
                     filter_expr = router.build_filter_expr(routing_values)
                     group_read_anything = True
                     chunk_end = min(chunk_start + chunk_size, current_id)
@@ -1361,8 +1388,14 @@ def _poll_cycle(
     snap_now = current_id if current_id is not None else 0
     dest_statuses = []
     delivery_snapshot = delivery.status_snapshot()
-    _export_dest_time_lag(src_table, delivery_snapshot, assigned_ids, snap_now)
-    for did in assigned_ids:
+    # status_snapshot() is active-filtered; assigned_ids is the startup
+    # capture. They are identical until the reconciler (stage 4) starts
+    # removing members mid-run — the intersection keeps a removal from
+    # KeyError-ing the cycle (which the run loop treats as fatal). Stage 4
+    # replaces assigned_ids with per-cycle registry-derived membership.
+    status_ids = [d for d in assigned_ids if d in delivery_snapshot]
+    _export_dest_time_lag(src_table, delivery_snapshot, status_ids, snap_now)
+    for did in status_ids:
         d = delivery_snapshot[did]
         lag = max(snap_now - d.flushed_snapshot, 0)
         metrics.dest_lag_snapshots.labels(destination=did).set(lag)
@@ -1372,7 +1405,7 @@ def _poll_cycle(
         dest_statuses.append(
             DestStatus(
                 id=did,
-                routing_value=cfg.destination_by_id(did).routing_value,
+                routing_value=dest_configs[did].routing_value,
                 snapshot=d.flushed_snapshot,
                 lag=lag,
                 rows_replicated=d.rows_replicated,
@@ -1411,8 +1444,8 @@ def _poll_cycle(
     # idleness doesn't flood the log; verbose when there's work to report.
     cycle_secs = time.monotonic() - cycle_t0
     if cycle_groups_processed > 0 or cycle_rows_read > 0 or flushes_submitted > 0:
-        max_lag = max((snap_now - delivery_snapshot[did].flushed_snapshot) for did in assigned_ids)
-        buffered_rows = sum(delivery_snapshot[did].buffer_rows for did in assigned_ids)
+        max_lag = max(((snap_now - delivery_snapshot[did].flushed_snapshot) for did in status_ids), default=0)
+        buffered_rows = sum(delivery_snapshot[did].buffer_rows for did in status_ids)
         log.info(
             "Poll cycle: snapshot=%d, groups=%d, cdc_rows_read=%d, buffered_rows=%d, "
             "flushes_submitted=%d, max_lag=%d, duration=%.2fs",

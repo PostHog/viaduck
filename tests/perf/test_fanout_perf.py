@@ -306,6 +306,7 @@ def _make_fanout_pool(tmp_path, n_dests: int, max_open: int):
     from unittest.mock import MagicMock
 
     from viaduck.destination import DestinationPool
+    from viaduck.registry import DestinationRegistry
 
     dests = {}
     for i in range(n_dests):
@@ -322,8 +323,8 @@ def _make_fanout_pool(tmp_path, n_dests: int, max_open: int):
         dests[dest_id] = d
 
     cfg = MagicMock()
-    cfg.destination_by_id = lambda d: dests[d]
-    pool = DestinationPool(cfg, max_open=max_open)
+    registry = DestinationRegistry.from_configs(list(dests.values()))
+    pool = DestinationPool(cfg, registry, max_open=max_open)
 
     from pyducklake import Schema
     from pyducklake.types import IntegerType, NestedField, StringType

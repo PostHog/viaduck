@@ -3876,3 +3876,32 @@ def test_poll_cycle_contains_group_read_failure():
         )
 
     delivery.maybe_flush.assert_called()
+
+
+def test_poll_cycle_survives_membership_smaller_than_assigned():
+    # Stage-4 landmine hardening: a destination removed from the delivery
+    # manager mid-run (status_snapshot omits it) while still present in
+    # the loop's startup-captured assigned_ids must not KeyError the
+    # cycle — the run loop treats poll-cycle errors as fatal.
+    delivery = _make_delivery({"dest-1": 10})  # dest-2 absent from snapshot
+    delivery.flushed_snapshots.return_value = {"dest-1": 10, "dest-2": 10}
+    delivery.read_plan.return_value = {"dest-1": (10, 0), "dest-2": (10, 0)}
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "a"), ("dest-2", "b")])
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
+        patch("viaduck.main._export_dest_time_lag"),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1", "dest-2"],
+            {"a": "dest-1", "b": "dest-2"},
+            key_columns=[],
+            mode="append_only",
+        )
+    delivery.maybe_flush.assert_called()

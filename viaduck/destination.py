@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from pyducklake.schema import Schema
 
     from viaduck.config import DestinationConfig, ViaduckConfig
+    from viaduck.registry import DestinationRegistry
     from viaduck.schema_projection import ProjectionPlan
 
 log = logging.getLogger(__name__)
@@ -45,10 +46,16 @@ class DestinationPool:
     practice — the counting is defensive.
     """
 
-    def __init__(self, config: ViaduckConfig, max_open: int = 50):
+    def __init__(self, config: ViaduckConfig, registry: DestinationRegistry, max_open: int = 50):
         if max_open < _MIN_MAX_OPEN:
             raise ValueError(f"max_open must be >= {_MIN_MAX_OPEN}, got {max_open}")
         self._config = config
+        # Destination configs resolve through the LIVE registry at _create
+        # time — never through the frozen startup config (three historical
+        # stale-capture defects; see viaduck/registry.py). self._config is
+        # retained for source/routing settings only, which are genuinely
+        # process-constant.
+        self._registry = registry
         self._max_open = max_open
         self._lock = threading.Lock()
         self._pool: OrderedDict[str, tuple[Catalog, Table]] = OrderedDict()
@@ -312,7 +319,7 @@ class DestinationPool:
         """
         from pyducklake import Catalog
 
-        dest_cfg: DestinationConfig = self._config.destination_by_id(destination_id)
+        dest_cfg: DestinationConfig = self._registry.config_for(destination_id)
         schema = self._get_source_schema()
 
         catalog = None

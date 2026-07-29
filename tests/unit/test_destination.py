@@ -17,7 +17,7 @@ def setup_module():
 @pytest.fixture()
 def pool():
     config = MagicMock()
-    return DestinationPool(config, max_open=3)
+    return DestinationPool(config, MagicMock(), max_open=3)
 
 
 # --- Basic pool operations ---
@@ -138,12 +138,12 @@ def test_pool_close_all(pool):
 def test_pool_max_open_zero_raises():
     """max_open < 1 should be rejected at construction (H7)."""
     with pytest.raises(ValueError, match="max_open"):
-        DestinationPool(MagicMock(), max_open=0)
+        DestinationPool(MagicMock(), MagicMock(), max_open=0)
 
 
 def test_pool_max_open_one_works():
     """max_open=1 should work: evict on every new connection."""
-    pool = DestinationPool(MagicMock(), max_open=1)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=1)
     catalogs = {}
 
     def mock_create(dest_id):
@@ -197,7 +197,7 @@ def test_pool_eviction_close_failure_continues(pool):
 
 def test_pool_set_source_schema():
     config = MagicMock()
-    pool = DestinationPool(config, max_open=50)
+    pool = DestinationPool(config, MagicMock(), max_open=50)
     mock_schema = MagicMock()
     pool.set_source_schema(mock_schema)
     assert pool._source_schema is mock_schema
@@ -205,7 +205,7 @@ def test_pool_set_source_schema():
 
 def test_pool_get_source_schema_cached():
     config = MagicMock()
-    pool = DestinationPool(config, max_open=50)
+    pool = DestinationPool(config, MagicMock(), max_open=50)
     mock_schema = MagicMock()
     pool._source_schema = mock_schema
     assert pool._get_source_schema() is mock_schema
@@ -240,7 +240,7 @@ def test_pool_get_source_schema_live_treats_schema_as_property():
     fake_catalog = MagicMock()
     fake_catalog.load_table.return_value = fake_table
 
-    pool = DestinationPool(config, max_open=50)
+    pool = DestinationPool(config, MagicMock(), max_open=50)
     pool._source_schema = None
 
     with patch("pyducklake.Catalog", return_value=fake_catalog):
@@ -259,7 +259,7 @@ def test_pool_lru_correctness_at_scale():
     Tests OrderedDict LRU logic, not connection open/close latency (which is
     DuckDB-bound at ~50-100ms per Catalog).
     """
-    pool = DestinationPool(MagicMock(), max_open=10)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=10)
     mock_catalog = MagicMock()
 
     with patch.object(pool, "_create", return_value=(mock_catalog, MagicMock(), None)):
@@ -280,7 +280,7 @@ def test_pool_lru_correctness_at_scale():
 
 def test_pool_pinned_entry_not_lru_evicted():
     """A pinned (leased, unreleased) entry must survive LRU pressure."""
-    pool = DestinationPool(MagicMock(), max_open=2)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=2)
     catalogs = {}
 
     def mock_create(dest_id):
@@ -302,7 +302,7 @@ def test_pool_pinned_entry_not_lru_evicted():
 
 def test_pool_evict_while_pinned_defers_close():
     """Force-evict of a pinned entry defers the close to the final release."""
-    pool = DestinationPool(MagicMock(), max_open=3)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=3)
     cat = MagicMock()
 
     with patch.object(pool, "_create", return_value=(cat, MagicMock(), None)):
@@ -445,7 +445,7 @@ def test_pool_projection_stress_concurrent_get_release(pool):
 
 
 def test_pool_all_pinned_overshoots_instead_of_deadlock():
-    pool = DestinationPool(MagicMock(), max_open=1)
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=1)
     with patch.object(pool, "_create", side_effect=lambda d: (MagicMock(), MagicMock(), None)):
         pool.get("a")  # pinned
         pool.get("b")  # capacity exceeded but "a" is pinned -> overshoot
@@ -870,3 +870,39 @@ def test_scrub_is_linear_on_adversarial_input():
     scrub_credentials(hostile)
     scrub_credentials('{"password":"' + "\\!" * 20000)
     assert _time.monotonic() - t0 < 1.0
+
+
+# --- Registry indirection (C3: stale-capture class) ---
+
+
+def test_create_resolves_via_registry_never_frozen_config():
+    """The stale-capture pin: _create resolves the destination through the
+    LIVE registry, never through the frozen startup config. Three separate
+    stale-captured-config defects motivated this — a pool holding a
+    pre-merge config made every discovered destination buffer forever."""
+    from viaduck.config import DestinationConfig
+    from viaduck.registry import DestinationRegistry
+
+    config = MagicMock()  # the frozen startup config: must never be asked
+    registry = DestinationRegistry()
+    registry.add(
+        DestinationConfig(
+            id="dyn-1",
+            routing_value="acme",
+            name="cat-dyn-1",
+            postgres_uri_env="UNUSED",
+            data_path="s3://bucket/dyn-1",
+            table="events",
+            postgres_uri_direct="postgresql://u:p@h/db",
+        ),
+        origin="discovered",
+    )
+    pool = DestinationPool(config, registry, max_open=3)
+    pool.set_source_schema(MagicMock())
+
+    fake_catalog = MagicMock()
+    with patch("pyducklake.Catalog", return_value=fake_catalog):
+        catalog, table, _plan = pool._create("dyn-1")
+
+    assert catalog is fake_catalog
+    config.destination_by_id.assert_not_called()
