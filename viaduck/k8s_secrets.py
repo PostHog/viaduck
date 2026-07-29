@@ -160,7 +160,14 @@ def read_secret_key_cached(
             from viaduck.scrub import scrub_credentials
 
             metrics.secret_cache_stale_fallback_total.inc()
-            log.warning(
+            # nosemgrep below: the logger-credential-disclosure rule
+            # pattern-matches "Secret"/"password" in the message TEXT; the
+            # logged values are the k8s namespace/name (metadata, not
+            # credentials), the SecretReadError text passed through
+            # scrub_credentials (secret-free by design AND by scrubbing),
+            # and an age in seconds. The cached credential value never
+            # enters this call.
+            log.warning(  # nosemgrep
                 "Secret %s/%s read failed (%s); using cached value (age %.0fs) — "
                 "a rotated password heals on the next successful read",
                 namespace,
