@@ -428,6 +428,17 @@ class DeliveryConfig:
     # paused reads for everyone. 0 (default) auto-derives a fair share:
     # buffer_total_max_bytes / number of assigned destinations.
     buffer_max_bytes_per_destination: int = 0
+    # Ceiling on the rows ONE flush takes from the buffer (sliced at
+    # chunk boundaries; the remainder stays buffered and goes out in the
+    # next flush). Without it, a slow flush lets the buffer pile up and
+    # the NEXT swap takes everything — the feedback loop that produced
+    # 170-440K-row append batches and drove the fork's native layer into
+    # buffer-manager corruption + SIGSEGV (2026-07-29 incident).
+    # Batches <=~60K rows are the empirically stable regime. A single
+    # buffered chunk larger than the cap still flushes whole (slicing
+    # never splits a chunk) — poll.cdc_chunk_snapshots bounds that.
+    # 0 = unlimited (pre-slicing behavior).
+    flush_batch_max_rows: int = 60_000
     pool_max_open: int = 100  # destination connection pool size
 
     def __post_init__(self):
@@ -442,6 +453,10 @@ class DeliveryConfig:
             raise ConfigError(
                 f"delivery.buffer_max_bytes_per_destination must be >= 0 (0 = auto), "
                 f"got {self.buffer_max_bytes_per_destination}"
+            )
+        if self.flush_batch_max_rows < 0:
+            raise ConfigError(
+                f"delivery.flush_batch_max_rows must be >= 0 (0 = unlimited), got {self.flush_batch_max_rows}"
             )
 
 
@@ -811,6 +826,9 @@ def load(path: str | Path) -> ViaduckConfig:
         buffer_max_bytes_per_destination=_validate_int(
             delivery_raw.get("buffer_max_bytes_per_destination", 0),
             "delivery.buffer_max_bytes_per_destination",
+        ),
+        flush_batch_max_rows=_validate_int(
+            delivery_raw.get("flush_batch_max_rows", 60_000), "delivery.flush_batch_max_rows"
         ),
         pool_max_open=_validate_int(delivery_raw.get("pool_max_open", 100), "delivery.pool_max_open"),
     )

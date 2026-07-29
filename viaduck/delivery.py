@@ -54,10 +54,23 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class _Buffer:
-    tables: list[pa.Table] = field(default_factory=list)
+    # (table, through_snapshot) per buffered CDC chunk: the through value
+    # is what flush-batch SLICING needs — a partial swap's cursor must
+    # advance exactly to the last included chunk's through, never to the
+    # live read position (which covers chunks left behind).
+    # INVARIANT (slice-cursor correctness and the TLA refinement both
+    # stand on it): entries are strictly ascending by through — the poll
+    # thread is the only writer, chunk_end is monotone per group, and
+    # every position REWIND clears the buffer and bumps the epoch.
+    entries: list[tuple[pa.Table, int]] = field(default_factory=list)
     rows: int = 0
     bytes: int = 0
     first_buffered_at: float | None = None  # monotonic; None when empty
+    # Set when this buffer is the REMAINDER of a partial swap: the next
+    # flush must not wait out the interval trigger (the pile is already
+    # older than one flush; stalling its tail would add up to a full
+    # interval of latency exactly when catch-up is being watched).
+    sliced_remainder: bool = False
 
 
 @dataclass(frozen=True)
@@ -373,7 +386,7 @@ class DeliveryManager:
                 )
                 return
             buf = self._buffers[dest_id]
-            buf.tables.append(table)
+            buf.entries.append((table, through_snapshot))
             buf.rows += table.num_rows
             buf.bytes += table.nbytes
             self._buffered_rows_total[dest_id] += table.num_rows
@@ -461,15 +474,54 @@ class DeliveryManager:
                 if trigger is None:
                     continue
                 buf = self._buffers[dest_id]
-                tables, through = buf.tables, self._position[dest_id]
-                # Buffer swap: the live buffer resets; reads keep landing
-                # in the fresh one while the worker owns the snapshot.
-                self._buffers[dest_id] = _Buffer()
+                # Flush-batch slicing: one swap takes at most
+                # flush_batch_max_rows, cut at CHUNK boundaries (a single
+                # oversize chunk still goes whole — cdc_chunk_snapshots
+                # bounds that). Without the cap, a slow flush lets the
+                # buffer pile up and the next swap takes everything — the
+                # feedback loop that produced 170-440K-row batches and
+                # drove the fork's native layer into buffer-manager
+                # corruption (2026-07-29). The remainder stays buffered
+                # with its age preserved, so the interval trigger keeps
+                # the pipeline of bounded slices draining.
+                cap = self._cfg.flush_batch_max_rows
+                take = len(buf.entries)
+                if cap > 0:
+                    taken_rows = 0
+                    take = 0
+                    for tbl, _through in buf.entries:
+                        if take > 0 and taken_rows + tbl.num_rows > cap:
+                            break
+                        taken_rows += tbl.num_rows
+                        take += 1
+                sliced = buf.entries[:take]
+                remainder = buf.entries[take:]
+                tables = [tbl for tbl, _ in sliced]
+                if remainder:
+                    # Cursor for a partial swap: the last included chunk's
+                    # through — NOT the live position, which covers the
+                    # chunks left behind.
+                    through = sliced[-1][1] if sliced else self._flushed[dest_id]
+                else:
+                    # Full swap: position may be ahead of the last chunk
+                    # (position-only advances); preserve the historical
+                    # persist-through-position behavior.
+                    through = self._position[dest_id]
+                rem_buf = _Buffer()
+                for tbl, thr in remainder:
+                    rem_buf.entries.append((tbl, thr))
+                    rem_buf.rows += tbl.num_rows
+                    rem_buf.bytes += tbl.nbytes
+                if remainder:
+                    rem_buf.first_buffered_at = buf.first_buffered_at
+                    rem_buf.sliced_remainder = True
+                self._buffers[dest_id] = rem_buf
                 self._inflight.add(dest_id)
-                self._inflight_bytes[dest_id] = buf.bytes
-                self._position_dirty_since[dest_id] = None
-                metrics.delivery_buffer_rows.labels(destination=dest_id).set(0)
-                metrics.delivery_buffer_bytes.labels(destination=dest_id).set(0)
+                self._inflight_bytes[dest_id] = buf.bytes - rem_buf.bytes
+                if not remainder:
+                    self._position_dirty_since[dest_id] = None
+                metrics.delivery_buffer_rows.labels(destination=dest_id).set(rem_buf.rows)
+                metrics.delivery_buffer_bytes.labels(destination=dest_id).set(rem_buf.bytes)
                 future = self._executor.submit(self._flush, dest_id, tables, through, trigger)
                 # _flush catches everything it expects; anything escaping
                 # (a bug) must not vanish into an unobserved Future.
@@ -583,6 +635,12 @@ class DeliveryManager:
         # the cap with its intake stopped.
         if has_data and self._dest_bytes_locked(dest_id) >= self._per_dest_cap:
             return "memory"
+        if has_data and buf.sliced_remainder:
+            # The tail of a sliced pile drains as soon as the in-flight
+            # slice completes — never on the interval cadence (slicing
+            # review F1: a mid-size remainder below the rows/bytes
+            # thresholds would otherwise stall up to flush_interval).
+            return "sliced"
         if has_data and buf.rows >= self._cfg.flush_max_rows:
             return "rows"
         if has_data and buf.bytes >= self._cfg.flush_max_bytes:
