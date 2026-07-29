@@ -97,15 +97,20 @@ class LifecycleTracker:
 
     # -- membership (C3 reconciler; poll-thread only) ------------------------
 
-    def add(self, dest_id: str) -> None:
+    def add(self, dest_id: str, state: str | None = None) -> None:
         """Track a dynamically added destination. Without this the tracker's
         membership is frozen at construction and a later pause/retire of a
-        dynamically added id would never apply (v4 review F2). The caller
-        loads + honors the id's lifecycle row at activation; here it enters
-        as ACTIVE and the next apply() cycle absorbs the real row."""
+        dynamically added id would never apply (v4 review F2). The
+        reconciler passes the freshly loaded lifecycle row's raw state so
+        operator intent applies from the FIRST cycle (a paused id enters
+        paused, not active-for-one-cycle); a bare add preserves any
+        existing state and defaults to active."""
         if dest_id not in self.dest_ids:
             self.dest_ids.append(dest_id)
-        self._states.setdefault(dest_id, ACTIVE)
+        if state is None:
+            self._states.setdefault(dest_id, ACTIVE)
+        else:
+            self._states[dest_id] = normalize(state, dest_id, log_unknown=True)
         metrics.set_destination_lifecycle(dest_id, self._states[dest_id], VALID_STATES)
 
     def remove(self, dest_id: str) -> None:

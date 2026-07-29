@@ -57,7 +57,7 @@ from types import MappingProxyType
 
 from viaduck import metrics
 from viaduck.config import DeferredUriSource, DestinationConfig
-from viaduck.k8s_secrets import SecretReadError, read_secret_key_cached
+from viaduck.k8s_secrets import SecretReadError, read_secret_key_cached, read_secret_key_fresh
 from viaduck.scrub import scrub_credentials
 
 log = logging.getLogger(__name__)
@@ -432,44 +432,81 @@ def materialize(
         if heartbeat is not None:
             heartbeat()
         rv = str(m.team_id)
-        if rv in static_routing_values:
-            log.warning(
-                "Discovered destination %s: routing value %s owned by a static destination — static wins "
-                "(delete the static entry to cut this tenant over to discovery; gap-free cutover requires "
-                "the static id to already equal %s so the cursor row carries over)",
-                m.dest_id,
-                rv,
-                m.dest_id,
-            )
-            continue
-        if m.dest_id in static_ids:
-            _broken("id_collision", f"{m.dest_id} collides with a static destination id (different routing value)")
-            continue
-        # Defense-in-depth against a spoofed payload (it directs which
-        # Secret we read and where the password gets sent in a libpq
-        # handshake): endpoints and secret namespaces must match the
-        # configured allowlists.
-        if allowed_endpoint_suffixes and not any(m.pg_endpoint.endswith(sfx) for sfx in allowed_endpoint_suffixes):
-            _broken("endpoint_not_allowed", f"{m.dest_id}: endpoint {m.pg_endpoint!r} outside allowed suffixes")
-            continue
-        if allowed_secret_namespaces and m.secret_namespace not in allowed_secret_namespaces:
-            _broken("namespace_not_allowed", f"{m.dest_id}: secret namespace {m.secret_namespace!r} not allowed")
-            continue
         if rv in seen_rvs or m.dest_id in seen_ids:
             _broken("duplicate", f"{m.dest_id}: payload served routing value {rv} or id more than once (first wins)")
             continue
-        try:
-            # Materializability PROBE (C3 §4/§5): the password is NOT
-            # baked into the config — the pool resolves the ref at
-            # connection-create time (TTL cache, stale-fallback), so
-            # rotation heals via ordinary evict/recreate. The probe keeps
-            # startup RBAC/absence validation loud (secret_unreadable
-            # counter) and warms the cache so the first flush does no
-            # API read. STAGE-4 NOTE: at startup the cache is always cold,
-            # so this genuinely validates. A stage-4 activate/fence-release
-            # materializability check must probe with ttl_s=0 and must NOT
-            # stale-fallback — "validate now" and "keep flushing" want
-            # different failure semantics; don't reuse this call shape.
+        cfg = materialize_one(
+            m,
+            static_routing_values,
+            defaults,
+            static_ids,
+            secret_timeout_s=secret_timeout_s,
+            secret_cache_ttl_s=secret_cache_ttl_s,
+            allowed_endpoint_suffixes=allowed_endpoint_suffixes,
+            allowed_secret_namespaces=allowed_secret_namespaces,
+        )
+        if cfg is None:
+            continue
+        seen_rvs.add(rv)
+        seen_ids.add(m.dest_id)
+        out.append(cfg)
+    return out
+
+
+def materialize_one(
+    m: MappedDestination,
+    static_routing_values: set[str],
+    defaults: dict,
+    static_ids: set[str] | None = None,
+    *,
+    secret_timeout_s: float = 10.0,
+    secret_cache_ttl_s: float = 300.0,
+    allowed_endpoint_suffixes: tuple[str, ...] = (),
+    allowed_secret_namespaces: tuple[str, ...] = (),
+    probe_fresh: bool = False,
+) -> DestinationConfig | None:
+    """One candidate -> DestinationConfig, or None (reason counted).
+    Shared by startup materialize() and the reconciler's activate
+    (which passes probe_fresh=True: an activation must prove the secret
+    is readable NOW — no TTL hit, no stale-fallback)."""
+    static_ids = static_ids or set()
+    rv = str(m.team_id)
+    if rv in static_routing_values:
+        log.warning(
+            "Discovered destination %s: routing value %s owned by a static destination — static wins "
+            "(delete the static entry to cut this tenant over to discovery; gap-free cutover requires "
+            "the static id to already equal %s so the cursor row carries over)",
+            m.dest_id,
+            rv,
+            m.dest_id,
+        )
+        return None
+    if m.dest_id in static_ids:
+        _broken("id_collision", f"{m.dest_id} collides with a static destination id (different routing value)")
+        return None
+    # Defense-in-depth against a spoofed payload (it directs which
+    # Secret we read and where the password gets sent in a libpq
+    # handshake): endpoints and secret namespaces must match the
+    # configured allowlists.
+    if allowed_endpoint_suffixes and not any(m.pg_endpoint.endswith(sfx) for sfx in allowed_endpoint_suffixes):
+        _broken("endpoint_not_allowed", f"{m.dest_id}: endpoint {m.pg_endpoint!r} outside allowed suffixes")
+        return None
+    if allowed_secret_namespaces and m.secret_namespace not in allowed_secret_namespaces:
+        _broken("namespace_not_allowed", f"{m.dest_id}: secret namespace {m.secret_namespace!r} not allowed")
+        return None
+    try:
+        # Materializability PROBE (C3 §4/§5): the password is NOT baked
+        # into the config — the pool resolves the ref at
+        # connection-create time (TTL cache, stale-fallback), so
+        # rotation heals via ordinary evict/recreate. The probe keeps
+        # RBAC/absence validation loud (secret_unreadable counter) and
+        # warms the cache so the first flush does no API read. Startup
+        # probes through the TTL cache (cold at process start — a real
+        # read); the reconciler's activate passes probe_fresh=True
+        # ("validate now": always hits the API, never stale-falls-back).
+        if probe_fresh:
+            read_secret_key_fresh(m.secret_namespace, m.secret_name, m.secret_key, timeout_s=secret_timeout_s)
+        else:
             read_secret_key_cached(
                 m.secret_namespace,
                 m.secret_name,
@@ -477,40 +514,35 @@ def materialize(
                 ttl_s=secret_cache_ttl_s,
                 timeout_s=secret_timeout_s,
             )
-        except SecretReadError as e:
-            _broken("secret_unreadable", f"{m.dest_id}: {e}")
-            continue
-        seen_rvs.add(rv)
-        seen_ids.add(m.dest_id)
-        props = {"memory_limit": defaults.get("memory_limit", "8GB")}
-        props.update(defaults.get("properties", {}))
-        out.append(
-            DestinationConfig(
-                id=m.dest_id,
-                routing_value=rv,
-                name=m.dest_id,
-                postgres_uri_env="",
-                uri_source=DeferredUriSource(
-                    pg_endpoint=m.pg_endpoint,
-                    pg_port=m.pg_port,
-                    pg_database=m.pg_database,
-                    pg_username=m.pg_username,
-                    secret_namespace=m.secret_namespace,
-                    secret_name=m.secret_name,
-                    secret_key=m.secret_key,
-                    sslmode=defaults.get("sslmode", "disable"),
-                ),
-                data_path=m.data_path,
-                table=m.table,
-                properties=props,
-                # Canonical shape is uniform across discovered tenants:
-                # projection on, captured_at dropped (plan C2 convention
-                # defaults; per-org exceptions stay static-config-only).
-                schema_projection_enabled=True,
-                drop_source_columns=tuple(defaults.get("drop_source_columns", ("captured_at",))),
-            )
-        )
-    return out
+    except SecretReadError as e:
+        _broken("secret_unreadable", f"{m.dest_id}: {e}")
+        return None
+    props = {"memory_limit": defaults.get("memory_limit", "8GB")}
+    props.update(defaults.get("properties", {}))
+    return DestinationConfig(
+        id=m.dest_id,
+        routing_value=rv,
+        name=m.dest_id,
+        postgres_uri_env="",
+        uri_source=DeferredUriSource(
+            pg_endpoint=m.pg_endpoint,
+            pg_port=m.pg_port,
+            pg_database=m.pg_database,
+            pg_username=m.pg_username,
+            secret_namespace=m.secret_namespace,
+            secret_name=m.secret_name,
+            secret_key=m.secret_key,
+            sslmode=defaults.get("sslmode", "disable"),
+        ),
+        data_path=m.data_path,
+        table=m.table,
+        properties=props,
+        # Canonical shape is uniform across discovered tenants:
+        # projection on, captured_at dropped (plan C2 convention
+        # defaults; per-org exceptions stay static-config-only).
+        schema_projection_enabled=True,
+        drop_source_columns=tuple(defaults.get("drop_source_columns", ("captured_at",))),
+    )
 
 
 @dataclass
@@ -542,6 +574,14 @@ class DriftWatcher:
     poll_interval_s: float
     baseline: dict[str, MappedDestination]
     startup_generation: int
+    # True when the C3 reconciler is applying views (discovery.
+    # apply_enabled): the vs-STARTUP drift comparison below is then
+    # permanently wrong after the first applied change (an applied add
+    # reads as drift forever, and "restart to apply" is false guidance),
+    # so it is skipped — pending UNAPPLIED work is exported by the
+    # reconciler on viaduck_reconciler_pending{reason} instead. The
+    # applied-registry-baseline rework lands with the dashboards PR.
+    apply_mode: bool = False
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
     _last_drift: tuple[frozenset, frozenset, frozenset] = (frozenset(), frozenset(), frozenset())
@@ -614,11 +654,17 @@ class DriftWatcher:
         elif not view.parse_poisoned and self._poison_reported:
             self._poison_reported = False
             log.info("Discovery view poison cleared; absence evaluation resumes")
-        # Baseline drift comparison stays on the startable/mapped level
-        # (same construction as before — last-wins dict over the raw
-        # list) until stage 4 redefines the baseline as the applied
-        # registry.
+        # Baseline drift comparison (skipped in apply_mode below) stays
+        # on the startable/mapped level — last-wins dict over the raw
+        # list, same construction as always.
         current = {e.dest_id: e.mapped for e in view.entry_list if e.mapped is not None}
+        if self.apply_mode:
+            # Reconciler active: the classified view IS the handoff; the
+            # vs-startup comparison below would read every applied change
+            # as permanent drift. The fence ERROR escalation is also
+            # obsolete (no fixed set to protect — flushes fail against
+            # the DB fence and rule 2 restarts on the changed config).
+            return
         if not self.baseline and self.startup_generation == -1 and current and not self._recovery_logged:
             self._recovery_logged = True
             log.warning(

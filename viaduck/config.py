@@ -459,6 +459,27 @@ class DiscoveryConfig:
     auth_token_env: str | None = None
     poll_interval_s: float = 60.0
     request_timeout_s: float = 10.0
+    # C3 reconciler (viaduck/reconciler.py). Default OFF: the classified
+    # view publishes and its metrics tick, but nothing acts on it until
+    # this flips (restart-to-flip: config is frozen and loaded once; the
+    # flip is a values change -> ConfigMap checksum -> rolling restart).
+    apply_enabled: bool = False
+    # Stop debounce: a RUNNING discovered destination deactivates only
+    # after this many CONSECUTIVE clean fetches (successful, un-poisoned
+    # views) observe it absent. A mentioned id (startable or not) resets
+    # its counter; failed fetches and poisoned views freeze all counters.
+    absent_stop_fetches: int = 3
+    # Mass-stop floor: refuse the stop half of a view that would
+    # deactivate more than max(1, ceil(fraction * running-discovered))
+    # workers (min_destinations is the absolute floor). Activations and
+    # restarts from the same view still apply. Availability guard, not a
+    # data guard — a false stop self-heals from the cursor within source
+    # retention.
+    stop_floor_fraction: float = 0.5
+    # Rate cap on config-swap restarts (reshard completions): each pool
+    # evict/recreate cycle costs ~160MB to the fork-side leak, so bound
+    # restarts per unit time rather than per cycle.
+    restart_min_interval_s: float = 300.0
     # Refuse a payload mapping fewer destinations than this at startup
     # (fail to static-only, synced=0): a CP bug serving an empty list must
     # not silently vanish every discovered tenant on the next restart.
@@ -495,6 +516,12 @@ class DiscoveryConfig:
             raise ConfigError("discovery poll_interval_s/request_timeout_s/materialize_deadline_s must be positive")
         if self.secret_cache_ttl_s <= 0:
             raise ConfigError("discovery.secret_cache_ttl_s must be positive")
+        if self.absent_stop_fetches < 1:
+            raise ConfigError("discovery.absent_stop_fetches must be >= 1")
+        if not (0.0 < self.stop_floor_fraction <= 1.0):
+            raise ConfigError("discovery.stop_floor_fraction must be in (0, 1]")
+        if self.restart_min_interval_s < 0:
+            raise ConfigError("discovery.restart_min_interval_s must be >= 0")
         if self.min_destinations < 0:
             raise ConfigError("discovery.min_destinations must be >= 0")
         d = self.defaults
@@ -625,17 +652,20 @@ class ViaduckConfig:
 
     def assigned_destination_ids(self) -> list[str]:
         """Return destination IDs assigned to this instance based on partition config."""
-        all_ids = [d.id for d in self.destinations]
+        return [did for did in (d.id for d in self.destinations) if self.is_assigned(did)]
+
+    def is_assigned(self, dest_id: str) -> bool:
+        """Per-id assignment predicate — the same rule assigned_destination_ids
+        applies, usable for ids that are not in the startup config (the
+        reconciler's dynamically discovered destinations; without this
+        every instance of a hash-partitioned fleet would adopt every new
+        tenant)."""
         mode = self.instance.partition.mode
-        if mode == "all":
-            return all_ids
-        elif mode == "explicit":
-            return [did for did in self.instance.partition.include if did in all_ids]
-        elif mode == "hash":
-            total = self.instance.partition.total
-            ordinal = self.instance.partition.ordinal
-            return [did for did in all_ids if _stable_hash(did) % total == ordinal]
-        return all_ids
+        if mode == "explicit":
+            return dest_id in self.instance.partition.include
+        if mode == "hash":
+            return _stable_hash(dest_id) % self.instance.partition.total == self.instance.partition.ordinal
+        return True
 
 
 def _stable_hash(value: str) -> int:
@@ -810,6 +840,10 @@ def load(path: str | Path) -> ViaduckConfig:
             min_destinations=int(disc_raw.get("min_destinations", 1)),
             materialize_deadline_s=float(disc_raw.get("materialize_deadline_s", 60.0)),
             secret_cache_ttl_s=float(disc_raw.get("secret_cache_ttl_s", 300.0)),
+            apply_enabled=bool(disc_raw.get("apply_enabled", False)),
+            absent_stop_fetches=int(disc_raw.get("absent_stop_fetches", 3)),
+            stop_floor_fraction=float(disc_raw.get("stop_floor_fraction", 0.5)),
+            restart_min_interval_s=float(disc_raw.get("restart_min_interval_s", 300.0)),
             allowed_endpoint_suffixes=tuple(
                 disc_raw.get("allowed_endpoint_suffixes", [".ducklings.svc", ".ducklings.svc.cluster.local"])
             ),

@@ -772,6 +772,14 @@ class DeliveryManager:
             self._active.discard(dest_id)
             self._recompute_per_dest_cap_locked()
 
+    def inflight_ids(self) -> set[str]:
+        """Ids with a flush in flight — the reconciler defers metric
+        label removal for a deactivated id until it leaves this set (an
+        in-flight flush calling .labels() after a .remove() re-creates
+        the series frozen)."""
+        with self._lock:
+            return set(self._inflight)
+
     def active_ids(self) -> set[str]:
         with self._lock:
             return set(self._active)

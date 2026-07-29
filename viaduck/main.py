@@ -727,6 +727,8 @@ def run(cfg: config.ViaduckConfig) -> None:
         baseline: dict[str, disco.MappedDestination] = {}
         generation = -1
         discovered: list = []
+        static_routing_values = {d.routing_value for d in cfg.destinations}
+        static_only_ids = {d.id for d in cfg.destinations}
         try:
             auth = cfg.discovery.auth_header()
             payload = None
@@ -750,9 +752,9 @@ def run(cfg: config.ViaduckConfig) -> None:
                 )
             discovered = disco.materialize(
                 mapped,
-                {d.routing_value for d in cfg.destinations},
+                static_routing_values,
                 cfg.discovery.defaults,
-                static_ids={d.id for d in cfg.destinations},
+                static_ids=static_only_ids,
                 # Bounded wall time: N sequential Secret reads against a
                 # blackholed API server must not eat the liveness grace
                 # and crashloop static tenants (round-2 review). The
@@ -813,6 +815,7 @@ def run(cfg: config.ViaduckConfig) -> None:
             poll_interval_s=cfg.discovery.poll_interval_s,
             baseline=baseline,
             startup_generation=generation,
+            apply_mode=cfg.discovery.apply_enabled,
         )
     # The registry is built from the post-merge cfg and is THE runtime
     # resolution path for destination configs — the pool, the poll cycle,
@@ -935,6 +938,33 @@ def run(cfg: config.ViaduckConfig) -> None:
         cfg.instance.id,
     )
 
+    reconciler = None
+    if drift_watcher is not None and cfg.discovery.apply_enabled:
+        from viaduck.reconciler import Reconciler
+
+        reconciler = Reconciler(
+            cfg,
+            registry,
+            delivery,
+            dest_pool,
+            tracker,
+            state_mgr,
+            static_routing_values=static_routing_values,
+            static_ids=static_only_ids,
+            baseline_mapped=dict(baseline),
+            src_head_fn=lambda: source.current_snapshot_id(src_table),
+            heartbeat=health.record_poll,
+        )
+        log.info(
+            "C3 reconciler ACTIVE (discovery.apply_enabled=true): CP-driven start/stop/restart, "
+            "k=%d clean fetches to stop, floor=%.0f%% (min_destinations=%d), "
+            "restart_min_interval_s=%.0f",
+            cfg.discovery.absent_stop_fetches,
+            cfg.discovery.stop_floor_fraction * 100,
+            cfg.discovery.min_destinations,
+            cfg.discovery.restart_min_interval_s,
+        )
+
     if drift_watcher is not None:
         drift_watcher.start()
 
@@ -950,20 +980,24 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     while not shutdown:
         try:
+            # C3 reconciler: apply the latest classified view BEFORE this
+            # cycle's lifecycle load and read planning, so an activation
+            # delivers this cycle and the retention-edge clamp covers a
+            # re-added stale cursor before its first read.
+            if reconciler is not None:
+                reconciler.apply(drift_watcher.latest())
+            # LIVE membership: the delivery manager's active set is the
+            # single authority (statics + reconciler adds − reconciler
+            # removes); with the reconciler off it equals the startup
+            # capture. Feeds the lifecycle load, read gating, and the
+            # status export.
+            current_ids = sorted(delivery.active_ids())
             # Refresh operator lifecycle intent. A state-store blip keeps
             # the last-known states (fail-safe: intent changes rarely; not
             # delivering on a stale ACTIVE would be worse than delivering
             # one cycle late on a stale PAUSE).
             try:
-                # STAGE-4 DEPENDENCY: this load iterates the STARTUP
-                # capture. The reconciler must rewire it (and the tracker
-                # construction above) to the live registry snapshot, or a
-                # dynamically added id's lifecycle row is never fetched
-                # and a later pause/retire of it never applies — the
-                # frozen-membership defect (v4 review F2). Until then the
-                # membership APIs (delivery.add/remove_destination,
-                # tracker.add/remove) must have no production callers.
-                lifecycle_rows = state_mgr.load_lifecycle_rows(assigned_ids)
+                lifecycle_rows = state_mgr.load_lifecycle_rows(current_ids)
                 raw_lifecycle = {d: r["state"] for d, r in lifecycle_rows.items()}
             except Exception:
                 log.warning("Lifecycle state load failed; keeping last-known states", exc_info=True)
@@ -990,7 +1024,7 @@ def run(cfg: config.ViaduckConfig) -> None:
                 dest_pool,
                 router,
                 cfg,
-                assigned_ids,
+                current_ids,
                 reg_snap.rv_to_dest,
                 key_columns,
                 mode,
@@ -1389,11 +1423,11 @@ def _poll_cycle(
     snap_now = current_id if current_id is not None else 0
     dest_statuses = []
     delivery_snapshot = delivery.status_snapshot()
-    # status_snapshot() is active-filtered; assigned_ids is the startup
-    # capture. They are identical until the reconciler (stage 4) starts
-    # removing members mid-run — the intersection keeps a removal from
-    # KeyError-ing the cycle (which the run loop treats as fatal). Stage 4
-    # replaces assigned_ids with per-cycle registry-derived membership.
+    # status_snapshot() is active-filtered and assigned_ids is the
+    # caller's per-cycle membership (delivery.active_ids() in production).
+    # The two are computed a few lines apart, so the intersection keeps a
+    # reconciler mutation landing between them from KeyError-ing the
+    # cycle (which the run loop treats as fatal).
     status_ids = [d for d in assigned_ids if d in delivery_snapshot]
     _export_dest_time_lag(src_table, delivery_snapshot, status_ids, snap_now)
     for did in status_ids:

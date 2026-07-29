@@ -184,3 +184,15 @@ def invalidate(namespace: str, name: str, key: str) -> None:
     negligible, and stale-fallback still covers API outages."""
     with _cache_lock:
         _cache.pop((namespace, name, key), None)
+
+
+def read_secret_key_fresh(namespace: str, name: str, key: str, *, timeout_s: float = 10.0) -> str:
+    """A VALIDATING read: always hits the API, never stale-falls-back,
+    and seeds the cache on success. The reconciler's activate probe uses
+    this — "validate now" (an activation must prove the secret is
+    readable today) has opposite failure semantics to the connect path's
+    "keep flushing" (C3 §4)."""
+    value = read_secret_key(namespace, name, key, timeout_s=timeout_s)
+    with _cache_lock:
+        _cache[(namespace, name, key)] = (time.monotonic(), value)
+    return value

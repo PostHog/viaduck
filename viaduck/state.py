@@ -269,6 +269,23 @@ class StateManager:
 
         return self._run(_op)
 
+    def max_cursor_any_instance(self, destination_id: str) -> int | None:
+        """MAX(last_snapshot_id) across ALL instance rows for one
+        destination, or None when no row exists anywhere. The
+        reconciler's activate uses this when a fleet resize reshuffled
+        hash assignment: the new owner has no row of its own, and
+        initializing at head would silently skip everything between the
+        old owner's cursor and head (C3 §4 step 3)."""
+
+        def _op(conn: psycopg.Connection):
+            row = conn.execute(
+                f"SELECT MAX(last_snapshot_id) FROM {self._qualified} WHERE destination_id = %s",
+                (destination_id,),
+            ).fetchone()
+            return None if row is None or row[0] is None else int(row[0])
+
+        return self._run(_op)
+
     def advance_cursors(self, destination_ids: list[str], snapshot_id: int) -> None:
         """Advance multiple destinations to the same snapshot atomically.
 
