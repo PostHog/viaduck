@@ -1069,6 +1069,58 @@ def _export_dest_time_lag(src_table, delivery_snapshot, assigned_ids, snap_now: 
             log.debug("time-lag export failed; skipping this cycle", exc_info=True)
 
 
+def _clamp_expired_cursors(delivery, dest_ids, earliest_snapshot) -> set[str]:
+    """Retention-edge clamp (bug fix, not policy): advance any cursor that
+    has fallen below the earliest retained source snapshot up to the edge,
+    acknowledging the expired range — loudly (WARNING + counter, emitted
+    by DeliveryManager.clamp_to_retention, which owns the race-safe
+    check-and-stamp).
+
+    Without this, the CDC read from an expired cursor raises inside the
+    poll cycle and the run loop's fatal-error handler exits the loop: ONE
+    destination whose cursor outlived snapshot retention (re-add after a
+    long stop, a pause that outlived retention, a multi-day flush-failure
+    loop) takes delivery down for the WHOLE instance.
+
+    The clamp floor is earliest-1: reads are exclusive of the cursor, so a
+    cursor at earliest-1 reads from the oldest retained snapshot. Keyed on
+    the durable cursor (not position): flushed below the floor with
+    position above it is the flush-failure rewind hazard — the rewind goes
+    to flushed, and the next read from there would be the fatal one.
+
+    Failures are contained PER DESTINATION: one candidate's state-store
+    blip must not abort its peers' clamps, and a destination whose clamp
+    failed is returned so the caller excludes it from this cycle's reads —
+    proceeding to read from its still-expired cursor would be the exact
+    fatal path this function exists to remove. Retried next cycle.
+    """
+    still_expired: set[str] = set()
+    if earliest_snapshot is None:
+        return still_expired
+    floor = earliest_snapshot - 1
+    try:
+        flushed = delivery.flushed_snapshots()
+    except Exception:
+        log.warning("Retention-edge clamp check failed; skipping this cycle", exc_info=True)
+        return still_expired
+    for did in dest_ids:
+        if flushed.get(did, floor) >= floor:
+            continue
+        try:
+            delivery.clamp_to_retention(did, floor)
+        except Exception:
+            still_expired.add(did)
+            log.warning(
+                "Retention-edge clamp for %s failed (cursor %d < earliest retained %d); "
+                "excluding it from this cycle's reads, retrying next cycle",
+                did,
+                flushed[did],
+                earliest_snapshot,
+                exc_info=True,
+            )
+    return still_expired
+
+
 def _poll_cycle(
     src_table,
     delivery,
@@ -1107,7 +1159,11 @@ def _poll_cycle(
     cycle_rows_read = 0
     cycle_groups_processed = 0
 
-    current_id = source.current_snapshot_id(src_table)
+    # One combined MIN/MAX statement: the postgres scanner does no aggregate
+    # pushdown, so separate earliest/current queries would each pull the
+    # full snapshot-id column per cycle.
+    bounds = source.snapshot_bounds(src_table)
+    earliest_id, current_id = bounds if bounds is not None else (None, None)
     if current_id is not None:
         metrics.source_snapshot_id.set(current_id)
 
@@ -1117,6 +1173,14 @@ def _poll_cycle(
             _log_watermark_paused("all destinations at buffer cap")
         else:
             _log_watermark_cleared()
+            # Retention-edge clamp BEFORE the plan snapshot, so a clamped
+            # destination's read starts from the clamped cursor this cycle.
+            # A destination whose clamp FAILED sits out this cycle's reads:
+            # reading from its still-expired cursor would raise, and the
+            # run loop treats poll-cycle errors as fatal.
+            still_expired = _clamp_expired_cursors(delivery, read_ids, earliest_id)
+            if still_expired:
+                read_ids = [d for d in read_ids if d not in still_expired]
             plan = delivery.read_plan()
             positions = {d: pos for d, (pos, _epoch) in plan.items()}
             epochs = {d: epoch for d, (_pos, epoch) in plan.items()}
@@ -1262,6 +1326,24 @@ def _poll_cycle(
                         delivery.maybe_flush()
                         chunk_start = chunk_end
 
+                    except Exception:
+                        # Contain read/route/buffer failures to THIS group:
+                        # letting them propagate makes the run loop exit for
+                        # the whole instance. The residual retention-expiry
+                        # race lands here too (the floor is computed once
+                        # per cycle; an expiry job advancing it mid-cycle
+                        # makes this group's read raise — next cycle's clamp
+                        # absorbs it). Source-connection death still exits
+                        # via snapshot_bounds at the top of the cycle, so a
+                        # dead catalog connection keeps its restart-to-heal
+                        # behavior.
+                        log.exception(
+                            "CDC read failed for group at %d (chunk %s); skipping group this cycle",
+                            start_snap,
+                            snap_range,
+                        )
+                        metrics.errors_total.labels(type="cdc_read", destination="").inc()
+                        break
                     finally:
                         _hb.set()
 

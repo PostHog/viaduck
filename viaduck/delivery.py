@@ -215,6 +215,98 @@ class DeliveryManager:
         with self._lock:
             return dict(self._position)
 
+    def flushed_snapshots(self) -> dict[str, int]:
+        """Durable-cursor view (in-memory mirror) for the retention-edge
+        clamp check in the poll cycle."""
+        with self._lock:
+            return dict(self._flushed)
+
+    def clamp_to_retention(self, dest_id: str, floor_snapshot: int) -> int | None:
+        """Retention-edge clamp — a data-loss acknowledgment, never policy.
+
+        The durable cursor has fallen below the earliest retained source
+        snapshot: the range (flushed, floor] is no longer re-readable. Left
+        alone, the next CDC read from it raises inside the poll cycle and
+        the run loop treats that as fatal — one expired destination takes
+        the whole instance down. Advance flushed (durable + in-memory) and
+        position to the floor so the next read starts at the oldest
+        retained snapshot.
+
+        Durable persist happens FIRST (with the flush path's retry): a
+        crash in between re-runs the clamp as a no-op next cycle, whereas
+        the reverse order would let a first-flush failure rewind position
+        to the un-clamped durable cursor and re-read the expired range.
+        Race-safe against a concurrent flush success: the durable write
+        reports whether the monotonic guard dropped it, and the in-memory
+        stamp re-checks under the lock — a flush that advanced past the
+        floor in the check/write gap means nothing was lost, so no note,
+        no counter, return None. A zombie flush with through < floor
+        cannot regress the clamp (success path max-guards _flushed);
+        position is epoch-bumped when raised so a CDC read that overlapped
+        the raise is discarded (buffer() stamps position unconditionally).
+
+        Buffered rows are kept: anything already read is valid data, and
+        its flush advances the cursor from the floor onward. The
+        acknowledgment is outcome-honest: rows never read (position below
+        the floor) are LOST; a range that was read but not durably flushed
+        is AT RISK — it materializes as loss only if the pending flush
+        fails (the rewind then lands on the floor).
+
+        The durable loss note (record_error) is best-effort by
+        construction: advance_cursor just cleared the error columns, and a
+        crash before the re-record leaves the WARNING + counter as the
+        only record. The next successful flush clears the note either way.
+
+        Returns the pre-clamp flushed snapshot, or None if no clamp was
+        needed (including a lost race).
+        """
+        with self._lock:
+            old_flushed = self._flushed[dest_id]
+            if old_flushed >= floor_snapshot:
+                return None
+        # cumulative_rows=None preserves the persisted count — no rows moved.
+        if self._advance_cursor_with_retry(dest_id, floor_snapshot, None) == 0:
+            # Monotonic guard dropped the write: a concurrent flush advanced
+            # the durable cursor past the floor. Nothing was lost.
+            return None
+        with self._lock:
+            if self._flushed[dest_id] >= floor_snapshot:
+                # Same race, memory side: the flush's success path got here
+                # between our durable write and this stamp.
+                return None
+            self._flushed[dest_id] = floor_snapshot
+            position = self._position[dest_id]
+            if position < floor_snapshot:
+                self._position[dest_id] = floor_snapshot
+                self._epoch[dest_id] += 1
+            unread_through = min(position, floor_snapshot)
+            if position < floor_snapshot:
+                loss_note = (
+                    f"cursor clamped to retention edge: snapshots ({unread_through}, {floor_snapshot}] "
+                    f"expired UNREAD and are lost"
+                )
+                outcome = "lost"
+            else:
+                loss_note = (
+                    f"cursor clamped to retention edge: re-read window for ({old_flushed}, {floor_snapshot}] "
+                    f"expired; the range is buffered/in-flight and is lost only if its pending flush fails"
+                )
+                outcome = "at_risk"
+            self._last_error[dest_id] = loss_note
+        metrics.retention_clamp_total.labels(destination=dest_id, outcome=outcome).inc()
+        log.warning(
+            "RETENTION-EDGE CLAMP: destination %s cursor %d -> %d — %s",
+            dest_id,
+            old_flushed,
+            floor_snapshot,
+            loss_note,
+        )
+        try:
+            self._state.record_error(dest_id, loss_note)
+        except Exception:
+            log.warning("Could not record retention-clamp note for %s", dest_id, exc_info=True)
+        return old_flushed
+
     def read_plan(self) -> dict[str, tuple[int, int]]:
         """Atomic snapshot of (position, epoch) per destination. The epoch
         must be passed back to buffer()/advance_position() so reads that
@@ -486,14 +578,20 @@ class DeliveryManager:
                     self._position[dest_id] = through
                     self._epoch[dest_id] += 1
                 self._rows_replicated[dest_id] = cumulative
-                self._last_error[dest_id] = None
+                # Clear the error only when this flush is at/ahead of the
+                # cursor. A zombie flush (through < flushed — a retention
+                # clamp landed mid-flight) must not clear the clamp's loss
+                # note or regress the cursor gauge.
+                flushed_after = self._flushed[dest_id]
+                if through >= flushed_after:
+                    self._last_error[dest_id] = None
                 if type_counts is not None:
                     applied = self._applied[dest_id]
                     applied["inserts"] += type_counts[0]
                     applied["updates"] += type_counts[1]
                     applied["deletes"] += type_counts[2]
             metrics.delivery_flushes_total.labels(destination=dest_id, trigger=trigger).inc()
-            metrics.dest_last_snapshot_id.labels(destination=dest_id).set(through)
+            metrics.dest_last_snapshot_id.labels(destination=dest_id).set(flushed_after)
             if tables:
                 # Data flushes only: empty position-only persists must not
                 # report write latency or readiness "replication" signals.
@@ -534,11 +632,10 @@ class DeliveryManager:
                 self._inflight_bytes[dest_id] = 0
                 metrics.delivery_buffer_total_bytes.set(self._total_bytes_locked())
 
-    def _advance_cursor_with_retry(self, dest_id: str, through: int, cumulative: int, attempts: int = 3) -> None:
+    def _advance_cursor_with_retry(self, dest_id: str, through: int, cumulative: int | None, attempts: int = 3) -> int:
         for attempt in range(attempts):
             try:
-                self._state.advance_cursor(dest_id, through, cumulative_rows=cumulative)
-                return
+                return self._state.advance_cursor(dest_id, through, cumulative_rows=cumulative)
             except Exception:
                 if attempt == attempts - 1:
                     raise

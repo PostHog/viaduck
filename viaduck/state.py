@@ -229,7 +229,7 @@ class StateManager:
                 len(destination_ids),
             )
 
-    def advance_cursor(self, destination_id: str, snapshot_id: int, cumulative_rows: int | None = None) -> None:
+    def advance_cursor(self, destination_id: str, snapshot_id: int, cumulative_rows: int | None = None) -> int:
         """Update a destination's cursor after successful replication.
 
         A single upsert — atomic by construction. If cumulative_rows is
@@ -239,11 +239,16 @@ class StateManager:
         (CursorMonotonicity in tla/Viaduck.tla); per-destination flush
         serialization should prevent out-of-order acks, this is
         defense-in-depth.
+
+        Returns the affected row count: 0 means the monotonic guard
+        dropped the write (a concurrent advance got there first) — the
+        retention clamp uses this to detect a lost race instead of
+        recording a phantom data-loss note.
         """
         now = datetime.now(UTC)
 
         def _op(conn: psycopg.Connection):
-            conn.execute(
+            cur = conn.execute(
                 f"""
                 INSERT INTO {self._qualified}
                     (destination_id, instance_id, last_snapshot_id, last_replicated_at,
@@ -260,8 +265,9 @@ class StateManager:
                 """,
                 (destination_id, self._instance_id, snapshot_id, now, cumulative_rows, now, cumulative_rows),
             )
+            return cur.rowcount
 
-        self._run(_op)
+        return self._run(_op)
 
     def advance_cursors(self, destination_ids: list[str], snapshot_id: int) -> None:
         """Advance multiple destinations to the same snapshot atomically.

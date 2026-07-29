@@ -195,6 +195,14 @@ _lifecycle_discarded_rows_total = Counter(
     "Buffered rows discarded by a lifecycle pause/retire (durable in the source; re-read from the cursor on resume)",
     ["pipeline", "destination"],
 )
+_retention_clamp_total = Counter(
+    "viaduck_retention_clamp_total",
+    "Retention-edge cursor clamps: the destination's cursor fell below the earliest retained source "
+    "snapshot and was advanced to the edge. outcome=lost — the range was never read: unrecoverable "
+    "data loss, alert on it. outcome=at_risk — the range is buffered/in-flight and is lost only if "
+    "its pending flush fails",
+    ["pipeline", "destination", "outcome"],
+)
 _discovery_synced = Gauge(
     "viaduck_discovery_synced",
     "1 after a successful discovery poll; 0 = static-only (CP unreachable at startup) or stale drift view",
@@ -327,6 +335,7 @@ delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 delivery_reads_paused = _delivery_reads_paused
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
+retention_clamp_total = _retention_clamp_total
 discovery_synced = _discovery_synced
 discovery_config_generation = _discovery_config_generation
 discovery_last_success_timestamp_seconds = _discovery_last_success_timestamp_seconds
@@ -366,6 +375,7 @@ def init(pipeline: str):
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
+    global retention_clamp_total
     global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
     global discovery_poll_failures_total, discovery_broken_entries_total
     global discovery_destinations, discovery_drift_destinations, discovery_drift_transitions_total
@@ -383,6 +393,7 @@ def init(pipeline: str):
     delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
     destination_lifecycle_state = _AutoPipelineLabels(_destination_lifecycle_state, pipeline)
     lifecycle_discarded_rows_total = _AutoPipelineLabels(_lifecycle_discarded_rows_total, pipeline)
+    retention_clamp_total = _AutoPipelineLabels(_retention_clamp_total, pipeline)
     discovery_broken_entries_total = _AutoPipelineLabels(_discovery_broken_entries_total, pipeline)
     discovery_drift_destinations = _AutoPipelineLabels(_discovery_drift_destinations, pipeline)
     discovery_drift_transitions_total = _AutoPipelineLabels(_discovery_drift_transitions_total, pipeline)

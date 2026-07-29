@@ -17,6 +17,7 @@ from viaduck.apply import (
     append_only,
 )
 from viaduck.main import (
+    _clamp_expired_cursors,
     _derive_dest_status,
     _fmt_duration,
     _group_by_cursor,
@@ -701,6 +702,7 @@ def _make_delivery(positions: dict[str, int]):
 
     delivery = MagicMock()
     delivery.positions.return_value = dict(positions)
+    delivery.flushed_snapshots.return_value = dict(positions)
     delivery.read_plan.return_value = {d: (snap, 0) for d, snap in positions.items()}
     delivery.should_pause_all_reads.return_value = False
     delivery.should_pause_reads_for.return_value = False
@@ -727,7 +729,7 @@ def test_poll_cycle_no_snapshots():
     router = MagicMock()
     cfg = _make_cfg([])
 
-    with patch("viaduck.main.source.current_snapshot_id", return_value=None):
+    with patch("viaduck.main.source.snapshot_bounds", return_value=None):
         _poll_cycle(MagicMock(), delivery, MagicMock(), router, cfg, [], {}, key_columns=[], mode="append_only")
 
     delivery.read_plan.assert_not_called()
@@ -740,7 +742,7 @@ def test_poll_cycle_all_caught_up():
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
 
-    with patch("viaduck.main.source.current_snapshot_id", return_value=10):
+    with patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)):
         _poll_cycle(
             MagicMock(),
             delivery,
@@ -769,7 +771,7 @@ def test_poll_cycle_routes_and_buffers():
     router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data),
     ):
         _poll_cycle(
@@ -797,7 +799,7 @@ def test_poll_cycle_empty_changeset_advances_positions():
 
     empty = pa.table({"company": pa.array([], type=pa.string())})
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=empty),
     ):
         _poll_cycle(
@@ -829,7 +831,7 @@ def test_poll_cycle_routing_error_breaks_gracefully():
     router.split_and_count.side_effect = RoutingError("routing field missing")
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data),
     ):
         _poll_cycle(
@@ -866,7 +868,7 @@ def test_poll_cycle_chunks_large_range():
         return arrow_data
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", side_effect=fake_read_cdc),
     ):
         _poll_cycle(
@@ -910,7 +912,7 @@ def test_poll_cycle_chunk_end_not_current_id():
     router.split_and_count.return_value = ({"a": row_a}, 0)
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=7),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 7)),
         patch("viaduck.main.source.read_cdc", side_effect=fake_read),
     ):
         _poll_cycle(
@@ -944,7 +946,7 @@ def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
     empty = pa.table({"company": pa.array([], type=pa.string())})
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=empty),
     ):
         _poll_cycle(
@@ -977,7 +979,7 @@ def test_poll_cycle_advances_no_data_destinations():
     router.split_and_count.return_value = ({"a": arrow_data}, 0)
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data),
     ):
         _poll_cycle(
@@ -1005,7 +1007,7 @@ def test_poll_cycle_pauses_reads_at_watermark():
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
 
-    with patch("viaduck.main.source.current_snapshot_id", return_value=10):
+    with patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)):
         _poll_cycle(
             MagicMock(),
             delivery,
@@ -1037,7 +1039,7 @@ def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
     delivery.should_pause_reads_for.side_effect = [False, True]
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=empty),
     ):
         _poll_cycle(
@@ -1090,7 +1092,7 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
     router.build_filter_expr.return_value = None
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=1000),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 1000)),
         patch("viaduck.main.source.read_cdc", side_effect=fake_read),
     ):
         _poll_cycle(
@@ -1143,7 +1145,7 @@ def test_poll_cycle_stuck_destination_at_cap_does_not_block_healthy_peer():
     router.build_filter_expr.return_value = None
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=1000),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 1000)),
         patch("viaduck.main.source.read_cdc", side_effect=fake_read),
     ):
         _poll_cycle(
@@ -1194,7 +1196,7 @@ def test_poll_cycle_mixed_group_reads_only_members_with_headroom():
     router.build_filter_expr.side_effect = fake_filter
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=300),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 300)),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data),
     ):
         _poll_cycle(
@@ -1250,7 +1252,7 @@ def test_poll_cycle_lagging_group_cannot_monopolize_reads():
     router.build_filter_expr.return_value = None
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10_000),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10_000)),
         patch("viaduck.main.source.read_cdc", side_effect=fake_read),
     ):
         _poll_cycle(
@@ -1284,7 +1286,7 @@ def test_poll_cycle_snapshot_at_zero():
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
 
-    with patch("viaduck.main.source.current_snapshot_id", return_value=0):
+    with patch("viaduck.main.source.snapshot_bounds", return_value=(1, 0)):
         _poll_cycle(
             MagicMock(),
             delivery,
@@ -1991,7 +1993,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
 
     delivery = _make_real_delivery(state_mgr, dest_pool, ["value"], ["dest-1"], mode="full_cdc")
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
     ):
         _poll_cycle(
@@ -2030,7 +2032,7 @@ def test_poll_cycle_append_only_unchanged():
 
     delivery = _make_real_delivery(state_mgr, dest_pool, [], ["dest-1"], mode="append_only")
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data) as mock_read_cdc,
         patch("viaduck.main.source.read_cdc_changes") as mock_read_changes,
     ):
@@ -2080,7 +2082,7 @@ def test_poll_cycle_cdc_delete_only_changeset():
 
     delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"], mode="full_cdc")
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
     ):
         _poll_cycle(
@@ -2129,7 +2131,7 @@ def test_poll_cycle_cdc_write_failure_isolation():
 
     delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1"], mode="full_cdc")
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc_changes", return_value=arrow_data),
         # Delivery threads its `_stopping` Event into `_write_with_retry`,
         # so retry backoff goes through `_backoff_sleep(delay, event)` →
@@ -2204,7 +2206,7 @@ def test_poll_cycle_cdc_routing_value_mutation():
 
     delivery = _make_real_delivery(state_mgr, dest_pool, ["company"], ["dest-1", "dest-2"], mode="full_cdc")
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc_changes", return_value=raw_data),
     ):
         _poll_cycle(
@@ -2236,7 +2238,7 @@ def test_poll_cycle_branches_on_key_columns():
 
     delivery = _make_delivery({"dest-1": 5})
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data) as mock_read_cdc,
         patch("viaduck.main.source.read_cdc_changes") as mock_read_changes,
     ):
@@ -2262,7 +2264,7 @@ def test_poll_cycle_branches_on_key_columns():
     router.split_and_count.return_value = ({"quacksworth": cdc_data}, 0)
     delivery = _make_delivery({"dest-1": 5})
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc") as mock_read_cdc2,
         patch("viaduck.main.source.read_cdc_changes", return_value=cdc_data) as mock_read_changes2,
     ):
@@ -2498,7 +2500,7 @@ def test_cdc_batch_rows_metric_observed():
 
     delivery = _make_delivery({"dest-1": 5})
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data),
         patch("viaduck.main.metrics.cdc_batch_rows") as mock_batch_metric,
     ):
@@ -3706,7 +3708,7 @@ def test_poll_cycle_wires_time_lag_export():
     cfg = _make_cfg([("dest-1", "quacksworth")])
 
     with (
-        patch("viaduck.main.source.current_snapshot_id", return_value=10),
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main._export_dest_time_lag") as ex,
     ):
         _poll_cycle(
@@ -3724,3 +3726,153 @@ def test_poll_cycle_wires_time_lag_export():
     args = ex.call_args[0]
     assert args[2] == ["dest-1"]
     assert args[3] == 10  # snap_now threaded through
+
+
+# ---------------------------------------------------------------------------
+# _clamp_expired_cursors (retention-edge clamp)
+# ---------------------------------------------------------------------------
+
+
+def test_clamp_expired_cursors_clamps_only_below_floor():
+    delivery = MagicMock()
+    delivery.flushed_snapshots.return_value = {"d1": 10, "d2": 99, "d3": 200}
+    delivery.clamp_to_retention.return_value = 10
+    assert _clamp_expired_cursors(delivery, ["d1", "d2", "d3"], 100) == set()
+    # floor = earliest - 1 = 99: d1 clamps; d2 sits exactly at the floor
+    # (its next read starts at the oldest retained snapshot); d3 is ahead.
+    delivery.clamp_to_retention.assert_called_once_with("d1", 99)
+
+
+def test_clamp_expired_cursors_no_snapshots_or_check_failure_is_noop():
+    delivery = MagicMock()
+    # No earliest snapshot (empty catalog): nothing to clamp against.
+    assert _clamp_expired_cursors(delivery, ["d1"], None) == set()
+    delivery.flushed_snapshots.assert_not_called()
+    # Best-effort: a flushed-snapshot read failure never breaks the cycle.
+    delivery.flushed_snapshots.side_effect = RuntimeError("pg down")
+    assert _clamp_expired_cursors(delivery, ["d1"], 100) == set()
+    delivery.clamp_to_retention.assert_not_called()
+
+
+def test_clamp_expired_cursors_scopes_to_given_ids():
+    # Paused/retired destinations are not readable and must not be clamped
+    # behind the operator's back — the clamp catches them on resume.
+    delivery = MagicMock()
+    delivery.flushed_snapshots.return_value = {"d1": 10, "paused-dest": 5}
+    delivery.clamp_to_retention.return_value = 10
+    _clamp_expired_cursors(delivery, ["d1"], 100)
+    delivery.clamp_to_retention.assert_called_once_with("d1", 99)
+
+
+def test_clamp_expired_cursors_failure_isolated_and_excludes_id():
+    # One candidate's clamp failure must not abort its peers, and the
+    # failed id is returned so the cycle excludes it from reads — reading
+    # its still-expired cursor would be the fatal path this exists to fix.
+    delivery = MagicMock()
+    delivery.flushed_snapshots.return_value = {"bad": 5, "good": 10}
+
+    def _clamp(did, floor):
+        if did == "bad":
+            raise RuntimeError("state store down")
+        return 10
+
+    delivery.clamp_to_retention.side_effect = _clamp
+    assert _clamp_expired_cursors(delivery, ["bad", "good"], 100) == {"bad"}
+    assert delivery.clamp_to_retention.call_count == 2
+
+
+def test_poll_cycle_clamps_before_reading_and_reads_from_floor():
+    # Pins the call-site ordering: the clamp runs BEFORE the plan snapshot,
+    # so a clamped destination's read starts at the retention floor THIS
+    # cycle — moving the clamp after read_plan() keeps the helper tests
+    # green while reintroducing the fatal expired read.
+    delivery = _make_delivery({"dest-1": 10})
+    delivery.flushed_snapshots.return_value = {"dest-1": 10}
+
+    def _clamp(did, floor):
+        # Mirror the real clamp: the plan the poll thread snapshots after
+        # this call must serve the clamped position.
+        delivery.read_plan.return_value = {did: (floor, 0)}
+        return 10
+
+    delivery.clamp_to_retention.side_effect = _clamp
+    router = MagicMock()
+    router.build_filter_expr.return_value = "company = 'quacksworth'"
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(100, 120)),
+        patch("viaduck.main.source.read_cdc", return_value=pa.table({"company": pa.array([], type=pa.string())})) as rc,
+        patch("viaduck.main._export_dest_time_lag"),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    delivery.clamp_to_retention.assert_called_once_with("dest-1", 99)
+    assert rc.call_args.kwargs["after_snapshot"] == 99
+
+
+def test_poll_cycle_excludes_destination_whose_clamp_failed():
+    delivery = _make_delivery({"dest-1": 10})
+    delivery.flushed_snapshots.return_value = {"dest-1": 10}
+    delivery.clamp_to_retention.side_effect = RuntimeError("state store down")
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(100, 120)),
+        patch("viaduck.main.source.read_cdc") as rc,
+        patch("viaduck.main._export_dest_time_lag"),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    # The expired destination sat the cycle out instead of fataling it.
+    rc.assert_not_called()
+
+
+def test_poll_cycle_contains_group_read_failure():
+    # A read/route failure is contained to its group: the cycle completes
+    # (no exception to the run loop, which would exit the process) and
+    # flush triggers still run.
+    delivery = _make_delivery({"dest-1": 10})
+    router = MagicMock()
+    router.build_filter_expr.return_value = "company = 'quacksworth'"
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 120)),
+        patch("viaduck.main.source.read_cdc", side_effect=RuntimeError("range expired mid-cycle")),
+        patch("viaduck.main._export_dest_time_lag"),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    delivery.maybe_flush.assert_called()
