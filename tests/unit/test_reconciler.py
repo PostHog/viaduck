@@ -297,19 +297,29 @@ def test_single_stop_within_floor_proceeds():
 def test_config_change_restarts_via_pending_until_clean():
     m_old = _mapped()
     m_new = _mapped(endpoint="pooler-2.cnpg-shards.svc.cluster.local")
-    rec, registry, delivery, _, _, _ = _reconciler(running=[m_old], baseline={m_old.dest_id: m_old})
+    rec, registry, delivery, _, _, pool = _reconciler(running=[m_old], baseline={m_old.dest_id: m_old})
     delivery.is_clean.return_value = False  # in-flight flush: swap must wait
     with _patched_materialize():
         rec.apply(_view([_startable(m_new)], generation=1))
     # Deactivated, not yet re-activated.
     delivery.remove_destination.assert_called_once_with(m_old.dest_id)
     delivery.add_destination.assert_not_called()
+    pool.evict.assert_not_called()
     # Clean now: the NEXT apply (even of a stale view) completes the swap.
     delivery.is_clean.return_value = True
+    handoff_order = []
+    pool.evict.side_effect = lambda _did: handoff_order.append("evict")
+    delivery.add_destination.side_effect = lambda _did: handoff_order.append("activate")
     with _patched_materialize():
         rec.apply(None)
+    # The stale Catalog must be gone before the destination becomes active
+    # with its new endpoint; otherwise DestinationPool.get() returns the
+    # cached old connection without consulting the live registry.
+    pool.evict.assert_called_once_with(m_old.dest_id)
+    assert handoff_order == ["evict", "activate"]
     delivery.add_destination.assert_called_once_with(m_old.dest_id)
     assert registry.snapshot().rv_to_dest == {"7": m_old.dest_id}
+    assert rec._applied_mapped[m_old.dest_id] == m_new
 
 
 def test_unchanged_config_is_a_noop():

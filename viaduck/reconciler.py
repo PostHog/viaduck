@@ -419,6 +419,24 @@ class Reconciler:
         effects. Runs every cycle regardless of view freshness."""
         for dest_id, m in list(self._pending_restart.items()):
             if self._delivery.is_clean(dest_id):
+                # A config-change restart must replace the pooled Catalog
+                # before the destination becomes routable again. _activate()
+                # disarms deferred stop-side evictions so a quick re-add
+                # cannot close a newly-active tenant; without doing the
+                # restart eviction here first, that same safety mechanism
+                # preserves the old endpoint indefinitely (or until an
+                # unrelated connection error happens to evict it).
+                try:
+                    self._pool.evict(dest_id)
+                except Exception:
+                    self._deferred_failures += 1
+                    log.warning(
+                        "Pool eviction for restart of %s failed; retrying next cycle",
+                        dest_id,
+                        exc_info=True,
+                    )
+                    continue
+                self._evict_pending.discard(dest_id)
                 outcome = self._activate(dest_id, m, kind="restart_finish")
                 if outcome == _OK:
                     del self._pending_restart[dest_id]
