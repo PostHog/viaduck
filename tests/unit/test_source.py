@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
@@ -106,7 +107,7 @@ def test_read_cdc_empty_result():
     assert result.num_rows == 0
 
 
-def test_connect():
+def test_connect(tmp_path):
     """Test that connect() creates a Catalog with correct params."""
     from viaduck.config import SourceConfig
 
@@ -122,22 +123,27 @@ def test_connect():
             from viaduck.source import connect
 
             connect(cfg)
-            MockCatalog.assert_called_once_with(
-                "src",
-                "postgres:host=localhost dbname=test",
-                data_path="/tmp/data",
-                properties={
-                    "pg_connection_limit": "64",
-                    "arrow_large_buffer_size": "true",
-                    "enable_progress_bar": "true",
-                    "enable_progress_bar_print": "false",
-                    "enable_external_file_cache": "false",
-                    "ducklake_max_retry_count": "20",
-                    "ducklake_retry_wait_ms": "50",
-                    "ducklake_retry_backoff": "1.0",
-                    "temp_directory": "/tmp",
-                },
-            )
+            MockCatalog.assert_called_once()
+            args, kwargs = MockCatalog.call_args
+            assert args == ("src", "postgres:host=localhost dbname=test")
+            assert kwargs["data_path"] == "/tmp/data"
+            props = kwargs["properties"]
+            # temp_directory is a fresh per-connection spill dir (isolation
+            # against cross-instance spill-file collisions) — assert shape,
+            # not value. The conftest fixture points the base at tmp_path.
+            temp_dir = props.pop("temp_directory")
+            assert temp_dir.startswith(str(tmp_path))
+            assert f"{os.sep}viaduck-spill{os.sep}src-" in temp_dir
+            assert props == {
+                "pg_connection_limit": "64",
+                "arrow_large_buffer_size": "true",
+                "enable_progress_bar": "true",
+                "enable_progress_bar_print": "false",
+                "enable_external_file_cache": "false",
+                "ducklake_max_retry_count": "20",
+                "ducklake_retry_wait_ms": "50",
+                "ducklake_retry_backoff": "1.0",
+            }
 
 
 # --- read_cdc_changes tests ---

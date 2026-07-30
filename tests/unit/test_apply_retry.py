@@ -6,6 +6,8 @@ closing mid-write orphans the fork httpfs write-retry buffer (~one flush,
 130-160MB native). Only a real connection-death signal may reconnect.
 """
 
+import os
+import pathlib
 from unittest.mock import patch
 
 import duckdb
@@ -19,7 +21,7 @@ from viaduck.apply import (
     _is_occ_conflict,
     _write_with_retry,
 )
-from viaduck.source import _CONNECTION_DEFAULTS, with_connection_defaults
+from viaduck.source import _CONNECTION_DEFAULTS, sweep_spill_dirs, with_connection_defaults
 
 
 def setup_module():
@@ -222,14 +224,49 @@ class TestRetryLoopEviction:
         assert pool.evictions == _WRITE_MAX_RETRIES - 1
 
 
-class TestTempDirectoryDefault:
-    def test_default_points_at_writable_tmp(self):
-        # readOnlyRootFilesystem + CWD '/' => DuckDB must spill to the mounted
-        # writable /tmp emptyDir, not '.tmp' relative to the read-only CWD.
+class TestTempDirectoryIsolation:
+    # DuckDB spill filenames carry no instance token: two embedded instances
+    # sharing one temp_directory collide on the same spill files and crash
+    # the process (2026-07-29 crash-loop). with_connection_defaults() must
+    # therefore NEVER hand two connections the same temp_directory.
+
+    def test_default_base_is_writable_tmp(self):
+        # readOnlyRootFilesystem + CWD '/' => the spill BASE must be the
+        # mounted writable /tmp emptyDir, not '.tmp' relative to CWD.
         assert _CONNECTION_DEFAULTS.get("temp_directory") == "/tmp"
 
-    def test_default_applied_when_absent(self):
-        assert with_connection_defaults({})["temp_directory"] == "/tmp"
+    def test_each_connection_gets_unique_existing_dir(self, tmp_path):
+        a = with_connection_defaults({"temp_directory": str(tmp_path)}, name="dest-a")
+        b = with_connection_defaults({"temp_directory": str(tmp_path)}, name="dest-a")
+        assert a["temp_directory"] != b["temp_directory"]
+        assert os.path.isdir(a["temp_directory"])
+        assert os.path.isdir(b["temp_directory"])
 
-    def test_user_property_overrides_default(self):
-        assert with_connection_defaults({"temp_directory": "/custom"})["temp_directory"] == "/custom"
+    def test_user_temp_directory_is_base_not_literal(self, tmp_path):
+        merged = with_connection_defaults({"temp_directory": str(tmp_path)}, name="x")
+        assert merged["temp_directory"] != str(tmp_path)
+        assert merged["temp_directory"].startswith(str(tmp_path / "viaduck-spill") + os.sep)
+
+    def test_name_is_sanitized_for_filesystem(self, tmp_path):
+        merged = with_connection_defaults({"temp_directory": str(tmp_path)}, name="org/1:evil name")
+        leaf = os.path.basename(merged["temp_directory"])
+        assert "/" not in leaf and ":" not in leaf and " " not in leaf
+        assert leaf.startswith("org_1_evil_name-")
+
+    def test_other_defaults_and_user_overrides_untouched(self, tmp_path):
+        merged = with_connection_defaults({"temp_directory": str(tmp_path), "pg_connection_limit": "8"}, name="x")
+        assert merged["pg_connection_limit"] == "8"
+        assert merged["enable_external_file_cache"] == "false"
+
+    def test_sweep_removes_all_spill_dirs(self, tmp_path):
+        merged = with_connection_defaults({"temp_directory": str(tmp_path)}, name="x")
+        # Simulate crash leftovers: a real file inside a spill dir.
+        (pathlib.Path(merged["temp_directory"]) / "duckdb_temp_storage_DEFAULT-0.tmp").write_bytes(b"x")
+        sweep_spill_dirs(base=str(tmp_path))
+        assert not (tmp_path / "viaduck-spill").exists()
+        # Next connection recreates the root cleanly.
+        again = with_connection_defaults({"temp_directory": str(tmp_path)}, name="y")
+        assert os.path.isdir(again["temp_directory"])
+
+    def test_sweep_noop_when_root_absent(self, tmp_path):
+        sweep_spill_dirs(base=str(tmp_path))  # must not raise

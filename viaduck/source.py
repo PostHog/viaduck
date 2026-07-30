@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import tempfile
 import time
 from typing import TYPE_CHECKING
 
@@ -97,16 +100,69 @@ _CONNECTION_DEFAULTS = {
     # `Failed to create directory ".tmp": Read-only file system`, stalling that
     # destination (only the biggest-flush destination hits it, so it looks
     # per-destination). Point spill at the mounted writable /tmp emptyDir.
-    # Overridable per-connection via properties.
+    # NOTE: this value is the BASE directory only — with_connection_defaults()
+    # always replaces it with a fresh per-connection subdirectory beneath it
+    # (see the isolation comment there). A user-supplied temp_directory is
+    # likewise treated as a base, never used directly.
     "temp_directory": "/tmp",
 }
 
+# Subdirectory of the spill base that holds all per-connection spill dirs.
+# sweep_spill_dirs() removes the whole thing at startup, so nothing else may
+# ever live under it.
+_SPILL_SUBDIR = "viaduck-spill"
 
-def with_connection_defaults(props: dict[str, str]) -> dict[str, str]:
-    """Merge DuckDB connection defaults under user-supplied properties (user wins)."""
+
+def with_connection_defaults(props: dict[str, str], name: str = "conn") -> dict[str, str]:
+    """Merge DuckDB connection defaults under user-supplied properties (user wins),
+    then isolate `temp_directory` to a fresh per-connection subdirectory.
+
+    Isolation is unconditional: DuckDB spill filenames
+    (`duckdb_temp_storage_<sizeclass>-<idx>.tmp`) carry no instance token, so
+    two embedded DuckDB instances sharing one temp_directory collide on the
+    same spill files — concurrent spills corrupt the native temp accounting
+    (counter wraps to ~2^64, all further spills refused) and crash the
+    process (2026-07-29 crash-loop incident, reproduced in isolation). A
+    user-supplied temp_directory is honored as the BASE for the subdirectory.
+
+    `name` is a debugging aid only (prefixes the directory so `du` output is
+    attributable per destination); uniqueness comes from mkdtemp.
+
+    DuckDB deletes its temp FILES on clean instance close but knows nothing
+    of the directory itself, so each connection leaks one empty dir until the
+    next sweep_spill_dirs() at process start. Crash leftovers (with real
+    bytes — /tmp is a pod-level emptyDir that survives container restarts)
+    are cleaned by the same sweep.
+    """
     merged = dict(_CONNECTION_DEFAULTS)
     merged.update(props)
+    root = os.path.join(merged["temp_directory"], _SPILL_SUBDIR)
+    os.makedirs(root, exist_ok=True)
+    # Truncate: names come from CP payloads unbounded; uniqueness is
+    # mkdtemp's job, the prefix is only for attribution — a 300-char id
+    # must degrade to a shorter prefix, not ENAMETOOLONG the connect.
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)[:64] or "conn"
+    merged["temp_directory"] = tempfile.mkdtemp(prefix=f"{safe}-", dir=root)
     return merged
+
+
+def sweep_spill_dirs(base: str | None = None) -> None:
+    """Remove spill dirs left by previous containers (crash leftovers hold
+    real bytes; clean closes leave empty dirs). Call ONCE at process start,
+    strictly before the first with_connection_defaults() call.
+
+    Sweeps the DEFAULT base only: a per-connection temp_directory override
+    moves that connection's spill dirs to <override>/viaduck-spill, which
+    this never touches — leftovers there persist until whoever configured
+    the override cleans them up. No production config overrides it today.
+    """
+    root = os.path.join(base or _CONNECTION_DEFAULTS["temp_directory"], _SPILL_SUBDIR)
+    if os.path.isdir(root):
+        shutil.rmtree(root, ignore_errors=True)
+        if os.path.isdir(root):
+            log.warning("Spill-dir sweep left %s behind (permissions?); stale spill bytes may persist", root)
+        else:
+            log.info("Swept leftover spill dirs under %s", root)
 
 
 def connect(cfg: SourceConfig) -> Catalog:
@@ -117,7 +173,7 @@ def connect(cfg: SourceConfig) -> Catalog:
         cfg.name,
         cfg.postgres_uri,
         data_path=cfg.data_path,
-        properties=with_connection_defaults(cfg.resolved_properties()),
+        properties=with_connection_defaults(cfg.resolved_properties(), name=cfg.name),
     )
 
 

@@ -697,6 +697,11 @@ def run(cfg: config.ViaduckConfig) -> None:
     # `max_poll_age_s` rather than reverting this ordering.
     health.mark_started()
 
+    # Reclaim spill dirs from previous containers BEFORE the first
+    # connection creates a new one (/tmp is a pod-level emptyDir — crash
+    # leftovers survive container restarts and hold real bytes).
+    source.sweep_spill_dirs()
+
     # Connect to source
     src_catalog = source.connect(cfg.source)
     src_table = source.load_table(src_catalog, cfg.source.table)
