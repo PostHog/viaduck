@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING
@@ -235,7 +236,7 @@ class DestinationPool:
             src_cfg.name,
             src_cfg.postgres_uri,
             data_path=src_cfg.data_path,
-            properties=with_connection_defaults(src_cfg.resolved_properties()),
+            properties=with_connection_defaults(src_cfg.resolved_properties(), name=f"{src_cfg.name}-schema"),
         )
         try:
             src_tbl = src_catalog.load_table(src_cfg.table)
@@ -347,12 +348,19 @@ class DestinationPool:
         schema = self._get_source_schema()
 
         catalog = None
+        props = None
         try:
+            # Resolve the URI BEFORE with_connection_defaults: secret-read
+            # failures then leak no spill dir, and a failed Catalog() below
+            # can rmtree the one it did create (this path is per-retry-hot
+            # during connect storms — bad endpoint, reshard fence).
+            uri = self._resolve_uri(dest_cfg)
+            props = with_connection_defaults(dest_cfg.resolved_properties(), name=dest_cfg.name)
             catalog = Catalog(
                 dest_cfg.name,
-                self._resolve_uri(dest_cfg),
+                uri,
                 data_path=dest_cfg.data_path,
-                properties=with_connection_defaults(dest_cfg.resolved_properties()),
+                properties=props,
             )
             # Discovered tenants land in per-team schemas that don't
             # pre-exist the way `posthog` does (e.g. `evilco.events` for a
@@ -374,6 +382,10 @@ class DestinationPool:
                     catalog.close()
                 except Exception:
                     pass
+            if catalog is None and props is not None:
+                # Catalog() itself failed: reclaim the spill dir it would
+                # have owned (otherwise it orphans until the boot sweep).
+                shutil.rmtree(props["temp_directory"], ignore_errors=True)
             if dest_cfg.uri_source is not None:
                 # Deferred destination: a connect failure may be a rotated
                 # password served from the warm cache — invalidate so the
