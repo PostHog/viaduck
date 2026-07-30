@@ -1269,7 +1269,7 @@ def _poll_cycle(
             #     HEALTHY destination instead: the lagging group's chunk loop
             #     ran to head — or forever, when its flushes kept failing and
             #     the position kept resetting — so the caught-up group never
-            #     got a read. Observed on portola: team-2's cursor frozen for
+            #     got a read. Observed on team-50689: team-2's cursor frozen for
             #     1.5h while team-50689 relitigated the same range.
             # The cap turns strict priority into a round-robin with a
             # lagging-first bias: every group makes progress every cycle.

@@ -1,7 +1,7 @@
 """End-to-end integration test for the events_nrt → canonical events switchover.
 
 Replicates exactly what the production switchover will look like:
-  - Source table shaped like `posthog.events_nrt_beta` on duckling-portola:
+  - Source table shaped like `posthog.events_nrt_beta` on a production tenant duckling:
     26 columns, all-varchar timestamps, has `captured_at`, unpartitioned.
     This is what millpond currently writes and what viaduck currently reads.
   - Destination table shaped like canonical `posthog.events`:
@@ -48,7 +48,7 @@ pytestmark = pytest.mark.integration
 
 
 # ---------------------------------------------------------------------------
-# Schemas — mirror the real duckling-portola catalog exactly.
+# Schemas — mirror the real tenant duckling catalog exactly.
 # ---------------------------------------------------------------------------
 
 
@@ -92,7 +92,7 @@ def _events_nrt_source_schema() -> Schema:
 def _events_canonical_target_schema() -> Schema:
     """25-column DLT-backfilled canonical shape.
 
-    Column order matches the real duckling-portola.posthog.events (see
+    Column order matches the real the tenant duckling's posthog.events (see
     viaduck-canonical-events-switchover.md for the diff table). Note the
     positions of person_mode (col 23) and the group_*_created_at cluster
     (cols 18-22) — moving these around under a positional INSERT would

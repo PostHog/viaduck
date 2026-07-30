@@ -1,7 +1,7 @@
 """Tests for viaduck.schema_projection.
 
 The load-bearing fixture is the real events_nrt → canonical events diff
-we captured on duckling-portola: 26 → 25 columns, 8 varchar→timestamptz
+we captured on a production tenant duckling: 26 → 25 columns, 8 varchar→timestamptz
 casts, extra `captured_at` in source, and enough column-order shuffling
 that positional insert without projection would silently write into the
 wrong slots.
@@ -19,7 +19,7 @@ from viaduck.schema_projection import SchemaProjectionError, build
 # ---- Real-shape fixtures ----------------------------------------------------
 #
 # These match the schemas queried directly from the DuckLake catalogs on
-# duckling-portola: posthog.events_nrt_beta (raw millpond Kafka shape) and
+# a production tenant duckling: posthog.events_nrt_beta (raw millpond Kafka shape) and
 # posthog.events (DLT-backfilled canonical shape). See
 # viaduck-canonical-events-switchover.md for the diff table.
 
@@ -59,7 +59,7 @@ def _source_events_nrt_schema() -> pa.Schema:
 
 
 def _target_events_schema() -> pa.Schema:
-    """The 25-column canonical shape DLT backfilled onto duckling-portola.posthog.events."""
+    """The 25-column canonical shape DLT backfilled onto the tenant duckling's posthog.events."""
     utc = pa.timestamp("us", tz="UTC")
     return pa.schema(
         [

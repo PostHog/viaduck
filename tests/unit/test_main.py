@@ -140,7 +140,7 @@ def test_write_with_retry_exhausted():
 
 
 def test_write_with_retry_survives_many_transient_failures():
-    """Portola OCC scenario: peer writer commits at ~12s mean, viaduck flush
+    """team-50689 OCC scenario: peer writer commits at ~12s mean, viaduck flush
     window 2-5s. Half the attempts race a peer commit and fail. Verify the
     retry budget is deep enough that a run of transient failures resolves
     before exhausting attempts."""
@@ -149,7 +149,7 @@ def test_write_with_retry_survives_many_transient_failures():
     assert _WRITE_MAX_RETRIES >= 10, (
         "OCC-heavy destinations (concurrent-writer catalogs) need enough "
         "retry budget to catch a P99 gap; 3 attempts is deterministic-fail "
-        "on portola-shape workloads"
+        "on team-50689-shape workloads"
     )
 
     pool = MagicMock()
@@ -1064,7 +1064,7 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
     """Under buffer-watermark pressure, the read budget must go to the
     most-lagging cursor group first. Otherwise a caught-up destination fills
     the buffer before the lagging one gets its turn and the lagging group
-    is silently starved every cycle (empirically observed on portola with
+    is silently starved every cycle (empirically observed on team-50689 with
     team-2 at lag 969 vs team-50689 at lag 7969 — team-50689 got zero
     reads for the entire pod lifetime).
     """
@@ -1230,7 +1230,7 @@ def test_poll_cycle_lagging_group_cannot_monopolize_reads():
     chunks per cycle, then the healthy group gets its turn. Without the cap
     (the first sort-only fix), the lagging group's chunk loop ran to head —
     or forever when its flushes kept failing and its position kept resetting
-    — and the healthy destination's cursor froze (observed on portola:
+    — and the healthy destination's cursor froze (observed on team-50689:
     team-2 starved for 1.5h while team-50689 relitigated the same range).
     """
     from viaduck.main import _MAX_CHUNKS_PER_GROUP_PER_CYCLE
