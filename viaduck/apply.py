@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 # commit lands on the same table between viaduck's read-snapshot and its
 # commit — including commits that touch disjoint file sets (e.g., a peer
 # compactor rewriting old files while viaduck adds a new one). Empirically
-# a shared-table catalog (portola: backfill + peer compactor) commits at
+# a shared-table catalog (team-50689: backfill + peer compactor) commits at
 # ~12s mean, 47s p99 gap. A 2-5s viaduck flush window vs a 12s mean gap
 # gives ~50% per-attempt success, so 3 attempts (7s worth of backoff)
 # deterministically fails. 15 attempts with exp backoff capped at 30s +

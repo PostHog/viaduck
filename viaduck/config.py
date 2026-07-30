@@ -417,7 +417,7 @@ class DeliveryConfig:
     workers: int = 8
     flush_interval_seconds: float = 120.0
     flush_max_rows: int = 500_000
-    flush_max_bytes: int = 268_435_456  # 256 MiB per destination
+    flush_max_bytes: int = 268_435_456  # 256 MiB — ceiling + start of the adaptive per-dest target
     buffer_total_max_bytes: int = 1_073_741_824  # 1 GiB across all buffers
     # Per-destination buffer + in-flight byte ceiling — the bound on each
     # destination's CDC "queue". When a destination's (buffered + in-flight)
@@ -439,6 +439,28 @@ class DeliveryConfig:
     # never splits a chunk) — poll.cdc_chunk_snapshots bounds that.
     # 0 = unlimited (pre-slicing behavior).
     flush_batch_max_rows: int = 60_000
+    # Adaptive per-destination flush sizing (AIMD on flush duration).
+    # flush_max_bytes is a global knob, but the sustainable batch size is a
+    # property of each DESTINATION's catalog: on a commit-contended catalog
+    # write throughput DECREASES with batch size (a longer write+commit
+    # window collides with more peer commits → more DuckLake-internal OCC
+    # retries, each re-running multi-second catalog SQL), while an idle
+    # catalog absorbs the full-size batch at wire speed. team-2 vs team-50689
+    # (2026-07-30): same row sizes, opposite needs — no single global value
+    # serves both. Each destination therefore carries an in-memory bytes
+    # target that starts at flush_max_bytes and adapts to observed flush
+    # duration: in the [low, high] band → hold; faster than low → additive
+    # increase (step_bytes, capped at flush_max_bytes); slower than high →
+    # halve (floored at min_bytes). Effective floor is one CDC chunk —
+    # slicing never splits a chunk — so poll.cdc_chunk_snapshots stays the
+    # true lower bound on batch size.
+    flush_adaptive: bool = True
+    flush_adaptive_low_seconds: float = 5.0
+    flush_adaptive_high_seconds: float = 30.0
+    flush_adaptive_step_bytes: int = 16_777_216  # +16 MiB per fast flush
+    # Target floor; clamped to flush_max_bytes at runtime so lowering the
+    # ceiling below the floor stays a one-knob change.
+    flush_adaptive_min_bytes: int = 8_388_608  # 8 MiB
     pool_max_open: int = 100  # destination connection pool size
 
     def __post_init__(self):
@@ -457,6 +479,18 @@ class DeliveryConfig:
         if self.flush_batch_max_rows < 0:
             raise ConfigError(
                 f"delivery.flush_batch_max_rows must be >= 0 (0 = unlimited), got {self.flush_batch_max_rows}"
+            )
+        for name in ("flush_adaptive_step_bytes", "flush_adaptive_min_bytes"):
+            if getattr(self, name) < 1:
+                raise ConfigError(f"delivery.{name} must be >= 1, got {getattr(self, name)}")
+        if self.flush_adaptive_low_seconds < 0:
+            raise ConfigError(
+                f"delivery.flush_adaptive_low_seconds must be >= 0, got {self.flush_adaptive_low_seconds}"
+            )
+        if self.flush_adaptive_high_seconds <= self.flush_adaptive_low_seconds:
+            raise ConfigError(
+                f"delivery.flush_adaptive_high_seconds ({self.flush_adaptive_high_seconds}) must be > "
+                f"flush_adaptive_low_seconds ({self.flush_adaptive_low_seconds})"
             )
 
 
@@ -633,6 +667,14 @@ class ViaduckConfig:
         log.info(
             "config: delivery.buffer_max_bytes_per_destination=%d (0=auto: total/N)",
             self.delivery.buffer_max_bytes_per_destination,
+        )
+        log.info(
+            "config: delivery.flush_adaptive=%s (band=[%s, %s]s, step=%d, min=%d)",
+            self.delivery.flush_adaptive,
+            self.delivery.flush_adaptive_low_seconds,
+            self.delivery.flush_adaptive_high_seconds,
+            self.delivery.flush_adaptive_step_bytes,
+            self.delivery.flush_adaptive_min_bytes,
         )
         log.info("config: delivery.pool_max_open=%d", self.delivery.pool_max_open)
 
@@ -829,6 +871,15 @@ def load(path: str | Path) -> ViaduckConfig:
         ),
         flush_batch_max_rows=_validate_int(
             delivery_raw.get("flush_batch_max_rows", 60_000), "delivery.flush_batch_max_rows"
+        ),
+        flush_adaptive=bool(delivery_raw.get("flush_adaptive", True)),
+        flush_adaptive_low_seconds=float(delivery_raw.get("flush_adaptive_low_seconds", 5.0)),
+        flush_adaptive_high_seconds=float(delivery_raw.get("flush_adaptive_high_seconds", 30.0)),
+        flush_adaptive_step_bytes=_validate_int(
+            delivery_raw.get("flush_adaptive_step_bytes", 16_777_216), "delivery.flush_adaptive_step_bytes"
+        ),
+        flush_adaptive_min_bytes=_validate_int(
+            delivery_raw.get("flush_adaptive_min_bytes", 8_388_608), "delivery.flush_adaptive_min_bytes"
         ),
         pool_max_open=_validate_int(delivery_raw.get("pool_max_open", 100), "delivery.pool_max_open"),
     )

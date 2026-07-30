@@ -51,6 +51,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Growth gate for the adaptive flush-target controller: additive increase
+# only when the flushed batch filled at least this fraction of the current
+# target. A batch well below the target completing fast is evidence about
+# THAT batch size, not the target's — growing on it would let quiet-period
+# trickle flushes re-inflate a learned-down target (see _adapt_flush_target).
+_ADAPT_GROWTH_MIN_FILL = 0.7
+
 
 @dataclass
 class _Buffer:
@@ -108,9 +115,9 @@ class DeliveryManager:
     - I1: ``_active ⊆ _buffers.keys()`` — add_destination creates the dict
       entries under the lock BEFORE activating; nothing ever deletes a
       dict key (never-delete, §1 stop contract).
-    - I2: all ten per-destination dicts share one monotonically-growing
+    - I2: all eleven per-destination dicts share one monotonically-growing
       "ever-member" key set; constructor and add_destination write all
-      ten atomically under the lock.
+      eleven atomically under the lock.
     - I3: ``_suspended`` is NOT constrained relative to ``_active`` — it
       is replaced wholesale from the lifecycle tracker (a different
       authority, operator intent). Its only reader consults it after the
@@ -255,6 +262,17 @@ class DeliveryManager:
         # (same caveat as rows_replicated).
         self._applied: dict[str, dict[str, int]] = {d: {"inserts": 0, "updates": 0, "deletes": 0} for d in assigned_ids}
         self._buffered_rows_total: dict[str, int] = {d: 0 for d in assigned_ids}
+        # Adaptive flush-size target: the bytes flush-trigger threshold,
+        # per destination (see DeliveryConfig.flush_adaptive). Starts at
+        # the global cap and AIMD-adapts to observed flush duration in
+        # _adapt_flush_target. In-memory only — a restart re-learns a
+        # contended destination's target in ~log2(cap/floor) flushes.
+        self._flush_target: dict[str, int] = {d: cfg.flush_max_bytes for d in assigned_ids}
+        for d in assigned_ids:
+            # Seed the gauge so "target == ceiling" is visible before the
+            # first data flush — a dashboard reading "pinned at floor =
+            # contended" must be able to tell "never flushed" apart.
+            metrics.dest_flush_target_bytes.labels(destination=d).set(cfg.flush_max_bytes)
         # Lifecycle-suspended destinations (paused/retired): no flush
         # submissions. Draining destinations are NOT here — draining exists
         # to flush out. Owned by the poll thread via set_suspended().
@@ -475,24 +493,36 @@ class DeliveryManager:
                     continue
                 buf = self._buffers[dest_id]
                 # Flush-batch slicing: one swap takes at most
-                # flush_batch_max_rows, cut at CHUNK boundaries (a single
-                # oversize chunk still goes whole — cdc_chunk_snapshots
-                # bounds that). Without the cap, a slow flush lets the
+                # flush_batch_max_rows AND at most the adaptive per-dest
+                # byte target, cut at CHUNK boundaries (a single oversize
+                # chunk still goes whole — cdc_chunk_snapshots bounds
+                # that). Without the rows cap, a slow flush lets the
                 # buffer pile up and the next swap takes everything — the
                 # feedback loop that produced 170-440K-row batches and
                 # drove the fork's native layer into buffer-manager
-                # corruption (2026-07-29). The remainder stays buffered
-                # with its age preserved, so the interval trigger keeps
-                # the pipeline of bounded slices draining.
+                # corruption (2026-07-29). Without the BYTE cut, the
+                # adaptive target would gate only the trigger while
+                # backlogged swaps stay rows-cap-sized — the controller
+                # would converge its target and actuate nothing in
+                # exactly the contended-catalog regime it exists for.
+                # The remainder stays buffered with its age preserved,
+                # and the "sliced" trigger keeps the pipeline of bounded
+                # slices draining back-to-back.
                 cap = self._cfg.flush_batch_max_rows
+                byte_cap = self._flush_target[dest_id] if self._cfg.flush_adaptive else 0
                 take = len(buf.entries)
-                if cap > 0:
+                if cap > 0 or byte_cap > 0:
                     taken_rows = 0
+                    taken_bytes = 0
                     take = 0
                     for tbl, _through in buf.entries:
-                        if take > 0 and taken_rows + tbl.num_rows > cap:
+                        if take > 0 and (
+                            (cap > 0 and taken_rows + tbl.num_rows > cap)
+                            or (byte_cap > 0 and taken_bytes + tbl.nbytes > byte_cap)
+                        ):
                             break
                         taken_rows += tbl.num_rows
+                        taken_bytes += tbl.nbytes
                         take += 1
                 sliced = buf.entries[:take]
                 remainder = buf.entries[take:]
@@ -643,7 +673,12 @@ class DeliveryManager:
             return "sliced"
         if has_data and buf.rows >= self._cfg.flush_max_rows:
             return "rows"
-        if has_data and buf.bytes >= self._cfg.flush_max_bytes:
+        # Bytes trigger consults the ADAPTIVE per-destination target, not
+        # the global cap — flush_max_bytes survives as the target's ceiling
+        # and initial value. When the target has shrunk below one CDC
+        # chunk, the trigger fires per chunk: one chunk is the floor by
+        # construction (slicing never splits a chunk either).
+        if has_data and buf.bytes >= self._flush_target[dest_id]:
             return "bytes"
         dirty_since = self._position_dirty_since[dest_id]
         age_start = buf.first_buffered_at if has_data else dirty_since
@@ -651,9 +686,62 @@ class DeliveryManager:
             return "interval"
         return None
 
+    def _adapt_flush_target(self, dest_id: str, duration: float, batch_bytes: int, *, failed: bool = False) -> None:
+        """AIMD controller on flush duration (millpond's backpressure
+        precedent, per-destination). The sustainable batch size is a
+        property of the destination catalog's commit contention — on a
+        contended catalog, throughput DECREASES with batch size (longer
+        write+commit window → more peer-commit collisions → more
+        DuckLake-internal OCC retries, each re-running multi-second
+        catalog SQL) — so no global flush_max_bytes serves both a busy
+        and an idle catalog. Called by the flush worker after every DATA
+        flush (position-only persists carry no signal): slower than the
+        high bound → halve (floored at flush_adaptive_min_bytes; the
+        effective floor is one CDC chunk since neither the bytes trigger
+        nor the swap byte-cut splits a chunk); faster than the low bound
+        AND the batch nearly filled the current target → additive step
+        up (capped at flush_max_bytes); otherwise hold. The fill
+        condition is what makes growth evidence-based: a tiny interval
+        flush finishing in <1s says nothing about whether a target-sized
+        batch is sustainable, and without it a quiet period walks a
+        learned-down target back to the cap, so the next burst re-runs
+        the oversize-flush/drop/re-read cycle from scratch. Failures
+        never grow. Converges from a cold start in ~log2(cap/floor)
+        flushes and re-probes upward as contention subsides — but only
+        under enough traffic to fill the target, which is the only time
+        the target matters."""
+        cfg = self._cfg
+        if not cfg.flush_adaptive:
+            return
+        # Floor clamped to the ceiling: an operator lowering flush_max_bytes
+        # below flush_adaptive_min_bytes shouldn't need a second knob.
+        floor = min(cfg.flush_adaptive_min_bytes, cfg.flush_max_bytes)
+        with self._lock:
+            cur = self._flush_target[dest_id]
+            if duration > cfg.flush_adaptive_high_seconds:
+                new = max(floor, cur // 2)
+            elif (
+                not failed and duration < cfg.flush_adaptive_low_seconds and batch_bytes >= cur * _ADAPT_GROWTH_MIN_FILL
+            ):
+                new = min(cfg.flush_max_bytes, cur + cfg.flush_adaptive_step_bytes)
+            else:
+                new = cur
+            self._flush_target[dest_id] = new
+        metrics.dest_flush_target_bytes.labels(destination=dest_id).set(new)
+        if new != cur:
+            log.info(
+                "Adaptive flush target for %s: %d -> %d bytes (%s flush took %.1fs)",
+                dest_id,
+                cur,
+                new,
+                "failed" if failed else "successful",
+                duration,
+            )
+
     def _flush(self, dest_id: str, tables: list[pa.Table], through: int, trigger: str) -> None:
         """Worker: FlushCommit / FlushFail."""
         t0 = time.monotonic()
+        batch_bytes = sum(t.nbytes for t in tables)
         try:
             ops_count = 0
             if tables:
@@ -706,6 +794,7 @@ class DeliveryManager:
                 # dest_write_seconds continuity: pre-buffering dashboards
                 # observe per-destination write latency under this name.
                 metrics.dest_write_seconds.labels(destination=dest_id).observe(duration)
+                self._adapt_flush_target(dest_id, duration, batch_bytes)
                 if self._on_flush_success is not None:
                     self._on_flush_success()
                 log.info(
@@ -717,6 +806,7 @@ class DeliveryManager:
                     duration,
                 )
         except Exception:
+            duration = time.monotonic() - t0
             log.exception("Flush failed for destination %s", dest_id)
             # Invariant-restoring reset FIRST: if the bookkeeping below
             # (PG write, pool close) also fails, the position/buffer state
@@ -733,6 +823,17 @@ class DeliveryManager:
                 self._pool.evict(dest_id)
             except Exception:
                 log.exception("Could not evict connection for %s", dest_id)
+            if tables:
+                # A SLOW failure still teaches the controller: a flush that
+                # burned its retry budget for minutes was too big for this
+                # catalog, and without shrinking here a destination whose
+                # every oversized flush FAILS would never adapt down — the
+                # exact wedge this controller exists to break (team-2,
+                # 2026-07-30). failed=True suppresses growth so a fast
+                # failure (connection blip) can't inflate the target. Last
+                # in the handler: nothing after it may be skipped if the
+                # controller ever raises — the evict above must run.
+                self._adapt_flush_target(dest_id, duration, batch_bytes, failed=True)
         finally:
             with self._lock:
                 self._inflight.discard(dest_id)
@@ -817,6 +918,8 @@ class DeliveryManager:
                 self._inflight_bytes[dest_id] = 0
                 self._applied[dest_id] = {"inserts": 0, "updates": 0, "deletes": 0}
                 self._buffered_rows_total[dest_id] = 0
+                self._flush_target[dest_id] = self._cfg.flush_max_bytes
+                metrics.dest_flush_target_bytes.labels(destination=dest_id).set(self._cfg.flush_max_bytes)
             self._active.add(dest_id)
             self._recompute_per_dest_cap_locked()
 

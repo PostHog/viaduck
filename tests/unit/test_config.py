@@ -943,3 +943,40 @@ def test_discovery_secret_cache_ttl_loads_from_yaml(tmp_path):
     p.write_text(yaml.safe_dump(cfg_yaml))
     cfg = load(str(p))
     assert cfg.discovery.secret_cache_ttl_s == 600.0
+
+
+def test_flush_adaptive_defaults_enabled():
+    from viaduck.config import DeliveryConfig
+
+    cfg = DeliveryConfig()
+    assert cfg.flush_adaptive is True
+    assert cfg.flush_adaptive_low_seconds == 5.0
+    assert cfg.flush_adaptive_high_seconds == 30.0
+    assert cfg.flush_adaptive_step_bytes == 16_777_216
+    assert cfg.flush_adaptive_min_bytes == 8_388_608
+
+
+def test_flush_adaptive_band_must_be_ordered():
+    from viaduck.config import DeliveryConfig
+
+    with pytest.raises(ConfigError, match="flush_adaptive_high_seconds"):
+        DeliveryConfig(flush_adaptive_low_seconds=30.0, flush_adaptive_high_seconds=5.0)
+
+
+def test_flush_adaptive_loader_passthrough(tmp_path: Path):
+    raw = MINIMAL_YAML + (
+        "\ndelivery:\n"
+        "  flush_adaptive: false\n"
+        "  flush_adaptive_low_seconds: 2.5\n"
+        "  flush_adaptive_high_seconds: 60\n"
+        "  flush_adaptive_step_bytes: 8388608\n"
+        "  flush_adaptive_min_bytes: 4194304\n"
+    )
+    p = tmp_path / "adaptive.yaml"
+    p.write_text(raw)
+    cfg = load(p)
+    assert cfg.delivery.flush_adaptive is False
+    assert cfg.delivery.flush_adaptive_low_seconds == 2.5
+    assert cfg.delivery.flush_adaptive_high_seconds == 60.0
+    assert cfg.delivery.flush_adaptive_step_bytes == 8388608
+    assert cfg.delivery.flush_adaptive_min_bytes == 4194304
