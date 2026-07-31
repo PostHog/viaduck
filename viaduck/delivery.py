@@ -41,7 +41,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from viaduck import metrics
-from viaduck.apply import append_only, apply_full_cdc
+from viaduck.apply import FlushDeadlineExceeded, append_only, apply_full_cdc
 from viaduck.config import ConfigError
 
 if TYPE_CHECKING:
@@ -115,9 +115,13 @@ class DeliveryManager:
     - I1: ``_active ⊆ _buffers.keys()`` — add_destination creates the dict
       entries under the lock BEFORE activating; nothing ever deletes a
       dict key (never-delete, §1 stop contract).
-    - I2: all eleven per-destination dicts share one monotonically-growing
+    - I2: all per-destination dicts share one monotonically-growing
       "ever-member" key set; constructor and add_destination write all
-      eleven atomically under the lock.
+      of them atomically under the lock. Two exceptions by design:
+      ``_circuit_open_until`` is sparse (only open circuits, always read
+      via ``.get``-default) and circuit state is activation-scoped
+      (add_destination resets it — a re-added destination gets a fresh
+      probe, unlike position/epoch which max-merge).
     - I3: ``_suspended`` is NOT constrained relative to ``_active`` — it
       is replaced wholesale from the lifecycle tracker (a different
       authority, operator intent). Its only reader consults it after the
@@ -277,6 +281,29 @@ class DeliveryManager:
         # submissions. Draining destinations are NOT here — draining exists
         # to flush out. Owned by the poll thread via set_suspended().
         self._suspended: set[str] = set()
+        # Flush circuit breaker (delivery.flush_circuit_failures /
+        # flush_circuit_max_seconds): consecutive-failure count and, while
+        # open, the monotonic time submissions may resume (a probe). A
+        # broken destination without this cycles read->buffer->fail->
+        # rewind->re-read forever — burning a shared flush worker for
+        # minutes per attempt plus its per-cycle chunk quota, i.e. taxing
+        # every peer. The breaker converts that to a bounded idle cost:
+        # submissions pause, reads self-cap at the per-destination buffer
+        # ceiling, and a probe closes the circuit on success.
+        self._flush_failures: dict[str, int] = {d: 0 for d in assigned_ids}
+        self._circuit_open_until: dict[str, float] = {}
+        for d in assigned_ids:
+            # Seed the gauge so "never opened" reads 0, not absent — same
+            # alerting-contract reasoning as dest_flush_target_bytes above.
+            metrics.delivery_circuit_open.labels(destination=d).set(0)
+        # Overall per-flush wall-clock deadline (delivery.flush_deadline_seconds;
+        # 0 derives 2x flush_interval). Bounds the retry loop's wall time —
+        # the attempt budget alone permits ~5.5 min of backoff sleeps per
+        # flush. Disabled when the derived value is <= 0 (flush_interval=0).
+        derived_deadline = (
+            cfg.flush_deadline_seconds if cfg.flush_deadline_seconds > 0 else 2 * cfg.flush_interval_seconds
+        )
+        self._flush_deadline_s: float | None = derived_deadline if derived_deadline > 0 else None
 
     # ------------------------------------------------------------------ #
     # Poll-thread API
@@ -488,6 +515,16 @@ class DeliveryManager:
                     # buffer was discarded on suspension; this guard covers
                     # a read that raced the transition.
                     continue
+                if not shutdown and self._circuit_open_locked(dest_id, now):
+                    # Circuit open: submissions paused until the backoff
+                    # elapses (then this gate passes and the probe goes
+                    # out). Reads for the destination keep flowing under
+                    # the normal buffer-cap rules. Shutdown bypasses the
+                    # gate: drain() must attempt every destination (a
+                    # recovered destination drains cleanly instead of
+                    # burning the whole drain timeout and abandoning
+                    # rows; a failed drain probe simply re-opens).
+                    continue
                 trigger = self._trigger_for_locked(dest_id, now, shutdown, over_watermark)
                 if trigger is None:
                     continue
@@ -649,6 +686,26 @@ class DeliveryManager:
     def _total_bytes_locked(self) -> int:
         return sum(b.bytes for b in self._buffers.values()) + sum(self._inflight_bytes.values())
 
+    def _circuit_open_locked(self, dest_id: str, now: float) -> bool:
+        """True while the destination's flush circuit breaker is open AND
+        the resubmit backoff has not elapsed. Once `now` passes open_until,
+        the destination is eligible for a single probe flush (the in-flight
+        guard keeps it to one); the probe's success closes the circuit, its
+        failure re-opens it with the next backoff step."""
+        return now < self._circuit_open_until.get(dest_id, 0.0)
+
+    def _circuit_backoff_seconds_locked(self, dest_id: str) -> float:
+        """Resubmit delay for the current consecutive-failure count:
+        flush_interval x 2^(failures - threshold), floored at 1s (so the
+        breaker still bites at flush_interval_seconds=0, where the raw
+        formula collapses to 0 and never suppresses a submission), capped
+        at flush_circuit_max_seconds. At the threshold itself this is one
+        flush_interval — a flapping destination gets a quick first retry,
+        then exponential isolation."""
+        steps = max(0, self._flush_failures[dest_id] - self._cfg.flush_circuit_failures)
+        raw = self._cfg.flush_interval_seconds * (2**steps)
+        return min(max(raw, 1.0), self._cfg.flush_circuit_max_seconds)
+
     def _trigger_for_locked(self, dest_id: str, now: float, shutdown: bool, over_watermark: bool) -> str | None:
         buf = self._buffers[dest_id]
         has_data = buf.rows > 0
@@ -742,14 +799,26 @@ class DeliveryManager:
         """Worker: FlushCommit / FlushFail."""
         t0 = time.monotonic()
         batch_bytes = sum(t.nbytes for t in tables)
+        deadline = t0 + self._flush_deadline_s if self._flush_deadline_s is not None else None
+        circuit_was_open = False
+        # apply_done tracks whether the destination-write phase completed (or
+        # didn't exist — position-only flushes have none). Circuit failures
+        # count ONLY apply-phase failures: a cursor-persist failure is shared
+        # cursor-store infrastructure (PG), not a sick destination, and must
+        # not trip the breaker for it (same stance as lifecycle: a PG blip
+        # must not punish destinations).
+        apply_done = not tables
         try:
             ops_count = 0
             if tables:
                 batch = tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
                 if self._full_cdc:
-                    ops_count = apply_full_cdc(self._pool, dest_id, batch, self._key_columns, stop_event=self._stopping)
+                    ops_count = apply_full_cdc(
+                        self._pool, dest_id, batch, self._key_columns, stop_event=self._stopping, deadline=deadline
+                    )
                 else:
-                    ops_count = append_only(self._pool, dest_id, batch, stop_event=self._stopping)
+                    ops_count = append_only(self._pool, dest_id, batch, stop_event=self._stopping, deadline=deadline)
+                apply_done = True
             # Cursor persist AFTER the destination commit (the gap is the
             # spec's CrashDuringFlush window). A short retry here avoids
             # invoking the full failure path (buffer drop + healthy-catalog
@@ -785,6 +854,18 @@ class DeliveryManager:
                     applied["inserts"] += type_counts[0]
                     applied["updates"] += type_counts[1]
                     applied["deletes"] += type_counts[2]
+                # Flush succeeded: reset the consecutive-failure count and
+                # close the circuit if it was open (this WAS the probe).
+                # Only a DATA flush counts as probe evidence: a position-only
+                # persist (tables empty) never touches the destination, so it
+                # can't prove a broken destination healed — it would
+                # phantom-close the circuit on PG health alone.
+                if tables:
+                    circuit_was_open = dest_id in self._circuit_open_until
+                    self._flush_failures[dest_id] = 0
+                    self._circuit_open_until.pop(dest_id, None)
+                    if circuit_was_open:
+                        metrics.delivery_circuit_open.labels(destination=dest_id).set(0)
             metrics.delivery_flushes_total.labels(destination=dest_id, trigger=trigger).inc()
             metrics.dest_last_snapshot_id.labels(destination=dest_id).set(flushed_after)
             if tables:
@@ -805,7 +886,9 @@ class DeliveryManager:
                     trigger,
                     duration,
                 )
-        except Exception:
+                if circuit_was_open:
+                    log.info("Flush circuit closed for %s (probe flush succeeded)", dest_id)
+        except Exception as exc:
             duration = time.monotonic() - t0
             log.exception("Flush failed for destination %s", dest_id)
             # Invariant-restoring reset FIRST: if the bookkeeping below
@@ -815,6 +898,34 @@ class DeliveryManager:
             self._on_flush_failure(dest_id)
             metrics.errors_total.labels(type="dest_write", destination=dest_id).inc()
             metrics.delivery_buffers_dropped_total.labels(destination=dest_id).inc()
+            if isinstance(exc, FlushDeadlineExceeded):
+                metrics.delivery_flush_deadlines_total.labels(destination=dest_id).inc()
+            # Circuit breaker: count the consecutive failure ONLY when the
+            # apply phase (destination write) is what failed — a cursor-
+            # persist failure is shared PG infrastructure, not a sick
+            # destination. At the threshold, pause submissions for this
+            # destination behind an exponential resubmit backoff. Without
+            # this the failure loop below (rewind -> re-read -> resubmit) is
+            # IMMEDIATE — a broken destination burns a flush worker for
+            # minutes per attempt plus its per-cycle chunk quota, forever,
+            # taxing every peer.
+            if not apply_done:
+                with self._lock:
+                    self._flush_failures[dest_id] += 1
+                    failures = self._flush_failures[dest_id]
+                    if failures >= self._cfg.flush_circuit_failures:
+                        backoff = self._circuit_backoff_seconds_locked(dest_id)
+                        self._circuit_open_until[dest_id] = time.monotonic() + backoff
+                        metrics.delivery_circuit_open.labels(destination=dest_id).set(1)
+                        metrics.delivery_circuit_opens_total.labels(destination=dest_id).inc()
+                        log.warning(
+                            "Flush circuit OPEN for %s after %d consecutive failures; "
+                            "flush submissions paused for %.0fs (probe afterwards). "
+                            "Reads continue under the buffer cap; the range re-reads from the cursor.",
+                            dest_id,
+                            failures,
+                            backoff,
+                        )
             try:
                 self._state.record_error(dest_id, f"Flush failed (trigger={trigger})")
             except Exception:
@@ -920,6 +1031,14 @@ class DeliveryManager:
                 self._buffered_rows_total[dest_id] = 0
                 self._flush_target[dest_id] = self._cfg.flush_max_bytes
                 metrics.dest_flush_target_bytes.labels(destination=dest_id).set(self._cfg.flush_max_bytes)
+            # Circuit state is activation-scoped, not ever-member: a stopped,
+            # fixed, re-added destination deserves a fresh probe immediately,
+            # not its predecessor's open circuit (re-add after retire = new
+            # tenant per lifecycle semantics). Genuinely-new ids initialize
+            # clean by the same line.
+            self._flush_failures[dest_id] = 0
+            self._circuit_open_until.pop(dest_id, None)
+            metrics.delivery_circuit_open.labels(destination=dest_id).set(0)
             self._active.add(dest_id)
             self._recompute_per_dest_cap_locked()
 

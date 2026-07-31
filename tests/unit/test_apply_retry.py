@@ -270,3 +270,90 @@ class TestTempDirectoryIsolation:
 
     def test_sweep_noop_when_root_absent(self, tmp_path):
         sweep_spill_dirs(base=str(tmp_path))  # must not raise
+
+
+class TestFlushDeadline:
+    """Overall flush deadline (delivery.flush_deadline_seconds): bounds the
+    retry loop's WALL time — the attempt budget alone permits ~5.5 min of
+    backoff sleeps plus per-attempt write time, so one pathological
+    destination could hold a shared flush worker indefinitely. The deadline
+    aborts the loop with FlushDeadlineExceeded (FlushFail semantics)."""
+
+    def test_expired_deadline_raises_before_first_attempt(self):
+        from viaduck.apply import FlushDeadlineExceeded
+
+        pool = _EvictRecordingPool()
+        calls = []
+
+        def operation(catalog, table):
+            calls.append(1)
+
+        with pytest.raises(FlushDeadlineExceeded, match="flush deadline exceeded"):
+            _write_with_retry(pool, "team-test", operation, deadline=0.0)  # 1970 — always expired
+        assert calls == [], "no attempt may start once the deadline has passed"
+
+    def test_deadline_aborts_mid_retry(self):
+        from viaduck.apply import FlushDeadlineExceeded
+
+        pool = _EvictRecordingPool()
+        attempts = []
+
+        def operation(catalog, table):
+            attempts.append(1)
+            raise RuntimeError("Failed to commit DuckLake transaction: Transaction conflict")
+
+        # Clock script: loop-top check (attempt 1) -> delay-cap read ->
+        # loop-top check (attempt 2, past deadline).
+        with (
+            patch("viaduck.apply._backoff_sleep", return_value=False),
+            patch("viaduck.apply.time.monotonic", side_effect=[10.0, 10.5, 200.0]),
+        ):
+            with pytest.raises(FlushDeadlineExceeded):
+                _write_with_retry(pool, "team-test", operation, deadline=100.0)
+        assert len(attempts) == 1, "deadline must stop the loop after the first failed attempt"
+        assert pool.evictions == 0, "an OCC-conflict failure keeps its no-evict policy under the deadline"
+
+    def test_successful_attempt_unaffected_by_deadline(self):
+        pool = _EvictRecordingPool()
+
+        def operation(catalog, table):
+            return "ok"
+
+        with patch("viaduck.apply.time.monotonic", return_value=10.0):
+            assert _write_with_retry(pool, "team-test", operation, deadline=100.0) == "ok"
+
+    def test_no_deadline_preserves_attempt_budget(self):
+        pool = _EvictRecordingPool()
+        attempts = []
+
+        def operation(catalog, table):
+            attempts.append(1)
+            raise RuntimeError("perma-fail")
+
+        with patch("viaduck.apply._backoff_sleep", return_value=False):
+            with pytest.raises(RuntimeError, match="perma-fail"):
+                _write_with_retry(pool, "team-test", operation, deadline=None)
+        assert len(attempts) == _WRITE_MAX_RETRIES
+
+    def test_backoff_sleep_capped_at_remaining_deadline(self):
+        """A backoff that would carry the flush past the deadline is cut
+        short; the loop-top check then raises instead of starting another
+        attempt."""
+        pool = _EvictRecordingPool()
+        sleeps = []
+
+        def operation(catalog, table):
+            raise RuntimeError("perma-fail")
+
+        # deadline - now = 1s remaining; computed backoff would be 1.5s
+        # (base=1.0 x 2^0 with jitter pinned to +50% — always >1s).
+        with (
+            patch("viaduck.apply.time.monotonic", side_effect=[10.0, 10.0, 11.5]),
+            patch("viaduck.apply.random.uniform", return_value=0.5),
+            patch("viaduck.apply._backoff_sleep", side_effect=lambda delay, ev: sleeps.append(delay) or False),
+        ):
+            from viaduck.apply import FlushDeadlineExceeded
+
+            with pytest.raises(FlushDeadlineExceeded):
+                _write_with_retry(pool, "team-test", operation, deadline=11.0)
+        assert sleeps == [1.0], f"backoff must be capped at the remaining deadline, got {sleeps}"

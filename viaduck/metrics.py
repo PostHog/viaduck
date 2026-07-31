@@ -199,6 +199,26 @@ _delivery_reads_paused = Gauge(
     "1 while a destination's queue (buffer + in-flight) is at its per-destination cap and CDC reads for it are paused",
     ["pipeline", "destination"],
 )
+_delivery_circuit_open = Gauge(
+    "viaduck_delivery_circuit_open",
+    "1 while a destination's flush circuit breaker is open (flush submissions paused after repeated failures)",
+    ["pipeline", "destination"],
+)
+_delivery_circuit_opens_total = Counter(
+    "viaduck_delivery_circuit_opens_total",
+    "Times a destination's flush circuit breaker opened (consecutive flush failures reached the threshold)",
+    ["pipeline", "destination"],
+)
+_delivery_flush_deadlines_total = Counter(
+    "viaduck_delivery_flush_deadlines_total",
+    "Flushes aborted by the overall flush deadline (retry loop exceeded delivery.flush_deadline_seconds)",
+    ["pipeline", "destination"],
+)
+_poll_cycle_timeboxed_total = Counter(
+    "viaduck_poll_cycle_timeboxed_total",
+    "Poll cycles that hit the cycle time budget with cursor groups deferred to the next cycle",
+    ["pipeline"],
+)
 _destination_lifecycle_state = Gauge(
     "viaduck_destination_lifecycle_state",
     "1 for the destination's current lifecycle state (active|paused|draining|retired); see viaduck/lifecycle.py",
@@ -391,6 +411,10 @@ delivery_flushes_total = _delivery_flushes_total
 delivery_flush_seconds = _delivery_flush_seconds
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 delivery_reads_paused = _delivery_reads_paused
+delivery_circuit_open = _delivery_circuit_open
+delivery_circuit_opens_total = _delivery_circuit_opens_total
+delivery_flush_deadlines_total = _delivery_flush_deadlines_total
+poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
 retention_clamp_total = _retention_clamp_total
@@ -440,6 +464,8 @@ def init(pipeline: str):
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
+    global delivery_circuit_open, delivery_circuit_opens_total, delivery_flush_deadlines_total
+    global poll_cycle_timeboxed_total
     global retention_clamp_total, secret_cache_stale_fallback_total
     global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
     global discovery_poll_failures_total, discovery_broken_entries_total
@@ -458,6 +484,9 @@ def init(pipeline: str):
     delivery_flush_seconds = _AutoPipelineLabels(_delivery_flush_seconds, pipeline)
     delivery_buffers_dropped_total = _AutoPipelineLabels(_delivery_buffers_dropped_total, pipeline)
     delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
+    delivery_circuit_open = _AutoPipelineLabels(_delivery_circuit_open, pipeline)
+    delivery_circuit_opens_total = _AutoPipelineLabels(_delivery_circuit_opens_total, pipeline)
+    delivery_flush_deadlines_total = _AutoPipelineLabels(_delivery_flush_deadlines_total, pipeline)
     destination_lifecycle_state = _AutoPipelineLabels(_destination_lifecycle_state, pipeline)
     lifecycle_discarded_rows_total = _AutoPipelineLabels(_lifecycle_discarded_rows_total, pipeline)
     retention_clamp_total = _AutoPipelineLabels(_retention_clamp_total, pipeline)
@@ -493,6 +522,7 @@ def init(pipeline: str):
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
+    poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
     source_snapshot_id = _source_snapshot_id.labels(pipeline=pipeline)
@@ -523,6 +553,9 @@ def remove_destination_series(dest_id: str) -> None:
         delivery_buffer_rows,
         delivery_buffer_bytes,
         delivery_reads_paused,
+        delivery_circuit_open,
+        delivery_circuit_opens_total,
+        delivery_flush_deadlines_total,
         discovery_stop_countdown,
     )
     for m in per_dest:

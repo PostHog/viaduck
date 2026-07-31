@@ -679,6 +679,12 @@ def _make_cfg(dest_ids_and_rvs: list[tuple[str, str]]):
         dests.append(d)
     cfg.destinations = dests
     cfg.poll.cdc_chunk_snapshots = 100
+    # Real values (not MagicMock auto-attrs): the cycle time-budget logic
+    # compares these against the clock. Budget DISABLED by default here so a
+    # slow CI box can never time-box mid-test; timebox tests opt in via
+    # _timebox_setup.
+    cfg.poll.interval_seconds = 5.0
+    cfg.poll.cycle_time_budget_seconds = -1.0
 
     def by_id(dest_id):
         for d in dests:
@@ -3905,3 +3911,143 @@ def test_poll_cycle_survives_membership_smaller_than_assigned():
             mode="append_only",
         )
     delivery.maybe_flush.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Poll-cycle time budget + group rotation (slow-consumer isolation)
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """Stateful fake for time.monotonic: advances only when the test sets
+    it, so the cycle budget check trips at deterministic points. The fake
+    covers heartbeat threads too (shared module attr) and never raises
+    StopIteration, unlike a side_effect list."""
+
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _timebox_setup():
+    """dest-1 at cursor 3, dest-2 at cursor 5; current snapshot 10. Empty
+    routed reads (positions advance, nothing buffers)."""
+    delivery = _make_delivery({"dest-1": 3, "dest-2": 5})
+    router = MagicMock()
+    router.build_filter_expr.side_effect = lambda rvs: "f"
+    router.split_and_count.side_effect = lambda table, rvs: ({}, table.num_rows)
+    cfg = _make_cfg([("dest-1", "a"), ("dest-2", "b")])
+    cfg.poll.interval_seconds = 5.0
+    cfg.poll.cycle_time_budget_seconds = 0.0  # derive: 0.8 x 5.0 = 4.0s
+    return delivery, router, cfg
+
+
+def _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads, advance_after_first_read=False):
+    def fake_read(src_table, after_snapshot, end_snapshot, **kw):
+        reads.append(after_snapshot)
+        if advance_after_first_read:
+            clock.now = 100.0  # the NEXT group's budget check trips (budget 4.0s)
+        return pa.table({"company": ["a"], "value": [1]})
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
+        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+        patch("viaduck.main._export_dest_time_lag"),
+        patch("viaduck.main.time.monotonic", side_effect=clock),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1", "dest-2"],
+            {"a": "dest-1", "b": "dest-2"},
+            key_columns=[],
+            mode="append_only",
+            rotation=rotation,
+        )
+
+
+def test_timebox_defers_unreached_groups_and_rotation_resumes():
+    """Budget trips after the first group: the second defers to the next
+    cycle, which starts AT it (rotation), not back at the most-lagging one."""
+    delivery, router, cfg = _timebox_setup()
+    rotation = {"offset": 0}
+    clock = _Clock(0.0)
+
+    reads: list[int] = []
+    _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads, advance_after_first_read=True)
+    assert reads == [3], f"only the most-lagging group reads before the budget trips, got {reads}"
+    assert rotation["offset"] == 1, "next cycle must resume at the deferred group"
+
+    reads.clear()
+    clock.now = 0.0
+    _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads)
+    assert reads == [5, 3], f"deferred group reads first next cycle, got {reads}"
+    # Full coverage: offset advanced past both groups; mod-wraps next cycle.
+    assert rotation["offset"] % 2 == 1
+
+
+def test_full_coverage_cycle_processes_every_group_sorted():
+    """With the budget never tripping, all groups read every cycle in
+    ascending-cursor order (rotation offset 0 preserves legacy behavior)."""
+    delivery, router, cfg = _timebox_setup()
+    rotation = {"offset": 0}
+    clock = _Clock(0.0)
+    reads: list[int] = []
+    _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads)
+    assert reads == [3, 5], f"all groups read in ascending order, got {reads}"
+
+
+def test_negative_budget_disables_timebox():
+    """poll.cycle_time_budget_seconds < 0: legacy unbounded cycles (no
+    deferral regardless of elapsed time)."""
+    delivery, router, cfg = _timebox_setup()
+    cfg.poll.cycle_time_budget_seconds = -1.0
+    rotation = {"offset": 0}
+    clock = _Clock(1000.0)  # absurdly late — still no timebox
+    reads: list[int] = []
+    _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads)
+    assert reads == [3, 5], f"disabled budget must not defer groups, got {reads}"
+
+
+def test_timebox_floor_guarantees_one_group_per_cycle():
+    """Budget exhausted BEFORE the loop (slow snapshot_bounds / clamp): the
+    first group with work still reads — never a zero-progress cycle. The
+    deferral only kicks in from the second work-group onward."""
+    delivery, router, cfg = _timebox_setup()
+    rotation = {"offset": 0}
+    clock = _Clock(0.0)
+    reads: list[int] = []
+
+    def fake_bounds(table):
+        clock.now = 1000.0  # metadata work eats the entire 4.0s budget
+        return (1, 10)
+
+    def fake_read(src_table, after_snapshot, end_snapshot, **kw):
+        reads.append(after_snapshot)
+        return pa.table({"company": ["a"], "value": [1]})
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", side_effect=fake_bounds),
+        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+        patch("viaduck.main._export_dest_time_lag"),
+        patch("viaduck.main.time.monotonic", side_effect=clock),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1", "dest-2"],
+            {"a": "dest-1", "b": "dest-2"},
+            key_columns=[],
+            mode="append_only",
+            rotation=rotation,
+        )
+    assert reads == [3], f"floor: exactly the first work-group reads despite an eaten budget, got {reads}"
+    assert rotation["offset"] == 1
