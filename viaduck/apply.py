@@ -65,6 +65,20 @@ _PERMANENT_ERROR_TYPES: tuple[type[BaseException], ...] = (
 )
 
 
+class FlushDeadlineExceeded(Exception):
+    """The flush's overall wall-clock deadline (delivery.flush_deadline_seconds)
+    expired mid retry loop. Raised out of _write_with_retry to take the normal
+    FlushFail path (buffer drop + range re-read). Bounds how long one
+    pathological destination can hold a shared flush worker: the attempt
+    budget alone permits ~5.5 min of backoff sleeps plus per-attempt write
+    time — unbounded wall time on a contended catalog. Scope, honestly: this
+    bounds the WRITE retry loop only. A single blocking attempt is NOT
+    preempted, the pool get() (catalog ATTACH, seconds) runs outside it, and
+    the cursor-persist retry tail in delivery._flush is not covered either —
+    worst-case worker occupancy is deadline + one in-flight attempt + cursor
+    tail, not deadline exactly."""
+
+
 def _require_non_null_rowids(batch: pa.Table) -> None:
     """Reject null rowids loudly. Stable, non-null rowids are a contract
     assumption (see the module docstring + tla/Viaduck.tla); the Arrow hash
@@ -172,7 +186,9 @@ def _backoff_sleep(delay: float, stop_event: threading.Event | None) -> bool:
     return stop_event.wait(delay)
 
 
-def _write_with_retry(dest_pool, destination_id, operation, stop_event: threading.Event | None = None):
+def _write_with_retry(
+    dest_pool, destination_id, operation, stop_event: threading.Event | None = None, deadline: float | None = None
+):
     """Execute a write operation on a destination with exponential backoff.
 
     operation: callable that takes (catalog, table) and performs the write.
@@ -185,11 +201,25 @@ def _write_with_retry(dest_pool, destination_id, operation, stop_event: threadin
     SIGTERM and get SIGKILLed once k8s' terminationGracePeriodSeconds
     elapses — cursor stays where it was (safe) but drain() reports an
     abandoned buffer on every rolling restart.
+
+    deadline: optional monotonic timestamp (time.monotonic() basis) bounding
+    the whole retry loop's wall time. Before each attempt the loop checks
+    the deadline and raises FlushDeadlineExceeded instead of starting a new
+    attempt; backoff sleeps are capped at the remaining time so a sleep
+    never carries the flush past it. Attempt-count exhaustion semantics
+    are unchanged — the deadline is an outer bound, not a replacement for
+    the attempt budget.
     """
     metrics.dest_write_retrying.labels(destination=destination_id).set(1)
     instance_fatals = 0
     try:
         for attempt in range(_WRITE_MAX_RETRIES):
+            if deadline is not None and time.monotonic() >= deadline:
+                # Raised OUTSIDE the inner try: the generic except below
+                # would otherwise route it through another retry pass.
+                raise FlushDeadlineExceeded(
+                    f"flush deadline exceeded before attempt {attempt + 1}/{_WRITE_MAX_RETRIES}"
+                )
             try:
                 catalog, table = dest_pool.get(destination_id)
                 try:
@@ -234,6 +264,10 @@ def _write_with_retry(dest_pool, destination_id, operation, stop_event: threadin
                 # racing the same peer commit doesn't herd on the same tick.
                 base = min(_WRITE_BASE_DELAY_S * (2**attempt), _WRITE_MAX_DELAY_S)
                 delay = base * (1.0 + random.uniform(-_WRITE_JITTER_FRACTION, _WRITE_JITTER_FRACTION))
+                if deadline is not None:
+                    # Never sleep past the deadline; the loop-top check
+                    # raises FlushDeadlineExceeded when we wake.
+                    delay = min(delay, max(0.0, deadline - time.monotonic()))
                 metrics.dest_write_retries_total.labels(destination=destination_id).inc()
                 # Log severity ladder: routine OCC dance (attempts 1..3) is
                 # DEBUG; attempt 4+ is genuinely worth an operator's eye and
@@ -596,6 +630,7 @@ def apply_full_cdc(
     batch: pa.Table,
     key_columns: list[str],
     stop_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> int:
     """Phase 2 + Phase 3 for one destination flush. Returns ops applied."""
     resolved = _resolve_conflicts(batch)
@@ -630,6 +665,7 @@ def apply_full_cdc(
             on_null_fallback=_null_fallback,
         ),
         stop_event=stop_event,
+        deadline=deadline,
     )
     for column, count in fallback_counts.items():
         metrics.projection_cast_null_fallback_total.labels(destination=dest_id, column=column).inc(count)
@@ -647,6 +683,7 @@ def append_only(
     dest_id: str,
     batch: pa.Table,
     stop_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> int:
     """Append-only mode (mode=append_only): one tbl.append() per flush.
 
@@ -692,7 +729,7 @@ def append_only(
         b = batch if projection is None else projection.apply(batch, on_null_fallback=_null_fallback)
         tbl.append(b)
 
-    _write_with_retry(dest_pool, dest_id, _apply, stop_event=stop_event)
+    _write_with_retry(dest_pool, dest_id, _apply, stop_event=stop_event, deadline=deadline)
     for column, count in fallback_counts.items():
         metrics.projection_cast_null_fallback_total.labels(destination=dest_id, column=column).inc(count)
     metrics.dest_rows_written_total.labels(destination=dest_id).inc(batch.num_rows)

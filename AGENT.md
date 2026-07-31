@@ -53,7 +53,8 @@ Viaduck
        half-open ranges (position, current]
     3. If key_columns: table_changes() → Phase 1 → route → buffer
        Else: table_insertions() → route → buffer
-    4. Evaluate flush triggers (interval/rows/bytes/memory/shutdown)
+    4. Evaluate flush triggers (interval/rows/bytes/memory/shutdown), gated
+       by the per-destination flush circuit breaker
   flush workers (delivery.workers threads, flush cadence):
     5. Phase 2 (conflict resolution) on the concatenated buffer
     6. Phase 3 (Winner(k) dedup, delete+upsert in one txn)
@@ -179,6 +180,7 @@ Always run `just tlc` after spec changes.
 - **Config via YAML** with `_env` suffix convention for credential indirection
 - **At-least-once semantics**: no cross-catalog transactions; destinations tolerate duplicates
 - **Buffered delivery**: reads at poll cadence, writes at flush cadence (default 120s) — decouples lag visibility from write amplification; `workers: 1, flush_interval_seconds: 0` reproduces unbuffered behavior
+- **Slow-consumer isolation**: a per-destination flush circuit breaker (`flush_circuit_failures`, default 3; exponential resubmit backoff capped at `flush_circuit_max_seconds`) pauses submissions for a repeatedly-failing destination instead of letting it burn a shared worker plus its per-cycle chunk quota forever; an overall flush deadline (`flush_deadline_seconds`, default 2× flush interval) bounds the retry loop's wall time, and a poll-cycle time budget (`poll.cycle_time_budget_seconds`, default 0.8× interval) with rotating group offset keeps K lagging groups from stretching the cycle past the interval. Read-side backpressure stays destination-local (per-destination buffer caps) — these guards cover the shared write/read-scheduling side.
 - **Per-destination bounded buffers (queue semantics)**: each destination's queue (buffered + in-flight) is capped at `buffer_total_max_bytes / N` (or `buffer_max_bytes_per_destination`); an at-cap destination is excluded from CDC read filters and its position frozen — one slow destination backpressures only itself, like a per-partition Kafka consumer. Cap hit also force-flushes (trigger=`memory`). Modeled as BufferCap in the TLA+ spec.
 - **State on plain Postgres**: cursor advances must not create catalog snapshots (the snapshot treadmill); lives in a dedicated `viaduck` schema so it never pollutes the ducklake catalog's namespace; upserts carry a monotonicity guard
 - **LRU connection pool with lease pinning**: bounds memory at high fanout (default 100 open connections); eviction never closes a connection mid-transaction
@@ -205,7 +207,7 @@ Always run `just tlc` after spec changes.
 | `destination.py` | LRU connection pool for destination catalogs, lease pinning |
 | `state.py` | Per-destination cursors on plain Postgres (psycopg) |
 | `arrowutil.py` | Shared Arrow kernel helpers (row_indices, full_bool) |
-| `metrics.py` | Prometheus metric definitions (32 metrics) |
+| `metrics.py` | Prometheus metric definitions (57 metrics) |
 | `server.py` | HTTP /metrics, /healthz, /readyz, /status, /ui, /ui/sse |
 | `logging_config.py` | Structured logging setup |
 

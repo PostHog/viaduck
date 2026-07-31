@@ -109,11 +109,11 @@ Each poll cycle ([`main.py:_poll_cycle`](viaduck/main.py)):
 1. **Snapshot check** — `current_snapshot()` on the source table. If no snapshots exist, sleep and retry.
 2. **Read plan** — atomic snapshot of each destination's in-memory read position + epoch from the delivery manager ([`delivery.py:read_plan`](viaduck/delivery.py)). Positions start at the persisted cursors and advance in memory as reads land.
 3. **Group by position** — destinations at the same position share a single CDC read ([`main.py:_group_by_cursor`](viaduck/main.py)).
-4. **CDC read** — full CDC mode: `table_changes` (inserts, deletes, update pre/post images); append-only mode: `table_insertions`. The range is half-open `(position, current]` — the position snapshot was already delivered ([`source.py`](viaduck/source.py)). Routing values are pushed down as a SQL `IN` filter. Reads are **chunked** (`poll.cdc_chunk_snapshots` snapshots per read, default 100) with a per-cycle round-robin cap of 4 chunks per group, so one deeply-lagging group can never starve the others. Destinations at their per-destination buffer cap are excluded from each chunk's filter and their position frozen — backpressure is per-destination, not global.
+4. **CDC read** — full CDC mode: `table_changes` (inserts, deletes, update pre/post images); append-only mode: `table_insertions`. The range is half-open `(position, current]` — the position snapshot was already delivered ([`source.py`](viaduck/source.py)). Routing values are pushed down as a SQL `IN` filter. Reads are **chunked** (`poll.cdc_chunk_snapshots` snapshots per read, default 100) with a per-cycle round-robin cap of 4 chunks per group, so one deeply-lagging group can never starve the others. The cycle itself is **time-boxed** (`poll.cycle_time_budget_seconds`, default 0.8 × interval): once the budget trips, unreached groups defer to the next cycle and resume first via a rotating offset — K lagging groups can never stretch a cycle past the interval and slow flush evaluation for everyone. Destinations at their per-destination buffer cap are excluded from each chunk's filter and their position frozen — backpressure is per-destination, not global.
 5. **Phase 1: Preimage Resolution** *(full CDC only)* — pair `update_preimage` with `update_postimage` rows by `rowid` (Arrow hash join). Cross-tenant mutations convert the preimage to a delete on the old destination; same-tenant preimages drop; orphaned preimages convert to deletes ([`main.py:_resolve_preimages`](viaduck/main.py)).
 6. **Route** — `split_and_count()` partitions the Arrow table by routing value in a single vectorized pass ([`router.py:split_and_count`](viaduck/router.py)).
 7. **Buffer** — routed batches accumulate in per-destination buffers; the read position advances in memory. Destinations with no routed rows advance position only — zero writes for idle destinations ([`delivery.py:buffer`](viaduck/delivery.py)).
-8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ `flush_max_rows`, bytes ≥ `flush_max_bytes`, per-destination queue (buffered + in-flight) at its cap (trigger label `memory`), or shutdown. The per-destination cap is `buffer_total_max_bytes / N` by default, or `buffer_max_bytes_per_destination` explicitly. One flush takes at most `flush_batch_max_rows` rows (default 60K, sliced at chunk boundaries; the remainder drains immediately after — bounded append batches are what keep the fork's native layer out of its big-batch pathology). Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)).
+8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ `flush_max_rows`, bytes ≥ `flush_max_bytes`, per-destination queue (buffered + in-flight) at its cap (trigger label `memory`), or shutdown. The per-destination cap is `buffer_total_max_bytes / N` by default, or `buffer_max_bytes_per_destination` explicitly. One flush takes at most `flush_batch_max_rows` rows (default 60K, sliced at chunk boundaries; the remainder drains immediately after — bounded append batches are what keep the fork's native layer out of its big-batch pathology). Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)) — unless the destination's **circuit breaker** is open (below).
 9. **Lag metrics + status** — per-destination snapshot lag from the delivery manager's authoritative in-memory view.
 
 Each flush (worker thread, [`delivery.py:_flush`](viaduck/delivery.py)):
@@ -123,6 +123,11 @@ Each flush (worker thread, [`delivery.py:_flush`](viaduck/delivery.py)):
 3. **Advance cursor** — upsert the persisted cursor in Postgres, with a short in-process retry since the destination commit already landed ([`state.py:advance_cursor`](viaduck/state.py)).
 
 At most one flush per destination is in flight (the in-flight guard); flushes for different destinations run concurrently on `delivery.workers` threads. A failed flush drops the destination's buffers, resets its read position to the persisted cursor, and lets the next cycle re-read the range — at-least-once, no poison-buffer growth.
+
+Two guards keep one sick destination from taxing the whole fleet on this shared worker pool:
+
+- **Flush deadline** (`delivery.flush_deadline_seconds`, default 2 × `flush_interval_seconds`) — an overall wall-clock bound on the OCC retry loop inside one flush. Without it, 15 attempts × up-to-30s backoff is ~5.5 min of sleeps alone, so one pathological destination can hold a shared worker indefinitely. The deadline aborts the loop with ordinary FlushFail semantics (`viaduck_delivery_flush_deadlines_total`).
+- **Flush circuit breaker** (`delivery.flush_circuit_failures` = 3, `delivery.flush_circuit_max_seconds` = 900) — after N consecutive flush failures, submissions for that destination pause behind an exponential resubmit backoff (`flush_interval_seconds` × 2^failures, capped). Without it, a broken destination cycles read → buffer → fail → rewind → re-read forever, burning a worker for minutes per attempt plus its per-cycle chunk quota. While open, reads continue under the normal buffer cap (the destination self-pauses at its ceiling); the first submission after each backoff is a probe that closes the circuit on success (`viaduck_delivery_circuit_open`, `viaduck_delivery_circuit_opens_total`).
 
 ## CDC Operations and Semantics
 
@@ -181,6 +186,7 @@ There is **no data loss path** — machine-checked, not just argued: every consi
 | Destination apply failure (full CDC) | Delete + upsert transaction rolled back | No partial state on destination. Buffer dropped, range re-read. | Per-destination |
 | SIGTERM with data buffered | Shutdown drain | `drain()` flushes everything buffered (trigger=shutdown), bounded by a 60s deadline; anything abandoned is re-read on restart. Note: the 60s deadline exceeds K8s's default 30s `terminationGracePeriodSeconds` — raise the grace period or expect SIGKILL to cut the drain short (safe, just re-read). | — |
 | Destination at its buffer cap | Backpressure (by design) | The destination's queue (buffer + in-flight) hit its per-destination cap: its buffer force-flushes (trigger=`memory`) and its CDC reads pause until the flush drains — `viaduck_delivery_reads_paused` gauges it. Healthy peers keep reading and flushing. | **Per-destination** |
+| Destination failing flushes repeatedly | Circuit breaker opens after `flush_circuit_failures` consecutive failures | Flush submissions pause behind an exponential backoff; reads continue under the buffer cap. A probe after each backoff closes the circuit on success. `viaduck_delivery_circuit_open` / `viaduck_delivery_circuit_opens_total` gauge/count it; logs WARN on open. | **Per-destination** |
 | Routing field missing from source | `RoutingError` halts group processing | Error metricked, logged. Requires config or schema fix. | All destinations in group |
 | Connection pool eviction storm | Frequent close/reopen | Automatic via LRU; pinned (in-use) connections are never evicted mid-transaction. Increase `delivery.pool_max_open` if thrashing. | Performance, not correctness |
 
@@ -188,7 +194,6 @@ There is **no data loss path** — machine-checked, not just argued: every consi
 
 - **Dynamic destination discovery** — destinations are defined statically in YAML. No runtime discovery from a DuckLake table.
 - **Schema evolution propagation** — source schema changes are not automatically applied to existing destination tables. Requires viaduck restart.
-- **Halted destination state** — permanent per-destination failures (e.g. schema mismatch) retry forever with growing re-read ranges; no schema pre-flight check or consecutive-failure circuit breaker yet (see Error states).
 - **Exactly-once delivery** — at-least-once only. No deduplication layer.
 - **PostHog events integration** — operational events (flush failures, seeds, drains, halted destinations) emitted as PostHog events for product-side observability.
 - **Rowid-reuse tolerance** — DuckLake reuses a rowid when an upsert re-creates a deleted key; if the re-create lands in the same flush window as its predecessor's delete, Phase 2 mistakes them for one row and the new row is lost (pre-existing; both old and new conflict rules affected; append-only mode immune). Fix in design: snapshot-ordered latest-event-wins conflict resolution.
@@ -244,6 +249,7 @@ defaults:
 poll:
   interval_seconds: 5                       # how often to poll for new snapshots
   cdc_chunk_snapshots: 100                  # snapshots per CDC read chunk (bounds read size + flush unit during catch-up)
+  # cycle_time_budget_seconds: 0            # per-cycle wall budget for group reads (0 = derive: 0.8 x interval; <0 = unbounded)
 
 state:
   table: "viaduck_state"                    # Postgres cursor table
@@ -259,6 +265,9 @@ delivery:
   buffer_total_max_bytes: 1073741824        # total budget (1 GiB); per-destination cap = total / N
   # buffer_max_bytes_per_destination: 0     # explicit per-destination cap (0 = auto: total / N)
   pool_max_open: 100                        # destination connection pool size
+  # flush_deadline_seconds: 0               # overall per-flush wall-clock bound (0 = derive: 2 x flush_interval)
+  flush_circuit_failures: 3                 # consecutive failures before a destination's circuit breaker opens
+  flush_circuit_max_seconds: 900            # cap on the circuit breaker's exponential resubmit backoff
 
 server:
   port: 8000                                # metrics, health checks, status UI
@@ -569,7 +578,7 @@ Every error state and how it resolves:
 | Pool connection create/close failure | Destination catalog connect | Evicted and recreated on next access; close failures are log-warnings only |
 | Escaped flush-worker exception | Bug guard | CRITICAL log; in-flight state cleared in `finally` so the destination isn't wedged |
 
-**Permanent failures retry forever.** A destination that can never succeed (e.g. schema mismatch) loops through the flush-failure path at flush cadence, and because its cursor never advances, its re-read range — and the source I/O spent on it — grows every cycle. The failure is fully visible (`error` status, `last_error`, climbing `dest_lag_snapshots`, `delivery_buffers_dropped_total`) but never escalates. A `halted` destination state (schema pre-flight check / consecutive-failure circuit breaker) is logged future work.
+**Permanent failures are circuit-broken, not retried forever.** A destination that can never succeed (e.g. schema mismatch) trips the flush circuit breaker after `flush_circuit_failures` consecutive failures (default 3): flush submissions pause behind an exponential backoff (capped at `flush_circuit_max_seconds`, default 900s), so the broken destination stops consuming flush workers and re-read quota instead of looping at flush cadence. Reads continue under the buffer cap; a probe flush after each backoff re-tests the destination and closes the circuit on success. The failure remains fully visible (`error` status, `last_error`, climbing `dest_lag_snapshots`, `delivery_buffers_dropped_total`, plus `viaduck_delivery_circuit_open` / `viaduck_delivery_circuit_opens_total`) — operator action is still required to actually fix the destination; the breaker only bounds its cost.
 
 Why exit on source failure? The source catalog is the single point of truth. If it's unreachable, there's nothing to do. The exit path runs the normal shutdown drain (already-buffered data still flushes), then lets K8s handle the restart. DuckLake snapshot history ensures no data loss.
 

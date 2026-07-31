@@ -719,8 +719,11 @@ def test_log_summary_one_line_per_field_not_grouped(config_file, caplog):
         "config: delivery.flush_interval_seconds=",
         "config: delivery.flush_max_rows=",
         "config: delivery.flush_max_bytes=",
+        "config: delivery.flush_deadline_seconds=",
+        "config: delivery.flush_circuit_failures=",
         "config: poll.interval_seconds=",
         "config: poll.cdc_chunk_snapshots=",
+        "config: poll.cycle_time_budget_seconds=",
         "config: instance.partition.mode=",
         "config: state.table=",
         "config: state.schema=",
@@ -980,3 +983,46 @@ def test_flush_adaptive_loader_passthrough(tmp_path: Path):
     assert cfg.delivery.flush_adaptive_high_seconds == 60.0
     assert cfg.delivery.flush_adaptive_step_bytes == 8388608
     assert cfg.delivery.flush_adaptive_min_bytes == 4194304
+
+
+# --- slow-consumer isolation knobs (flush deadline / circuit / cycle budget) ---
+
+
+def test_slow_consumer_knob_defaults():
+    from viaduck.config import DeliveryConfig, PollConfig
+
+    d = DeliveryConfig()
+    assert d.flush_deadline_seconds == 0.0  # 0 = derive 2x flush_interval at DeliveryManager init
+    assert d.flush_circuit_failures == 3
+    assert d.flush_circuit_max_seconds == 900.0
+    p = PollConfig()
+    assert p.cycle_time_budget_seconds == 0.0  # 0 = derive 0.8x interval at poll time
+
+
+def test_slow_consumer_knob_validation():
+    from viaduck.config import DeliveryConfig
+
+    with pytest.raises(ConfigError, match="flush_deadline_seconds"):
+        DeliveryConfig(flush_deadline_seconds=-1.0)
+    with pytest.raises(ConfigError, match="flush_circuit_failures"):
+        DeliveryConfig(flush_circuit_failures=0)
+    with pytest.raises(ConfigError, match="flush_circuit_max_seconds"):
+        DeliveryConfig(flush_circuit_max_seconds=0.5)
+
+
+def test_slow_consumer_knob_loader_passthrough(tmp_path: Path):
+    raw = MINIMAL_YAML + (
+        "\npoll:\n"
+        "  cycle_time_budget_seconds: 3.5\n"
+        "delivery:\n"
+        "  flush_deadline_seconds: 240.0\n"
+        "  flush_circuit_failures: 5\n"
+        "  flush_circuit_max_seconds: 300\n"
+    )
+    p = tmp_path / "slowknobs.yaml"
+    p.write_text(raw)
+    cfg = load(p)
+    assert cfg.poll.cycle_time_budget_seconds == 3.5
+    assert cfg.delivery.flush_deadline_seconds == 240.0
+    assert cfg.delivery.flush_circuit_failures == 5
+    assert cfg.delivery.flush_circuit_max_seconds == 300.0

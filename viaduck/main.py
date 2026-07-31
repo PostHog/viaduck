@@ -975,6 +975,12 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     shutdown = False
 
+    # Cursor-group iteration offset, carried across cycles: with the cycle
+    # time budget (poll.cycle_time_budget_seconds), groups not reached this
+    # cycle resume first next cycle instead of the most-lagging group
+    # always getting first-turn service. See _poll_cycle.
+    cycle_rotation: dict = {"offset": 0}
+
     def _signal_handler(signum, frame):
         nonlocal shutdown
         log.info("Received signal %s, shutting down", signal.Signals(signum).name)
@@ -1036,6 +1042,7 @@ def run(cfg: config.ViaduckConfig) -> None:
                 read_ids=read_ids,
                 lifecycle_states=tracker.states(),
                 dest_configs=reg_snap.configs,
+                rotation=cycle_rotation,
             )
         except Exception:
             log.exception("Fatal error in poll cycle")
@@ -1195,6 +1202,7 @@ def _poll_cycle(
     read_ids=None,
     lifecycle_states=None,
     dest_configs=None,
+    rotation=None,
 ):
     # Local boolean so the existing branch sites stay terse. Threading mode
     # (not full_cdc) through the call signature avoids reconstructing the
@@ -1218,6 +1226,16 @@ def _poll_cycle(
     Writes happen on the delivery manager's worker pool at flush cadence —
     this thread only reads, routes (Phase 1 included), and buffers. See
     viaduck/delivery.py and tla/Viaduck.tla (BufferRead / FlushStart).
+
+    `rotation`: optional mutable dict (owned by the run loop) carrying the
+    cursor-group iteration offset across cycles. Groups are processed in
+    ascending-cursor order, rotated by this offset; when the cycle time
+    budget (poll.cycle_time_budget_seconds) trips, remaining groups defer
+    to the next cycle, which resumes near the rotation offset (approximate
+    under group merge/split) rather than restarting at the most-lagging
+    group every time. Without the rotation, K lagging groups each get
+    first-turn service ahead of healthy groups on EVERY cycle — the
+    cursor-scatter wedge of 2026-07-31 (100s cycles on a 5s interval).
     """
     metrics.polls_total.inc()
     health.record_poll()
@@ -1273,9 +1291,40 @@ def _poll_cycle(
             #     1.5h while team-50689 relitigated the same range.
             # The cap turns strict priority into a round-robin with a
             # lagging-first bias: every group makes progress every cycle.
-            for start_snap, dest_ids in sorted(groups.items()):
+            #
+            # Cycle time budget + rotation (poll.cycle_time_budget_seconds):
+            # the chunk cap bounds work PER GROUP, not the cycle — K lagging
+            # groups still stretch the cycle past the poll interval, slowing
+            # flush evaluation and lifecycle application for everyone (the
+            # 2026-07-31 cursor-scatter wedge: 100s cycles on a 5s interval).
+            # The budget stops group reads once the cycle is ~80% spent;
+            # deferred groups resume near the rotation offset next cycle
+            # (approximate under group merge/split — the offset is an index
+            # into a re-sorted, re-sized list, but a skipped group's frozen
+            # position sinks it toward sorted-index 0, self-correcting).
+            # Real bound per cycle is budget + one group's chunk quota: the
+            # budget is only checked BETWEEN groups. Floor: the check is
+            # skipped until one group with work has read, so a slow
+            # snapshot_bounds or retention clamp that eats the whole budget
+            # can never produce a zero-progress cycle.
+            cycle_budget_s = cfg.poll.cycle_time_budget_seconds
+            if cycle_budget_s == 0:
+                cycle_budget_s = 0.8 * cfg.poll.interval_seconds
+            ordered_groups = sorted(groups.items())
+            rot_off = 0
+            if rotation is not None and ordered_groups:
+                rot_off = rotation.get("offset", 0) % len(ordered_groups)
+                ordered_groups = ordered_groups[rot_off:] + ordered_groups[:rot_off]
+            groups_completed = 0
+            groups_read = 0
+            timeboxed = False
+            for start_snap, dest_ids in ordered_groups:
                 if start_snap >= current_id:
+                    groups_completed += 1
                     continue  # already read through the current snapshot
+                if cycle_budget_s > 0 and groups_read > 0 and (time.monotonic() - cycle_t0) >= cycle_budget_s:
+                    timeboxed = True
+                    break
 
                 # Read CDC in snapshot chunks to bound memory use.
                 # Each chunk is read, routed, and buffered before the next is fetched.
@@ -1416,8 +1465,25 @@ def _poll_cycle(
 
                 if group_read_anything:
                     cycle_groups_processed += 1
+                groups_completed += 1
+                groups_read += 1
                 if routing_error:
                     break
+
+            if rotation is not None and ordered_groups:
+                # Next cycle resumes at the first group not reached this
+                # one (mod wraps: a fully-covered cycle starts at the same
+                # offset as this one began).
+                rotation["offset"] = rot_off + groups_completed
+            if timeboxed:
+                deferred = len(ordered_groups) - groups_completed
+                metrics.poll_cycle_timeboxed_total.inc()
+                log.info(
+                    "Poll cycle time-boxed after %.1fs (budget %.1fs): %d cursor group(s) deferred to next cycle",
+                    time.monotonic() - cycle_t0,
+                    cycle_budget_s,
+                    deferred,
+                )
 
     # Evaluate flush triggers (FlushStart) — also persists position-only
     # advances for idle destinations on the flush cadence.

@@ -328,6 +328,19 @@ class DestinationConfig:
 class PollConfig:
     interval_seconds: float = 5.0
     cdc_chunk_snapshots: int = 100
+    # Per-cycle wall-clock budget for CDC group reads. When the budget trips,
+    # remaining cursor groups defer to the next cycle (group iteration
+    # rotates, so deferred groups resume near the rotation offset —
+    # approximate under group merge/split). Without it, K lagging groups x
+    # the per-group chunk quota can stretch a cycle past the interval — the
+    # 2026-07-31 cursor-scatter incident ran 100s cycles on a 5s interval,
+    # slowing flush evaluation, lifecycle application, and lag exports for
+    # every destination, not just the lagging ones. The budget is checked
+    # only BETWEEN groups (real bound: budget + one group's chunk quota) and
+    # is skipped until one group with work has read (never a zero-progress
+    # cycle). 0 (default) derives 0.8 x interval_seconds; negative disables
+    # (legacy unbounded cycles).
+    cycle_time_budget_seconds: float = 0.0
 
     def __post_init__(self):
         if self.cdc_chunk_snapshots < 1:
@@ -462,6 +475,41 @@ class DeliveryConfig:
     # ceiling below the floor stays a one-knob change.
     flush_adaptive_min_bytes: int = 8_388_608  # 8 MiB
     pool_max_open: int = 100  # destination connection pool size
+    # Overall per-flush wall-clock deadline. The OCC retry loop
+    # (apply._write_with_retry) is bounded in ATTEMPTS but unbounded in
+    # wall time: 15 attempts x up-to-30s backoff is ~5.5 min of sleeps
+    # alone, plus per-attempt write time on a contended catalog — one
+    # pathological destination holds a shared flush worker the whole time
+    # (the write side is shared fate: one FIFO ThreadPoolExecutor for all
+    # destinations). The deadline aborts the retry loop (same FlushFail
+    # semantics as any other write failure: buffer drop + range re-read).
+    # Scope: the WRITE retry loop only — a single blocking attempt is NOT
+    # preempted, and the cursor-persist retry tail runs outside it, so
+    # worst-case worker occupancy is deadline + one in-flight attempt +
+    # cursor tail. 0 (default) derives 2 x flush_interval_seconds; if the
+    # derived value is <= 0 (e.g. flush_interval_seconds=0), the deadline
+    # is disabled.
+    flush_deadline_seconds: float = 0.0
+    # Per-destination flush circuit breaker. After this many CONSECUTIVE
+    # flush failures, submissions for that destination pause: without it, a
+    # broken destination cycles read->buffer->fail->rewind->re-read
+    # forever, burning a flush worker for minutes per attempt AND its
+    # per-cycle chunk quota (lagging groups are served first) — one broken
+    # destination actively taxes every peer instead of just stalling
+    # itself. While open, reads continue under the normal buffer-cap rules
+    # (the destination pauses itself at cap, Kafka-partition semantics).
+    # Only apply-phase (destination-write) failures count — a cursor-persist
+    # failure is shared PG infrastructure, not a sick destination. Only a
+    # flush carrying data closes the circuit (a position-only persist never
+    # touches the destination). drain() bypasses the gate so shutdown
+    # flushes always attempt. Resubmission backs off exponentially:
+    # flush_interval_seconds x 2^(failures - threshold), floored at 1s (the
+    # raw formula collapses to 0 at flush_interval_seconds=0), capped at
+    # flush_circuit_max_seconds; the first submission after the backoff is
+    # a probe (in-flight guard makes it one) that closes the circuit on
+    # success or re-opens it with the next backoff step on failure.
+    flush_circuit_failures: int = 3
+    flush_circuit_max_seconds: float = 900.0
 
     def __post_init__(self):
         if self.workers < 1:
@@ -492,6 +540,15 @@ class DeliveryConfig:
                 f"delivery.flush_adaptive_high_seconds ({self.flush_adaptive_high_seconds}) must be > "
                 f"flush_adaptive_low_seconds ({self.flush_adaptive_low_seconds})"
             )
+        if self.flush_deadline_seconds < 0:
+            raise ConfigError(
+                f"delivery.flush_deadline_seconds must be >= 0 (0 = 2x flush_interval_seconds), "
+                f"got {self.flush_deadline_seconds}"
+            )
+        if self.flush_circuit_failures < 1:
+            raise ConfigError(f"delivery.flush_circuit_failures must be >= 1, got {self.flush_circuit_failures}")
+        if self.flush_circuit_max_seconds < 1:
+            raise ConfigError(f"delivery.flush_circuit_max_seconds must be >= 1, got {self.flush_circuit_max_seconds}")
 
 
 @dataclass(frozen=True)
@@ -658,6 +715,10 @@ class ViaduckConfig:
 
         log.info("config: poll.interval_seconds=%s", self.poll.interval_seconds)
         log.info("config: poll.cdc_chunk_snapshots=%d", self.poll.cdc_chunk_snapshots)
+        log.info(
+            "config: poll.cycle_time_budget_seconds=%s (0=derive: 0.8x interval)",
+            self.poll.cycle_time_budget_seconds,
+        )
 
         log.info("config: delivery.workers=%d", self.delivery.workers)
         log.info("config: delivery.flush_interval_seconds=%s", self.delivery.flush_interval_seconds)
@@ -677,6 +738,15 @@ class ViaduckConfig:
             self.delivery.flush_adaptive_min_bytes,
         )
         log.info("config: delivery.pool_max_open=%d", self.delivery.pool_max_open)
+        log.info(
+            "config: delivery.flush_deadline_seconds=%s (0=derive: 2x flush_interval)",
+            self.delivery.flush_deadline_seconds,
+        )
+        log.info(
+            "config: delivery.flush_circuit_failures=%d, flush_circuit_max_seconds=%s",
+            self.delivery.flush_circuit_failures,
+            self.delivery.flush_circuit_max_seconds,
+        )
 
         log.info("config: server.port=%d", self.server.port)
         log.info("config: web.enabled=%s", self.web.enabled)
@@ -841,6 +911,7 @@ def load(path: str | Path) -> ViaduckConfig:
     poll = PollConfig(
         interval_seconds=poll_raw.get("interval_seconds", 5.0),
         cdc_chunk_snapshots=_validate_int(poll_raw.get("cdc_chunk_snapshots", 100), "poll.cdc_chunk_snapshots"),
+        cycle_time_budget_seconds=float(poll_raw.get("cycle_time_budget_seconds", 0.0)),
     )
 
     server_raw = raw.get("server", {})
@@ -882,6 +953,11 @@ def load(path: str | Path) -> ViaduckConfig:
             delivery_raw.get("flush_adaptive_min_bytes", 8_388_608), "delivery.flush_adaptive_min_bytes"
         ),
         pool_max_open=_validate_int(delivery_raw.get("pool_max_open", 100), "delivery.pool_max_open"),
+        flush_deadline_seconds=float(delivery_raw.get("flush_deadline_seconds", 0.0)),
+        flush_circuit_failures=_validate_int(
+            delivery_raw.get("flush_circuit_failures", 3), "delivery.flush_circuit_failures"
+        ),
+        flush_circuit_max_seconds=float(delivery_raw.get("flush_circuit_max_seconds", 900.0)),
     )
 
     inst_raw = raw.get("instance", {})

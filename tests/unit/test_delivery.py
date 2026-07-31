@@ -5,6 +5,7 @@ BufferRead, FlushStart, FlushCommit, FlushFail."""
 from __future__ import annotations
 
 import threading
+import time as _time_mod
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
@@ -278,7 +279,7 @@ def test_full_cdc_flush_concats_buffered_reads():
     mgr, _, _ = _manager(flush_interval_seconds=0.0, mode="full_cdc", key_columns=["value"])
     captured = {}
 
-    def fake_apply(pool, dest, batch, key_columns, stop_event=None):
+    def fake_apply(pool, dest, batch, key_columns, stop_event=None, deadline=None):
         captured["rows"] = batch.num_rows
         return batch.num_rows
 
@@ -490,7 +491,7 @@ def test_drain_second_pass_flushes_rows_buffered_during_inflight_flush():
     release = threading.Event()
     flushed_batches = []
 
-    def slow_apply(pool, dest, batch, stop_event=None):
+    def slow_apply(pool, dest, batch, stop_event=None, deadline=None):
         flushed_batches.append(batch.num_rows)
         if len(flushed_batches) == 1:
             release.wait(5)
@@ -516,7 +517,7 @@ def test_watermark_counts_inflight_bytes():
     mgr, _, _ = _manager(buffer_total_max_bytes=1, flush_interval_seconds=3600.0)
     release = threading.Event()
 
-    def slow_apply(pool, dest, batch, stop_event=None):
+    def slow_apply(pool, dest, batch, stop_event=None, deadline=None):
         release.wait(5)
         return batch.num_rows
 
@@ -1341,3 +1342,261 @@ def test_flush_target_gauge_seeded_at_startup_and_add():
     assert g._value.get() == 128 * _MIB
     mgr.add_destination("d9")
     assert metrics.dest_flush_target_bytes.labels(destination="d9")._value.get() == 128 * _MIB
+
+
+# ---------------------------------------------------------------------------
+# Flush circuit breaker + flush deadline (slow-consumer isolation)
+# ---------------------------------------------------------------------------
+
+
+def _fail_flushes(mgr, n, start_through=1):
+    """Drive n consecutive flush failures for d1 (rows trigger), simulating
+    the resubmit backoff elapsing between iterations so each one submits.
+    The state after the FINAL failure is left intact for assertions."""
+    for i in range(n):
+        with mgr._lock:
+            mgr._circuit_open_until.pop("d1", None)  # backoff elapsed -> probe eligible
+        mgr.buffer("d1", _table(1), start_through + i)
+        submitted = mgr.maybe_flush()
+        assert submitted == 1, f"failure-drive iteration {i}: expected a submission"
+        assert mgr.wait_idle(5)
+
+
+def test_circuit_opens_at_threshold_and_pauses_submissions():
+    mgr, _, _ = _manager(
+        flush_max_rows=1, flush_circuit_failures=3, flush_interval_seconds=100.0, flush_circuit_max_seconds=1000.0
+    )
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 3)
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 3
+        assert mgr._circuit_open_until["d1"] > 0
+    # Submissions paused even though data is buffered and a trigger is due.
+    mgr.buffer("d1", _table(1), 99)
+    assert mgr.maybe_flush() == 0
+    assert metrics.delivery_circuit_open.labels(destination="d1")._value.get() == 1
+
+
+def test_circuit_probe_success_closes_and_resubmits():
+    mgr, _, _ = _manager(flush_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 2)
+    with mgr._lock:
+        assert mgr._circuit_open_until["d1"] > 0
+        mgr._circuit_open_until["d1"] = 0.0  # backoff elapsed -> probe eligible
+    with patch("viaduck.delivery.append_only", return_value=1):
+        mgr.buffer("d1", _table(1), 99)
+        assert mgr.maybe_flush() == 1, "elapsed backoff must let the probe through"
+        assert mgr.wait_idle(5)
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 0
+        assert "d1" not in mgr._circuit_open_until
+    assert metrics.delivery_circuit_open.labels(destination="d1")._value.get() == 0
+
+
+def test_circuit_probe_failure_reopens_with_next_backoff_step():
+    mgr, _, _ = _manager(
+        flush_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0, flush_circuit_max_seconds=1000.0
+    )
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 2)
+        # backoff=2s step; then a failing probe
+        with mgr._lock:
+            mgr._circuit_open_until["d1"] = 0.0
+        mgr.buffer("d1", _table(1), 99)
+        assert mgr.maybe_flush() == 1
+        assert mgr.wait_idle(5)
+    # Third consecutive failure: failures=3 -> backoff = 100 * 2^(3-2) = 200s.
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 3
+        remaining = mgr._circuit_open_until["d1"] - _time_mod.monotonic()
+    assert 190 < remaining <= 200, f"backoff must step to 2x interval, got {remaining:.1f}s"
+    mgr.buffer("d1", _table(1), 100)
+    assert mgr.maybe_flush() == 0
+
+
+def test_circuit_backoff_capped_at_max_seconds():
+    mgr, _, _ = _manager(
+        flush_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0, flush_circuit_max_seconds=150.0
+    )
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 4)  # uncapped backoff would reach 100*2^2=400s
+    with mgr._lock:
+        remaining = mgr._circuit_open_until["d1"] - _time_mod.monotonic()
+    assert 140 < remaining <= 150, f"backoff must cap at flush_circuit_max_seconds, got {remaining:.1f}s"
+
+
+def test_success_before_threshold_resets_consecutive_failures():
+    mgr, _, _ = _manager(flush_max_rows=1, flush_circuit_failures=3, flush_interval_seconds=100.0)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 2)
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 2
+        assert "d1" not in mgr._circuit_open_until  # still closed below threshold
+    with patch("viaduck.delivery.append_only", return_value=1):
+        mgr.buffer("d1", _table(1), 99)
+        assert mgr.maybe_flush() == 1
+        assert mgr.wait_idle(5)
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 0
+    with patch("viaduck.delivery.append_only", return_value=1):
+        mgr.buffer("d1", _table(1), 100)
+        assert mgr.maybe_flush() == 1
+        assert mgr.wait_idle(5)
+
+
+def test_circuit_is_per_destination():
+    mgr, _, _ = _manager(dests=("d1", "d2"), flush_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 2)
+    with patch("viaduck.delivery.append_only", return_value=1):
+        mgr.buffer("d2", _table(1), 50)
+        assert mgr.maybe_flush() == 1, "d2's flush must submit while d1's circuit is open"
+        assert mgr.wait_idle(5)
+    with mgr._lock:
+        assert mgr._circuit_open_until.get("d1", 0) > 0
+        assert "d2" not in mgr._circuit_open_until
+
+
+def test_flush_passes_derived_deadline_to_apply():
+    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0, flush_deadline_seconds=0.0)
+    with patch("viaduck.delivery.append_only", return_value=1) as ao:
+        mgr.buffer("d1", _table(1), 5)
+        assert mgr.maybe_flush() == 1
+        assert mgr.wait_idle(5)
+    deadline = ao.call_args.kwargs["deadline"]
+    assert deadline is not None
+    # Derived default: 2x flush_interval_seconds from the flush's start time.
+    assert abs(deadline - (_time_mod.monotonic() + 200.0)) < 60, f"derived deadline should be ~200s out, got {deadline}"
+
+
+def test_flush_deadline_disabled_when_derived_nonpositive():
+    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=0.0, flush_deadline_seconds=0.0)
+    with patch("viaduck.delivery.append_only", return_value=1) as ao:
+        mgr.buffer("d1", _table(1), 5)
+        mgr.maybe_flush()
+        assert mgr.wait_idle(5)
+    assert ao.call_args.kwargs["deadline"] is None
+
+
+def test_flush_deadline_exceeded_counts_metric_and_fails_flush():
+    from viaduck.apply import FlushDeadlineExceeded
+
+    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0)
+    before = metrics.delivery_flush_deadlines_total.labels(destination="d1")._value.get()
+    with patch("viaduck.delivery.append_only", side_effect=FlushDeadlineExceeded("too slow")):
+        mgr.buffer("d1", _table(1), 5)
+        assert mgr.maybe_flush() == 1
+        assert mgr.wait_idle(5)
+    after = metrics.delivery_flush_deadlines_total.labels(destination="d1")._value.get()
+    assert after == before + 1
+    # A deadline abort is an ordinary FlushFail for the position model.
+    assert mgr.positions() == {"d1": 0}
+
+
+def test_position_only_flush_does_not_close_circuit():
+    """A position-only persist (tables empty) never touches the destination
+    — it must not count as probe evidence and phantom-close the circuit on
+    PG health alone."""
+    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=0.0, flush_circuit_failures=3)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 3)
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 3
+        mgr._circuit_open_until["d1"] = 0.0  # backoff elapsed -> probe eligible
+    # Position-only advance: submits a tables-empty flush which "succeeds"
+    # (nothing to write, cursor persists). append_only must NOT be called.
+    with patch("viaduck.delivery.append_only", side_effect=AssertionError("must not be called")):
+        mgr.advance_position("d1", 50)
+        assert mgr.maybe_flush() == 1
+        assert mgr.wait_idle(5)
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 3, "empty flush must not reset the failure count"
+    assert metrics.delivery_circuit_open.labels(destination="d1")._value.get() == 1
+
+
+def test_circuit_backoff_floored_at_one_second_when_interval_zero():
+    """flush_interval_seconds=0 (unbuffered-repro mode): the raw formula
+    collapses to 0s and the breaker would never suppress a submission.
+    The 1s floor keeps the gate real."""
+    mgr, _, _ = _manager(
+        flush_max_rows=1, flush_interval_seconds=0.0, flush_circuit_failures=3, flush_circuit_max_seconds=900.0
+    )
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 3)
+    with mgr._lock:
+        remaining = mgr._circuit_open_until["d1"] - _time_mod.monotonic()
+    assert 0.9 < remaining <= 1.0, f"backoff must floor at 1s, got {remaining:.2f}s"
+    mgr.buffer("d1", _table(1), 99)
+    assert mgr.maybe_flush() == 0, "gate must actually suppress submissions at interval=0"
+
+
+def test_cursor_persist_failure_does_not_count_toward_circuit():
+    """The destination write SUCCEEDED; the cursor-store PG is down. Shared
+    infrastructure must not trip the destination's breaker (same stance as
+    lifecycle: a PG blip must not punish destinations)."""
+    mgr, sm, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
+    sm.advance_cursor.side_effect = RuntimeError("pg down")
+    with (
+        patch("viaduck.delivery.append_only", return_value=1),
+        patch("viaduck.delivery.time.sleep"),  # skip the cursor-retry backoff
+    ):
+        for _ in range(3):
+            mgr.buffer("d1", _table(1), 5)
+            assert mgr.maybe_flush() == 1
+            assert mgr.wait_idle(5)
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 0, "cursor-persist failures must not count toward the circuit"
+        assert "d1" not in mgr._circuit_open_until
+
+
+def test_drain_bypasses_circuit():
+    """Shutdown must attempt every destination even with an open circuit:
+    a recovered destination drains cleanly instead of burning the whole
+    drain timeout and abandoning rows."""
+    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 2)
+    with mgr._lock:
+        assert mgr._circuit_open_until["d1"] > 0
+    flushed = []
+    with patch("viaduck.delivery.append_only", side_effect=lambda *a, **k: flushed.append(1) or 1):
+        mgr.buffer("d1", _table(3), 50)
+        t0 = _time_mod.monotonic()
+        mgr.drain(timeout_s=5.0)
+        elapsed = _time_mod.monotonic() - t0
+    assert flushed == [1], "drain must bypass the circuit and attempt the flush"
+    assert elapsed < 2.0, f"drain must not spin its timeout behind an open circuit ({elapsed:.1f}s)"
+
+
+def test_readd_resets_circuit_state():
+    """remove_destination -> add_destination: activation-scoped circuit
+    state (a stopped, fixed, re-added destination gets a fresh probe, not
+    its predecessor's open circuit)."""
+    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
+        _fail_flushes(mgr, 2)
+    with mgr._lock:
+        assert mgr._circuit_open_until["d1"] > 0
+        assert mgr._flush_failures["d1"] == 2
+    mgr.remove_destination("d1")
+    mgr.add_destination("d1")
+    with mgr._lock:
+        assert mgr._flush_failures["d1"] == 0
+        assert "d1" not in mgr._circuit_open_until
+    assert metrics.delivery_circuit_open.labels(destination="d1")._value.get() == 0
+
+
+def test_remove_destination_series_covers_circuit_and_deadline_series():
+    """A removed destination's circuit/deadline series must not freeze —
+    phantom 'circuit open' gauges page for tenants that no longer exist."""
+    metrics.delivery_circuit_open.labels(destination="dz").set(1)
+    metrics.delivery_circuit_opens_total.labels(destination="dz").inc()
+    metrics.delivery_flush_deadlines_total.labels(destination="dz").inc()
+    metrics.remove_destination_series("dz")
+    for raw in (
+        metrics._delivery_circuit_open,
+        metrics._delivery_circuit_opens_total,
+        metrics._delivery_flush_deadlines_total,
+    ):
+        assert all("dz" not in key for key in raw._metrics), f"series for dz survived removal in {raw}"
