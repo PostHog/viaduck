@@ -1,4 +1,6 @@
-FROM ghcr.io/astral-sh/uv:0.7 AS uv
+# 0.7 -> 0.9: relative exclude-newer ("7 days") needs modern uv;
+# keep in lockstep with the setup-uv pin in .github/workflows/.
+FROM ghcr.io/astral-sh/uv:0.12 AS uv
 FROM python:3.12-slim AS builder
 
 COPY --from=uv /uv /usr/local/bin/uv
