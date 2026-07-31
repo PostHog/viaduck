@@ -16,7 +16,15 @@ license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "pyducklake>=1.0.14",
-    "duckdb==1.5.2",
+    # 1.5.2 -> 1.5.5 (2026-07-31): the duckdb-1.5.2 extension channel is
+    # frozen at ducklake build 415a9ebd (2026-04-09), whose per-connection
+    # stats/schemas caches grow unbounded whenever catalog snapshots
+    # advance between binds -- the OOM leak that killed the pod every
+    # 4-6h (see hypothesis-1.md; A/B-verified: 415a9ebd leaks 1.07 MiB
+    # per snapshot-advancing bind, the 1.5.5-channel build d8a1881e is
+    # flat). The Dockerfile asserts the extension build at image build
+    # time so channel drift can never be silent again.
+    "duckdb==1.5.5",
     "pyarrow>=18.0",
     "prometheus-client>=0.21",
     "pyyaml>=6.0",
@@ -51,3 +59,10 @@ markers = [
     "e2e: marks tests as E2E tests requiring docker-compose stack",
     "perf: marks tests as performance benchmarks",
 ]
+
+[tool.uv]
+# pyducklake 1.0.16 hard-pins duckdb==1.5.2; override until pyducklake
+# 1.0.17 relaxes the pin (tracked follow-up -- our package). Safe:
+# 1.5.2 -> 1.5.5 is a patch-line bump, full unit+integration suite runs
+# against 1.5.5 in CI/local.
+override-dependencies = ["duckdb==1.5.5"]
