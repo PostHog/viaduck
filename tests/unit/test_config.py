@@ -1026,3 +1026,20 @@ def test_slow_consumer_knob_loader_passthrough(tmp_path: Path):
     assert cfg.delivery.flush_deadline_seconds == 240.0
     assert cfg.delivery.flush_circuit_failures == 5
     assert cfg.delivery.flush_circuit_max_seconds == 300.0
+
+
+def test_destination_buffer_max_bytes_loader(tmp_path: Path):
+    raw = MINIMAL_YAML.replace(
+        "postgres_uri_env: DEST_QW_PG",
+        "postgres_uri_env: DEST_QW_PG\n    buffer_max_bytes: 8589934592",
+    )
+    assert "buffer_max_bytes" in raw  # guard against a silent no-op replace
+    p = tmp_path / "dest_cap.yaml"
+    p.write_text(raw)
+    cfg = load(p)
+    assert cfg.destinations[0].buffer_max_bytes == 8589934592
+
+
+def test_destination_buffer_max_bytes_default_zero(config_file: Path):
+    cfg = load(config_file)
+    assert cfg.destinations[0].buffer_max_bytes == 0

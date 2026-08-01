@@ -925,6 +925,10 @@ def run(cfg: config.ViaduckConfig) -> None:
         assigned_ids,
         mode=mode,
         on_flush_success=health.record_replication,
+        # Static destinations may carry explicit queue-cap overrides
+        # (DestinationConfig.buffer_max_bytes); discovered destinations
+        # use the global default.
+        per_dest_cap_overrides={d.id: d.buffer_max_bytes for d in cfg.destinations if d.buffer_max_bytes > 0},
     )
 
     tracker = lifecycle.LifecycleTracker(assigned_ids)

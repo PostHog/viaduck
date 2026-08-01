@@ -233,6 +233,10 @@ destinations:
     table: "events"                          # defaults to source table name if omitted
     schema_projection_enabled: true          # project source rows onto an existing dest schema (see Schema Projection)
     drop_source_columns: ["ingest_ts"]       # source columns to drop; requires schema_projection_enabled
+    buffer_max_bytes: 8589934592             # optional per-destination queue-cap override (bytes; 0/omitted = the
+                                             # global delivery.buffer_max_bytes_per_destination). A catch-up
+                                             # THROUGHPUT knob: bounds what this destination's queue absorbs per
+                                             # read turn; aggregate memory stays governed by buffer_total_max_bytes
 
   - id: "mallardine-lake"
     routing_value: "mallardine"

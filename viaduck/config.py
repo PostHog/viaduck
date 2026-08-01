@@ -57,6 +57,17 @@ def _validate_int(value: object, ctx: str) -> int:
     return value
 
 
+def _validate_non_negative_int(value: object, ctx: str) -> int:
+    """Like _validate_int but also rejects negatives: a typo'd negative on
+    a per-destination override would otherwise silently fall through to
+    the global default — the exact misconfiguration the override surface
+    exists to prevent."""
+    v = _validate_int(value, ctx)
+    if v < 0:
+        raise ConfigError(f"{ctx} must be >= 0 (0 = use the global default), got {v}")
+    return v
+
+
 def _resolve_env_properties(props: dict[str, str]) -> dict[str, str]:
     """Resolve properties: keys ending in _env have their values read from env vars."""
     resolved = {}
@@ -266,6 +277,18 @@ class DestinationConfig:
     data_path: str
     table: str
     properties: dict[str, str] = field(default_factory=dict)
+    # Optional per-destination buffer/queue cap override (bytes). 0 = use
+    # the global delivery.buffer_max_bytes_per_destination (or its
+    # fair-share auto-derivation; negative values are rejected at load).
+    # The cap is a CATCH-UP THROUGHPUT knob:
+    # it bounds what this destination's CDC queue (buffer + in-flight)
+    # can absorb per read turn — deep-laggard catch-up rate is
+    # proportional to it. Aggregate memory stays governed by
+    # delivery.buffer_total_max_bytes via watermark force-flushes.
+    # Rationale for per-destination shape: destination volumes are
+    # heavily skewed; one global number is either wasteful for the tail
+    # or throttling for the head (2026-08-01 sizing).
+    buffer_max_bytes: int = 0
     # Optional partition spec applied at table-creation time. Each entry is
     # `(transform_name, column_name)` where transform_name is "" for identity
     # (bare column) or one of {year, month, day, hour}. Empty tuple means
@@ -899,6 +922,9 @@ def load(path: str | Path) -> ViaduckConfig:
                 data_path=_require_non_empty(d.get("data_path", ""), f"destinations[{i}].data_path"),
                 table=d.get("table", source.table),
                 properties=dest_props,
+                buffer_max_bytes=_validate_non_negative_int(
+                    d.get("buffer_max_bytes", 0), f"destinations[{i}].buffer_max_bytes"
+                ),
                 partition_by=_validate_partition_by(d.get("partition_by"), f"destinations[{i}].partition_by"),
                 partition_by_allow_alter_populated=allow_alter_raw,
                 schema_projection_enabled=schema_proj_raw,
