@@ -1600,3 +1600,133 @@ def test_remove_destination_series_covers_circuit_and_deadline_series():
         metrics._delivery_flush_deadlines_total,
     ):
         assert all("dz" not in key for key in raw._metrics), f"series for dz survived removal in {raw}"
+
+
+# ---------------------------------------------------------------------------
+# Per-destination buffer-cap overrides (DestinationConfig.buffer_max_bytes)
+# ---------------------------------------------------------------------------
+
+
+def test_cap_override_gates_reads_per_destination():
+    # d1 carries an explicit override; d2 rides the global. Each pauses at
+    # its OWN cap — the override must not leak to peers.
+    tbl = _table(100)
+    mgr, _, _ = _manager(
+        dests=("d1", "d2"),
+        buffer_max_bytes_per_destination=1000,  # below one table: d2 pauses
+        buffer_total_max_bytes=10_000_000,
+    )
+    mgr._cap_overrides = {"d1": tbl.nbytes * 3}  # above one table: d1 flows
+    mgr.buffer("d1", tbl, 5)
+    mgr.buffer("d2", tbl, 5)
+    assert not mgr.should_pause_reads_for("d1")
+    assert mgr.should_pause_reads_for("d2")
+    # …and d1 pauses at ITS cap once it accumulates past the override.
+    mgr.buffer("d1", tbl, 6)
+    mgr.buffer("d1", tbl, 7)
+    assert mgr.should_pause_reads_for("d1")
+
+
+def test_cap_override_constructor_wiring():
+    from viaduck.config import DeliveryConfig
+    from viaduck.delivery import DeliveryManager
+
+    cfg = DeliveryConfig(workers=2, buffer_max_bytes_per_destination=1000, buffer_total_max_bytes=10_000_000)
+    sm = _state_mgr({"d1": 0, "d2": 0})
+    from unittest.mock import MagicMock
+
+    mgr = DeliveryManager(
+        cfg,
+        sm,
+        MagicMock(),
+        [],
+        ["d1", "d2"],
+        mode="append_only",
+        per_dest_cap_overrides={"d1": 7777, "ghost": 0},
+    )
+    with mgr._lock:
+        assert mgr._cap_for_locked("d1") == 7777
+        assert mgr._cap_for_locked("d2") == 1000
+        # zero/absent overrides fall through to the default
+        assert "ghost" not in mgr._cap_overrides
+
+
+def test_membership_recompute_leaves_overrides_alone():
+    # Auto mode: default cap re-derives on membership change; the override
+    # is a fixed contract and must not move.
+    mgr, _, _ = _manager(dests=("d1",), buffer_total_max_bytes=1000)
+    mgr._cap_overrides = {"d1": 999_999}
+    before = mgr._cap_overrides["d1"]
+    mgr.add_destination("d9")  # auto default shrinks to total/2
+    with mgr._lock:
+        assert mgr._cap_for_locked("d1") == before
+        assert mgr._cap_for_locked("d9") == mgr._per_dest_cap
+
+
+def test_memory_trigger_respects_override():
+    # The per-dest-cap "memory" trigger is the second consumer of the
+    # override: a dest between the global default and its own override
+    # must NOT force-flush; one at its override must.
+    tbl = _table(100)
+    mgr, _, _ = _manager(
+        dests=("d1",),
+        buffer_max_bytes_per_destination=1000,  # global default below one table
+        buffer_total_max_bytes=10_000_000,
+        flush_interval_seconds=3600.0,
+        flush_max_bytes=10_000_000,
+        flush_max_rows=10_000_000,
+    )
+    mgr._cap_overrides = {"d1": tbl.nbytes * 3}
+    fake, calls = _recording_flush(mgr)
+    mgr.buffer("d1", tbl, 5)
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush() == 0  # above global default, below override: no trigger
+        mgr.buffer("d1", tbl, 6)
+        mgr.buffer("d1", tbl, 7)
+        assert mgr.maybe_flush() == 1  # at/over its override: memory trigger fires
+    assert calls[0][3] == "memory"
+
+
+def test_explicit_recompute_with_overrides_present():
+    # Prod shape: explicit global + overrides. Membership growth re-derives
+    # only the non-override default; the override never moves.
+    mgr, _, _ = _manager(
+        dests=("d1", "d2"),
+        buffer_max_bytes_per_destination=1000,
+        buffer_total_max_bytes=2500,
+    )
+    mgr._cap_overrides = {"d1": 50_000}
+    mgr.add_destination("d3")  # 3 x 1000 > 2500 -> explicit shrinks to fair 833
+    with mgr._lock:
+        assert mgr._cap_for_locked("d1") == 50_000
+        assert mgr._cap_for_locked("d2") == mgr._per_dest_cap
+        assert mgr._per_dest_cap == 2500 // 3
+
+
+def test_startup_warn_counts_assigned_overrides_only(caplog):
+    import logging
+    from unittest.mock import MagicMock
+
+    from viaduck.config import DeliveryConfig
+    from viaduck.delivery import DeliveryManager
+
+    cfg = DeliveryConfig(workers=2, buffer_max_bytes_per_destination=1000, buffer_total_max_bytes=1500)
+    sm = _state_mgr({"d1": 0, "d2": 0})
+    with caplog.at_level(logging.WARNING, logger="viaduck.delivery"):
+        DeliveryManager(
+            cfg,
+            sm,
+            MagicMock(),
+            [],
+            ["d1", "d2"],
+            mode="append_only",
+            # d1 assigned+overridden; "elsewhere" overridden but NOT assigned
+            # (another partition's destination) — must not be counted.
+            per_dest_cap_overrides={"d1": 5000, "elsewhere": 9_999_999},
+        )
+    warn = next(
+        r for r in caplog.records if "exceeding buffer_total_max_bytes" in r.message or "exceeding" in r.getMessage()
+    )
+    msg = warn.getMessage()
+    assert "6000" in msg  # cap_sum = 5000 (d1 override) + 1000 (d2 default)
+    assert "(1 override(s) + default 1000 x 1)" in msg

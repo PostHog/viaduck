@@ -149,6 +149,7 @@ class DeliveryManager:
         *,
         mode: str,
         on_flush_success=None,
+        per_dest_cap_overrides: dict[str, int] | None = None,
     ):
         self._cfg = cfg
         self._state = state_mgr
@@ -192,35 +193,49 @@ class DeliveryManager:
         # the others' intake. Auto-derive a fair share of the global cap
         # when not explicitly configured; the global cap survives as the
         # forced-flush trigger in maybe_flush and the all-at-cap early-exit.
+        # Per-destination OVERRIDES (DestinationConfig.buffer_max_bytes):
+        # destination volumes are heavily skewed, so the head tenants can
+        # carry explicit caps while the global value serves the tail. An
+        # override is a fixed contract — membership-change recompute never
+        # touches it, only the default for non-override destinations.
+        self._cap_overrides: dict[str, int] = {d: c for d, c in (per_dest_cap_overrides or {}).items() if c > 0}
         if cfg.buffer_max_bytes_per_destination > 0:
             self._per_dest_cap = cfg.buffer_max_bytes_per_destination
-            if len(assigned_ids) * self._per_dest_cap > cfg.buffer_total_max_bytes:
-                # With destination-local read gating, the sum of per-dest
-                # caps IS the effective memory bound — the global value no
-                # longer stops reads. An explicit cap that oversubscribes
-                # it is a one-knob misconfig worth a loud line.
-                log.warning(
-                    "delivery.buffer_max_bytes_per_destination=%d x %d destinations = %d "
-                    "exceeds buffer_total_max_bytes=%d; effective memory bound is the sum "
-                    "of per-destination caps",
-                    self._per_dest_cap,
-                    len(assigned_ids),
-                    len(assigned_ids) * self._per_dest_cap,
-                    cfg.buffer_total_max_bytes,
-                )
         else:
             self._per_dest_cap = max(1, cfg.buffer_total_max_bytes // max(1, len(assigned_ids)))
+        # Pre-thread: workers/poll/reconciler start after __init__ returns,
+        # so the _locked helper is safe to call here without the lock.
+        cap_sum = sum(self._cap_for_locked(d) for d in assigned_ids)
+        assigned_overrides = sum(1 for d in assigned_ids if d in self._cap_overrides)
+        if cap_sum > cfg.buffer_total_max_bytes:
+            # With destination-local read gating, the sum of per-dest caps
+            # bounds transient absorption; the total watermark still forces
+            # flushes on aggregate. Oversubscription is a deliberate
+            # throughput posture (see values comments) — one loud line so
+            # the arithmetic is never a surprise.
+            log.warning(
+                "per-destination caps sum to %d (%d override(s) + default %d x %d) "
+                "exceeding buffer_total_max_bytes=%d; watermark force-flushes govern the aggregate",
+                cap_sum,
+                assigned_overrides,
+                self._per_dest_cap,
+                len(assigned_ids) - assigned_overrides,
+                cfg.buffer_total_max_bytes,
+            )
         log.info(
-            "Per-destination buffer cap: %d bytes (%s) across %d destinations",
+            "Per-destination buffer cap: default %d bytes (%s), %d assigned override(s), %d destinations",
             self._per_dest_cap,
             "explicit" if cfg.buffer_max_bytes_per_destination > 0 else "auto: buffer_total_max_bytes / N",
+            assigned_overrides,
             len(assigned_ids),
         )
         # Startup semantics above are unchanged (explicit oversubscription
         # only warns — existing deployments keep their contract);
-        # _recompute_per_dest_cap_locked enforces the bound on MEMBERSHIP
-        # CHANGES, where dynamic growth would otherwise erode
-        # buffer_total_max_bytes as the effective memory bound.
+        # _recompute_per_dest_cap_locked bounds the NON-OVERRIDE share on
+        # membership changes. With overrides present the effective
+        # transient-absorption bound is buffer_total_max_bytes plus each
+        # override's excess over fair share — the WATERMARK's forced
+        # flushes remain the aggregate governor either way.
         # Shutdown signal threaded into apply._write_with_retry: a worker
         # deep in the OCC retry backoff (up to ~30s per sleep, ~5 min per
         # flush worst case) would otherwise ignore SIGTERM and get SIGKILLed
@@ -456,6 +471,11 @@ class DeliveryManager:
                 if self._position_dirty_since[dest_id] is None:
                     self._position_dirty_since[dest_id] = time.monotonic()
 
+    def _cap_for_locked(self, dest_id: str) -> int:
+        """Effective queue cap for a destination: explicit override wins,
+        else the (possibly membership-recomputed) default."""
+        return self._cap_overrides.get(dest_id, 0) or self._per_dest_cap
+
     def _dest_bytes_locked(self, dest_id: str) -> int:
         return self._buffers[dest_id].bytes + self._inflight_bytes[dest_id]
 
@@ -468,7 +488,7 @@ class DeliveryManager:
         signal: a destination pinned at cap for a long stretch is the
         operator-visible symptom of a slow/hung flush downstream."""
         with self._lock:
-            paused = self._dest_bytes_locked(dest_id) >= self._per_dest_cap
+            paused = self._dest_bytes_locked(dest_id) >= self._cap_for_locked(dest_id)
         metrics.delivery_reads_paused.labels(destination=dest_id).set(1 if paused else 0)
         return paused
 
@@ -484,7 +504,7 @@ class DeliveryManager:
                 # destinations; vacuous all() would report it permanently
                 # wedged and spam the watermark WARN state machine.
                 return False
-            return all(self._dest_bytes_locked(d) >= self._per_dest_cap for d in self._active)
+            return all(self._dest_bytes_locked(d) >= self._cap_for_locked(d) for d in self._active)
 
     def maybe_flush(self, *, shutdown: bool = False) -> int:
         """Evaluate flush triggers and submit eligible flushes (FlushStart).
@@ -720,7 +740,7 @@ class DeliveryManager:
         # thresholds aren't met — reads for it are paused until this drains,
         # so waiting for flush_max_bytes/interval would leave it wedged at
         # the cap with its intake stopped.
-        if has_data and self._dest_bytes_locked(dest_id) >= self._per_dest_cap:
+        if has_data and self._dest_bytes_locked(dest_id) >= self._cap_for_locked(dest_id):
             return "memory"
         if has_data and buf.sliced_remainder:
             # The tail of a sliced pile drains as soon as the in-flight
@@ -1073,7 +1093,12 @@ class DeliveryManager:
         that oversubscribes shrinks to the fair share with a WARN (unlike
         at startup, where the explicit value is honored with a WARN —
         membership changes are dynamic-fleet territory and the total is
-        the contract there)."""
+        the contract there). OVERRIDES are exempt: an explicit
+        per-destination cap is a sizing contract, not a fair-share
+        participant — only the default for non-override destinations is
+        re-derived here, so with overrides present this bounds the
+        NON-OVERRIDE share only; the aggregate is governed by the
+        watermark's forced flushes, not by this recompute."""
         n = max(1, len(self._active))
         fair = max(1, self._cfg.buffer_total_max_bytes // n)
         if self._cfg.buffer_max_bytes_per_destination > 0:
