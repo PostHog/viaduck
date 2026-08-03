@@ -586,6 +586,12 @@ class DiscoveryConfig:
     url: str | None = None
     auth_header_name: str | None = None
     auth_token_env: str | None = None
+    # Which team-payload field discovery reads as the destination table.
+    # events_table for the events pipeline; persons_table /
+    # persons_distinct_ids_table for the two streamed-persons pipelines.
+    # Validated against the known payload fields: silently defaulting a
+    # typo to events_table would route person rows into events tables.
+    table_field: str = "events_table"
     poll_interval_s: float = 60.0
     request_timeout_s: float = 10.0
     # C3 reconciler (viaduck/reconciler.py). Default OFF: the classified
@@ -636,9 +642,15 @@ class DiscoveryConfig:
     secret_cache_ttl_s: float = 300.0
     defaults: dict = field(default_factory=dict)
 
+    # Team-payload fields that name a destination table. Kept in sync
+    # with the duckgres discovery payload (resolveTeamTables).
+    TABLE_FIELDS = ("events_table", "persons_table", "persons_distinct_ids_table")
+
     def __post_init__(self):
         if self.enabled and not self.url:
             raise ConfigError("discovery.enabled requires discovery.url")
+        if self.table_field not in self.TABLE_FIELDS:
+            raise ConfigError(f"discovery.table_field must be one of {self.TABLE_FIELDS}, got {self.table_field!r}")
         if (self.auth_header_name is None) != (self.auth_token_env is None):
             raise ConfigError("discovery.auth_header_name and discovery.auth_token_env must be set together")
         if self.poll_interval_s <= 0 or self.request_timeout_s <= 0 or self.materialize_deadline_s <= 0:
@@ -1006,6 +1018,7 @@ def load(path: str | Path) -> ViaduckConfig:
             url=disc_raw.get("url"),
             auth_header_name=disc_raw.get("auth_header_name"),
             auth_token_env=disc_raw.get("auth_token_env"),
+            table_field=str(disc_raw.get("table_field", "events_table")),
             poll_interval_s=float(disc_raw.get("poll_interval_s", 60.0)),
             request_timeout_s=float(disc_raw.get("request_timeout_s", 10.0)),
             min_destinations=int(disc_raw.get("min_destinations", 1)),

@@ -69,6 +69,47 @@ class TestMapPayload:
         assert m.pg_endpoint == "cnpg-shard-1-rw.ducklings.svc"
         assert m.secret_namespace == "ducklings"
 
+    def test_table_field_selects_persons_table(self):
+        # A persons pipeline routes into the payload's persons_table,
+        # still verbatim — the CP owns naming for every streamed table.
+        wh = _warehouse(
+            teams=[
+                {
+                    "team_id": 7,
+                    "schema_name": "t7",
+                    "enabled": True,
+                    "events_table": "t7.events",
+                    "persons_table": "t7.persons_ab12",
+                }
+            ]
+        )
+        mapped = discovery.map_payload(_payload([wh]), table_field="persons_table")
+        assert [m.table for m in mapped] == ["t7.persons_ab12"]
+
+    def test_table_field_selects_persons_distinct_ids_table(self):
+        wh = _warehouse(
+            teams=[
+                {
+                    "team_id": 7,
+                    "schema_name": "t7",
+                    "enabled": True,
+                    "events_table": "t7.events",
+                    "persons_distinct_ids_table": "t7.persons_distinct_ids_ab12",
+                }
+            ]
+        )
+        mapped = discovery.map_payload(_payload([wh]), table_field="persons_distinct_ids_table")
+        assert [m.table for m in mapped] == ["t7.persons_distinct_ids_ab12"]
+
+    def test_table_field_missing_is_mentioned_not_poison(self):
+        # Same contract as a missing events_table: the id is nameable, so
+        # the row is degraded, never absent and never view-poisoning.
+        wh = _warehouse()
+        view = discovery.classify_payload(_payload([wh]), table_field="persons_table")
+        e = view.entries["org-acme-team-666"]
+        assert not e.startable
+        assert not view.parse_poisoned
+
     def test_disabled_team_still_included(self):
         # `enabled` is the QUERY-SERVING switch (duckgres migration
         # 000024): deriving ingestion-stop from it turns a serving hold

@@ -361,7 +361,7 @@ A destination paused while it has never been seeded (cursor 0) skips seeding at 
 
 ## CP-Driven Destination Discovery (additive)
 
-With `discovery.enabled`, viaduck polls the duckgres control plane's read-only endpoint (`GET /api/v1/warehouses`, authenticated with the scoped read-only secret via `discovery.auth_header_name` + `discovery.auth_token_env`) at startup and extends the static destination set: one destination per (warehouse, team), id `org-<org_id>-team-<team_id>`, routing value = team id, **table = the payload's `events_table` verbatim** (the CP owns naming; renames are not allowed upstream). Metadata-store passwords resolve via a direct Kubernetes Secret read with viaduck's ServiceAccount (`password_secret_ref` — RBAC into the tenant namespace, no secret copies, no plaintext payloads).
+With `discovery.enabled`, viaduck polls the duckgres control plane's read-only endpoint (`GET /api/v1/warehouses`, authenticated with the scoped read-only secret via `discovery.auth_header_name` + `discovery.auth_token_env`) at startup and extends the static destination set: one destination per (warehouse, team), id `org-<org_id>-team-<team_id>`, routing value = team id, **table = a payload table field verbatim** — `events_table` by default; a persons pipeline sets `discovery.table_field` to `persons_table` or `persons_distinct_ids_table` (the CP owns naming; renames are not allowed upstream). Metadata-store passwords resolve via a direct Kubernetes Secret read with viaduck's ServiceAccount (`password_secret_ref` — RBAC into the tenant namespace, no secret copies, no plaintext payloads).
 
 Semantics (M4): **additive, static wins, fixed set.** A static destination beats a discovered one on routing-value collision (cutover = delete the static entry). Discovered destinations initialize at the source head (`seed_mode`-independent: discovery starts the stream, never backfills) with convention defaults — schema projection on, `captured_at` dropped, `memory_limit` from `discovery.defaults`. The destination set is fixed at startup; a background poller detects drift (`viaduck_discovery_drift_destinations{kind}`) and a restart applies it. Fail-open at startup (CP unreachable → static-only + `viaduck_discovery_synced` 0); fail-safe per entry (`viaduck_discovery_broken_entries_total{reason}` — a broken tenant never takes down the rest; non-writable/resharding warehouses are skipped).
 
@@ -373,6 +373,7 @@ discovery:
   url: "http://duckgres-admin.duckgres.svc.cluster.local:8080/api/v1/warehouses"
   auth_header_name: "X-Duckgres-Internal-Secret"
   auth_token_env: "VIADUCK_DISCOVERY_TOKEN"   # the read-only secret, never the internal secret
+  table_field: "events_table"                 # persons pipeline: persons_table / persons_distinct_ids_table
   poll_interval_s: 60
   defaults:
     memory_limit: "8GB"
