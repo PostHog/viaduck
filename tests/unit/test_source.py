@@ -367,3 +367,66 @@ class TestSnapshotTimes:
         min_result.fetchone.return_value = (None,)
         table = self._table([in_result, min_result])
         assert snapshot_times(table, [5]) == {}
+
+
+# ---------------------------------------------------------------------------
+# skip-scan helpers: ducklake_table_id / next_snapshot_touching_table
+# ---------------------------------------------------------------------------
+
+
+def _make_skipscan_table(catalog_name: str, fetchone_results: list):
+    """Mock Table whose connection.execute(...).fetchone() pops results in order."""
+    from viaduck import source as source_mod
+
+    source_mod._table_id_cache.clear()
+    table = MagicMock()
+    table._catalog.name = catalog_name
+    table._identifier = ("main", "events_nrt")
+    results = list(fetchone_results)
+    table._catalog.connection.execute.return_value.fetchone.side_effect = lambda: results.pop(0)
+    return table
+
+
+def test_ducklake_table_id_resolves_and_caches():
+    from viaduck.source import ducklake_table_id
+
+    table = _make_skipscan_table("megaduck-mw-prod-us", [(16,)])
+    assert ducklake_table_id(table) == 16
+    sql = table._catalog.connection.execute.call_args[0][0]
+    assert '"__ducklake_metadata_megaduck-mw-prod-us"' in sql
+    assert "end_snapshot IS NULL" in sql
+    assert "'events_nrt'" in sql and "'main'" in sql
+    # Second call must come from the cache — no further catalog queries.
+    assert ducklake_table_id(table) == 16
+    assert table._catalog.connection.execute.call_count == 1
+
+
+def test_ducklake_table_id_missing_raises():
+    import pytest
+
+    from viaduck.source import ducklake_table_id
+
+    table = _make_skipscan_table("cat", [None])
+    with pytest.raises(LookupError):
+        ducklake_table_id(table)
+
+
+def test_next_snapshot_touching_table_returns_min():
+    from viaduck.source import next_snapshot_touching_table
+
+    # First fetchone resolves table_id, second answers the probe.
+    table = _make_skipscan_table("megaduck-mw-prod-us", [(16,), (22941700,)])
+    got = next_snapshot_touching_table(table, 22941600, 22981600)
+    assert got == 22941700
+    sql = table._catalog.connection.execute.call_args[0][0]
+    assert "MIN(snapshot_id)" in sql
+    assert "snapshot_id > 22941600" in sql and "snapshot_id <= 22981600" in sql
+    # Anchored verb:id match — table 16 must not match ids 160/165/1.
+    assert "(^|,)[a-z_]+:16(,|$)" in sql
+
+
+def test_next_snapshot_touching_table_none_when_span_is_other_tables():
+    from viaduck.source import next_snapshot_touching_table
+
+    table = _make_skipscan_table("cat", [(16,), (None,)])
+    assert next_snapshot_touching_table(table, 100, 200) is None

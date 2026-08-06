@@ -1359,6 +1359,49 @@ def _poll_cycle(
                     routing_values = [dest_configs[d].routing_value for d in readable]
                     filter_expr = router.build_filter_expr(routing_values)
                     group_read_anything = True
+
+                    # Skip-scan: snapshot ids are global to the source
+                    # catalog, so spans minted by OTHER tables' commits
+                    # (measured 88% of megaduck churn) contain nothing for
+                    # this table yet cost a full catalog-planning round-trip
+                    # to read as an empty chunk. One indexed probe of
+                    # ducklake_snapshot_changes finds the next snapshot that
+                    # touched the CDC table; everything before it advances
+                    # cursor-only. Probe failure falls back to the plain
+                    # sequential read — skip-scan is an optimization, never
+                    # a correctness gate.
+                    try:
+                        next_touch = source.next_snapshot_touching_table(src_table, chunk_start, current_id)
+                    except Exception:
+                        log.warning(
+                            "Skip-scan probe failed for group at %d; reading sequentially", start_snap, exc_info=True
+                        )
+                        next_touch = chunk_start + 1
+                    if next_touch is None:
+                        for did in readable:
+                            delivery.advance_position(did, current_id, epoch=epochs[did])
+                        metrics.cdc_snapshots_skipped_total.inc(current_id - chunk_start)
+                        log.info(
+                            "CDC skip-scan: no source-table changes in (%d, %d], fast-forwarded %d snapshots",
+                            chunk_start,
+                            current_id,
+                            current_id - chunk_start,
+                        )
+                        delivery.maybe_flush()
+                        chunk_start = current_id
+                        continue
+                    if next_touch - 1 > chunk_start:
+                        skipped = next_touch - 1 - chunk_start
+                        for did in readable:
+                            delivery.advance_position(did, next_touch - 1, epoch=epochs[did])
+                        metrics.cdc_snapshots_skipped_total.inc(skipped)
+                        log.debug(
+                            "CDC skip-scan: fast-forwarded %d snapshots to %d (next source-table change)",
+                            skipped,
+                            next_touch - 1,
+                        )
+                        chunk_start = next_touch - 1
+
                     chunk_end = min(chunk_start + chunk_size, current_id)
                     snap_range = f"{chunk_start}→{chunk_end}"
                     chunk_t0 = time.monotonic()

@@ -827,6 +827,99 @@ def test_poll_cycle_empty_changeset_advances_positions():
     assert delivery.maybe_flush.call_count == 2  # once per chunk + once at end of cycle
 
 
+def test_poll_cycle_skip_scan_fast_forwards_span_without_read():
+    """A span with no source-table changes advances cursors without a CDC read."""
+    delivery = _make_delivery({"dest-1": 5})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "a")])
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
+        patch("viaduck.main.source.next_snapshot_touching_table", return_value=None),
+        patch("viaduck.main.source.read_cdc") as read_cdc,
+        patch.object(metrics, "cdc_snapshots_skipped_total") as skipped,
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"a": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    read_cdc.assert_not_called()
+    delivery.advance_position.assert_called_once_with("dest-1", 10, epoch=0)
+    skipped.inc.assert_called_once_with(5)  # (5, 10] fast-forwarded
+
+
+def test_poll_cycle_skip_scan_jumps_to_next_touching_snapshot():
+    """The read starts at the snapshot before the next source-table change;
+    the dead span in front of it advances cursor-only."""
+    delivery = _make_delivery({"dest-1": 5})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "a")])
+
+    empty = pa.table({"company": pa.array([], type=pa.string())})
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
+        patch("viaduck.main.source.next_snapshot_touching_table", return_value=9),
+        patch("viaduck.main.source.read_cdc", return_value=empty) as read_cdc,
+        patch.object(metrics, "cdc_snapshots_skipped_total") as skipped,
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"a": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    # Cursor-only advance over (5, 8], then a normal read of (8, 10].
+    delivery.advance_position.assert_any_call("dest-1", 8, epoch=0)
+    read_cdc.assert_called_once()
+    assert read_cdc.call_args.kwargs["after_snapshot"] == 8
+    assert read_cdc.call_args.kwargs["end_snapshot"] == 10
+    skipped.inc.assert_called_once_with(3)
+
+
+def test_poll_cycle_skip_scan_probe_failure_falls_back_to_sequential_read():
+    """A broken probe must never stall the pipeline — reads proceed as before."""
+    delivery = _make_delivery({"dest-1": 5})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "a")])
+
+    arrow_data = pa.table({"company": ["a"], "value": [1]})
+    router.split_and_count.return_value = ({"a": arrow_data}, 0)
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
+        patch("viaduck.main.source.next_snapshot_touching_table", side_effect=RuntimeError("catalog hiccup")),
+        patch("viaduck.main.source.read_cdc", return_value=arrow_data) as read_cdc,
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"a": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+        )
+
+    read_cdc.assert_called_once()
+    assert read_cdc.call_args.kwargs["after_snapshot"] == 5
+    delivery.buffer.assert_called_once()
+
+
 def test_poll_cycle_routing_error_breaks_gracefully():
     """A routing failure stops reads for the cycle without buffering."""
     delivery = _make_delivery({"dest-1": 5})

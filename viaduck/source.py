@@ -204,6 +204,69 @@ def current_snapshot_id(table: Table) -> int | None:
     return int(row[0])
 
 
+# table_id cache for skip-scan probes, keyed by (catalog, namespace, table).
+# The id is stable for the life of the table; a DROP+CREATE of the source
+# table changes it, but that also invalidates every cursor, so a process
+# restart (which clears this) is already required.
+_table_id_cache: dict[tuple[str, str, str], int] = {}
+
+
+def ducklake_table_id(table: Table) -> int:
+    """The catalog's numeric table_id for this table (cached after first call)."""
+    catalog_name = table._catalog.name
+    namespace, table_name = table._identifier[0], table._identifier[1]
+    key = (catalog_name, namespace, table_name)
+    cached = _table_id_cache.get(key)
+    if cached is not None:
+        return cached
+    meta_schema = f"__ducklake_metadata_{catalog_name}".replace('"', '""')
+    esc_ns = namespace.replace("'", "''")
+    esc_tbl = table_name.replace("'", "''")
+    row = table._catalog.connection.execute(
+        f'SELECT t.table_id FROM "{meta_schema}".ducklake_table t '
+        f'JOIN "{meta_schema}".ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL '
+        f"WHERE t.table_name = '{esc_tbl}' AND s.schema_name = '{esc_ns}' AND t.end_snapshot IS NULL"
+    ).fetchone()
+    if row is None or row[0] is None:
+        raise LookupError(f"table_id not found in catalog for {namespace}.{table_name}")
+    tid = int(row[0])
+    _table_id_cache[key] = tid
+    return tid
+
+
+def next_snapshot_touching_table(table: Table, after_snapshot: int, until_snapshot: int) -> int | None:
+    """Smallest snapshot id in (after_snapshot, until_snapshot] whose commit
+    touched THIS table, or None if the whole span is other tables' churn.
+
+    Powers the poll loop's skip-scan: snapshot ids are global to the
+    catalog, so a multi-table source mints ids the CDC table never
+    appears in — measured 88% of megaduck snapshots were the `events`
+    consumers' commits while viaduck replicates `events_nrt`. Reading
+    those spans as CDC chunks costs a full planning round-trip
+    (catalog file-listing on a 22M-row ducklake_data_file) per chunk
+    just to return 0 rows; one indexed probe of
+    ducklake_snapshot_changes replaces all of them.
+
+    "Touched" means ANY change verb (inserted_into_table, merge_adjacent,
+    and whatever future verbs appear): the probe must never skip past a
+    snapshot table_insertions would have surfaced, and being conservative
+    about unknown verbs only costs a normal chunk read.
+    """
+    catalog_name = table._catalog.name
+    meta_schema = f"__ducklake_metadata_{catalog_name}".replace('"', '""')
+    tid = ducklake_table_id(table)
+    # changes_made is a comma-joined list like "inserted_into_table:16";
+    # the (^|,) / (,|$) anchors keep table_id 1 from matching 16, 160, …
+    row = table._catalog.connection.execute(
+        f'SELECT MIN(snapshot_id) FROM "{meta_schema}".ducklake_snapshot_changes '
+        f"WHERE snapshot_id > {int(after_snapshot)} AND snapshot_id <= {int(until_snapshot)} "
+        f"AND regexp_matches(changes_made, '(^|,)[a-z_]+:{tid}(,|$)')"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
 # Warn-once registry for cursors found older than snapshot retention: the
 # clamp below keeps the gauge honest ("at least window age") but the state
 # itself is an operational incident — the CDC range past that cursor may no
