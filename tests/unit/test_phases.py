@@ -9,6 +9,7 @@ in test_delivery.py next to the rest of the flush-path tests.
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
@@ -25,6 +26,7 @@ from viaduck.phases import (
     PROBE,
     PROJECTION,
     QUEUE_WAIT,
+    RESOLVE,
     RETRY_BACKOFF,
     FlushPhases,
 )
@@ -46,8 +48,11 @@ class _Pool:
         self.on_append = on_append
         self.gets = []
         self.table = MagicMock()
+        self.table.upsert.return_value.rows_updated = 0
         self.catalog = MagicMock()
         self.catalog.name = "team_2"
+        # full_cdc writes go through catalog.begin_transaction() -> load_table
+        self.catalog.begin_transaction.return_value.__enter__.return_value.load_table.return_value = self.table
         if on_append is not None:
             self.table.append.side_effect = lambda b: on_append()
 
@@ -298,3 +303,105 @@ def test_write_path_works_without_a_phase_timer():
     pool = _Pool()
     assert append_only(pool, "team-2", _batch()) == 4
     assert pool.gets == [None]
+
+
+# ---------------------------------------------------------------------------
+# Probe honesty: a probe that did not run must never look like a fast one
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_probe_reports_whether_it_actually_ran():
+    catalog = MagicMock()
+    catalog.name = "team_2"
+    assert _catalog_probe(catalog) is True
+
+    failing = MagicMock()
+    failing.name = "team_3"
+    failing.fetchall.side_effect = RuntimeError("catalog unreachable")
+    assert _catalog_probe(failing) is False
+
+    unsafe = MagicMock()
+    unsafe.name = "team.2"  # a legal config value; not a bare identifier
+    assert _catalog_probe(unsafe) is False
+
+
+def test_skipped_probe_records_no_sample_and_renders_as_skipped():
+    """`probe=0.0` would read as "the catalog answered instantly" — the exact
+    conclusion that sends an operator to look at object storage instead."""
+    pool = _Pool()
+    pool.catalog.name = "team.2"
+    p = FlushPhases(probe_enabled=True)
+    append_only(pool, "team-2", _batch(), phases=p)
+    assert PROBE not in p.recorded()
+    assert p.probe_skipped is True
+    assert "probe=skipped" in p.log_fragment()
+
+
+def test_failed_probe_records_no_sample_and_renders_as_skipped():
+    pool = _Pool()
+    pool.catalog.fetchall.side_effect = RuntimeError("catalog unreachable")
+    p = FlushPhases(probe_enabled=True)
+    append_only(pool, "team-2", _batch(), phases=p)
+    assert PROBE not in p.recorded()
+    assert "probe=skipped" in p.log_fragment()
+
+
+def test_successful_probe_still_renders_a_duration():
+    pool = _Pool()
+    p = FlushPhases(probe_enabled=True)
+    append_only(pool, "team-2", _batch(), phases=p)
+    assert PROBE in p.recorded()
+    assert p.probe_skipped is False
+    assert "probe=skipped" not in p.log_fragment()
+
+
+# ---------------------------------------------------------------------------
+# resolve: the Arrow-side batch preparation
+# ---------------------------------------------------------------------------
+
+
+def _cdc_batch(n: int = 4) -> pa.Table:
+    return pa.table(
+        {
+            "id": pa.array(list(range(n)), type=pa.int64()),
+            "change_type": pa.array(["insert"] * n),
+            "snapshot_id": pa.array([7] * n, type=pa.int64()),
+            "rowid": pa.array(list(range(n)), type=pa.int64()),
+        }
+    )
+
+
+def test_full_cdc_attributes_conflict_resolution_and_dedup_to_resolve():
+    """Phase 2 and Winner(k) are O(rows) Arrow work inside the flush
+    duration; unattributed they are an unexplained gap in a slow CDC flush."""
+    from viaduck.apply import apply_full_cdc
+
+    pool = _Pool()
+    p = FlushPhases()
+    apply_full_cdc(pool, "team-2", _cdc_batch(), ["id"], phases=p)
+    assert RESOLVE in p.recorded()
+
+
+def test_full_cdc_leaves_only_fixed_bookkeeping_unattributed():
+    """The acceptance property for the CDC path.
+
+    Asserted as an absolute bound rather than a percentage: what stays
+    outside the phases is a fixed handful of `metrics.*.inc()` calls, not
+    anything that scales with the batch. A constant sub-millisecond residual
+    is >=95% attribution for any flush long enough to care about — and a
+    percentage assertion at this timescale would just measure test-harness
+    overhead."""
+    from viaduck.apply import apply_full_cdc
+
+    pool = _Pool()
+    p = FlushPhases()
+    started = time.monotonic()
+    apply_full_cdc(pool, "team-2", _cdc_batch(20_000), ["id"], phases=p)
+    elapsed = time.monotonic() - started
+    assert elapsed - p.accounted() < 0.01
+
+
+def test_write_path_still_works_without_a_timer_in_full_cdc():
+    from viaduck.apply import apply_full_cdc
+
+    assert apply_full_cdc(_Pool(), "team-2", _cdc_batch(), ["id"]) == 4

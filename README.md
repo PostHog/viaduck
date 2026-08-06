@@ -82,7 +82,7 @@ Core modules:
 | [`destination.py`](viaduck/destination.py) | LRU connection pool for destination catalogs, lease pinning | Connections |
 | [`state.py`](viaduck/state.py) | Per-destination cursors on plain Postgres | State tracking |
 | [`arrowutil.py`](viaduck/arrowutil.py) | Shared Arrow kernel helpers | Vectorization |
-| [`phases.py`](viaduck/phases.py) | Per-flush phase timing (queue wait, acquire, probe, append, cursor) | Observability |
+| [`phases.py`](viaduck/phases.py) | Per-flush phase timing (queue wait, acquire, resolve, probe, append, cursor) | Observability |
 | [`metrics.py`](viaduck/metrics.py) | Prometheus metric definitions | Observability |
 | [`server.py`](viaduck/server.py) | HTTP `/metrics`, `/healthz`, `/readyz`, status web UI | Health checks |
 
@@ -490,7 +490,8 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 |-------|--------|
 | `queue_wait` | Submit → worker pickup. **Outside** the reported flush duration: the shared worker pool (`delivery.workers`) can hide minutes here that look like nothing at all today. |
 | `acquire` | The destination pool lease. Normally ~0 on a pooled hit. |
-| `probe` | The optional catalog probe (below). Absent unless enabled. |
+| `resolve` | Arrow-side batch preparation: concatenating the buffered reads, Phase 2 conflict resolution, Winner(k) dedup. Real seconds on a large catch-up batch. |
+| `probe` | The optional catalog probe (below). Absent unless enabled; recorded only when the read actually completed. |
 | `projection` | Schema projection. Absent when the destination has none. |
 | `append` | The pyducklake write itself — `tbl.append()` in `append_only`, the delete+upsert transaction in `full_cdc`. |
 | `retry_backoff` | Sleeps between write-retry attempts. Absent on a first-attempt success. |
@@ -506,7 +507,7 @@ The same breakdown is appended to the flush log line, so a slow flush explains i
 Flushed team-2: 59104 ops through snapshot 8814 (trigger=sliced, 81.70s: queue=0.1 acquire=0.0 probe=62.3 append=18.9 cursor=0.2)
 ```
 
-The prefix through the duration is byte-identical to the pre-instrumentation line. `acquire` renders as `acquire=14.2(cold)` on a cold attach, and `attempts=N` appears when a flush needed more than one write attempt.
+The prefix through the duration is byte-identical to the pre-instrumentation line. `acquire` renders as `acquire=14.2(cold)` on a cold attach, and `attempts=N` appears when a flush needed more than one write attempt. A probe that could not run renders as `probe=skipped` and records no sample — never as a fast `probe=0.0`, which would wrongly exonerate the catalog.
 
 **Reading it.** To find which phase eats a stall, compare the same quantile across phases:
 
@@ -521,7 +522,14 @@ sum by (phase) (rate(viaduck_flush_phase_seconds_bucket{destination="team-2", le
   - sum by (phase) (rate(viaduck_flush_phase_seconds_bucket{destination="team-2", le="60"}[1h]))
 ```
 
-Mean write attempts per flush — the retry-storm signal — is `rate(viaduck_flush_retry_attempts_total[5m]) / rate(viaduck_delivery_flushes_total[5m])`. (This counts *attempts*; `viaduck_dest_write_retries_total` counts only the failed ones.)
+Mean write attempts per flush — the retry-storm signal — divides by the `acquire` phase count, **not** by `viaduck_delivery_flushes_total`:
+
+```promql
+rate(viaduck_flush_retry_attempts_total[5m])
+  / rate(viaduck_flush_phase_seconds_count{phase="acquire"}[5m])
+```
+
+Both sides count exactly the same events — data flushes that reached the write path, successful or failed — so the ratio is a true mean. `viaduck_delivery_flushes_total` is the wrong denominator on both counts: it only increments on **success** while the numerator includes failed flushes (a destination whose every flush fails drives the ratio to infinity, which is precisely when you'd be looking at it), and it also counts position-only cursor persists that never touch a destination. `viaduck_flush_retry_attempts_total` counts *attempts*; the pre-existing `viaduck_dest_write_retries_total` counts only the failed ones.
 
 **The catalog probe** (`delivery.flush_probe_enabled`, default `false`) is the answer to a gap in the above: pyducklake's `Table.append()` is a single `INSERT INTO … SELECT`, so parquet encode, the S3 PUT and the DuckLake catalog commit are one opaque call that cannot be split from Python. When enabled, viaduck times the cheapest possible catalog read (`max(snapshot_id)` off the metadata store) on the **same connection**, immediately before the write. If `probe` is slow exactly when `append` is slow, the stall is catalog-metadata reads; if `append` is slow while `probe` stays fast, it is not the catalog. It costs one extra round-trip to the metadata store per flush — the only catalog work this instrumentation adds, which is why it is opt-in:
 

@@ -207,7 +207,7 @@ Always run `just tlc` after spec changes.
 | `destination.py` | LRU connection pool for destination catalogs, lease pinning |
 | `state.py` | Per-destination cursors on plain Postgres (psycopg) |
 | `arrowutil.py` | Shared Arrow kernel helpers (row_indices, full_bool) |
-| `phases.py` | Per-flush phase timing (queue_wait/acquire/probe/projection/append/retry_backoff/cursor_persist) |
+| `phases.py` | Per-flush phase timing (queue_wait/acquire/resolve/probe/projection/append/retry_backoff/cursor_persist) |
 | `metrics.py` | Prometheus metric definitions (60 metrics) |
 | `server.py` | HTTP /metrics, /healthz, /readyz, /status, /ui, /ui/sse |
 | `logging_config.py` | Structured logging setup |

@@ -1751,7 +1751,7 @@ def test_flush_log_line_carries_the_phase_breakdown(caplog):
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Flushed d1"))
     assert re.match(
         r"^Flushed d1: 4 ops through snapshot 7 \(trigger=\w+, \d+\.\d\ds: "
-        r"queue=\d+\.\d acquire=\d+\.\d append=\d+\.\d cursor=\d+\.\d\)$",
+        r"queue=\d+\.\d acquire=\d+\.\d resolve=\d+\.\d append=\d+\.\d cursor=\d+\.\d\)$",
         line,
     ), line
 
@@ -1837,3 +1837,40 @@ def test_position_only_persist_records_no_phase_samples():
         mgr.maybe_flush()
         assert mgr.wait_idle()
     hist.labels.assert_not_called()
+
+
+def test_queue_wait_excludes_earlier_destinations_swap_work():
+    """The stamp is taken immediately before submit(), not at the top of
+    maybe_flush. maybe_flush holds the manager lock and slices per
+    destination, so a stamp taken once per cycle would charge every earlier
+    destination's swap to the executor as queue wait it never spent."""
+    mgr, _, _ = _manager(dests=("d1", "d2", "d3"), flush_interval_seconds=0.0)
+    stamps = {}
+
+    def record(dest, tables, through, trigger, phases=None):
+        stamps[dest] = phases._submitted_at
+        with mgr._lock:
+            mgr._inflight.discard(dest)
+
+    real_trigger = mgr._trigger_for_locked
+
+    def slow_trigger(dest_id, now, shutdown, over_watermark):
+        # Stand in for the per-destination work the submit loop really does
+        # (trigger evaluation + slicing + buffer swap), made measurable.
+        _time_mod.sleep(0.02)
+        return real_trigger(dest_id, now, shutdown, over_watermark)
+
+    for d in ("d1", "d2", "d3"):
+        mgr.buffer(d, _table(2), 5)
+
+    with patch.object(mgr, "_flush", side_effect=record):
+        with patch.object(mgr, "_trigger_for_locked", side_effect=slow_trigger):
+            mgr.maybe_flush()
+        assert mgr.wait_idle()
+
+    assert len(stamps) == 3
+    ordered = sorted(stamps.values())
+    # A single per-cycle `now` would make these identical. Each stamp must
+    # instead track the loop's own progress: >= one slow_trigger apart.
+    assert ordered[1] - ordered[0] >= 0.02, stamps
+    assert ordered[2] - ordered[1] >= 0.02, stamps

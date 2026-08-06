@@ -16,8 +16,9 @@ Two classes of phase:
 
 - PARTITION phases tile the flush timeline and are meant to be summed:
   `queue_wait` (submit -> worker pickup, OUTSIDE the reported duration),
-  then `acquire`, `probe`, `projection`, `append`, `retry_backoff` and
-  `cursor_persist`, which tile the reported duration itself.
+  then `acquire`, `resolve`, `probe`, `projection`, `append`,
+  `retry_backoff` and `cursor_persist`, which tile the reported duration
+  itself.
 - NESTED phases subdivide a partition phase and MUST NOT be added to the
   top-level sum: `cold_attach` is the part of `acquire` that built a new
   connection.
@@ -44,6 +45,7 @@ from viaduck import metrics
 # Phases that tile the flush timeline. Order is the log-line render order.
 QUEUE_WAIT = "queue_wait"
 ACQUIRE = "acquire"
+RESOLVE = "resolve"
 PROBE = "probe"
 PROJECTION = "projection"
 APPEND = "append"
@@ -56,6 +58,7 @@ COLD_ATTACH = "cold_attach"
 PARTITION_PHASES = (
     QUEUE_WAIT,
     ACQUIRE,
+    RESOLVE,
     PROBE,
     PROJECTION,
     APPEND,
@@ -71,10 +74,25 @@ NESTED_PHASES = (COLD_ATTACH,)
 _ALWAYS_RENDERED = (QUEUE_WAIT, ACQUIRE, APPEND, CURSOR_PERSIST)
 
 
+@contextmanager
+def optional(phases, phase: str):
+    """Time `phase` when a timer is present, no-op when it isn't.
+
+    `phases` is optional on every write-path entry point (seeding and the
+    reconciler call them without one), so call sites that would otherwise
+    need an if/else around a `with` use this instead.
+    """
+    if phases is None:
+        yield
+        return
+    with phases.time(phase):
+        yield
+
+
 class FlushPhases:
     """Mutable per-flush accumulator of phase durations, in seconds."""
 
-    __slots__ = ("_d", "_submitted_at", "probe_enabled", "attempts", "cold_attach")
+    __slots__ = ("_d", "_submitted_at", "probe_enabled", "attempts", "cold_attach", "probe_skipped")
 
     def __init__(self, submitted_at: float | None = None, *, probe_enabled: bool = False):
         self._d: dict[str, float] = {}
@@ -86,6 +104,10 @@ class FlushPhases:
         # Write-retry attempts actually used (1 on a first-attempt success).
         self.attempts = 0
         self.cold_attach = False
+        # Set when the probe was asked for but could not run (unsafe catalog
+        # name, or the query itself failed). Distinct from "fast": renders
+        # as `probe=skipped` rather than a duration.
+        self.probe_skipped = False
 
     def start(self) -> None:
         """Called by the flush worker at pickup: closes out `queue_wait`.
@@ -142,6 +164,7 @@ class FlushPhases:
         for phase, label in (
             (QUEUE_WAIT, "queue"),
             (ACQUIRE, "acquire"),
+            (RESOLVE, "resolve"),
             (PROBE, "probe"),
             (PROJECTION, "projection"),
             (APPEND, "append"),
@@ -149,6 +172,9 @@ class FlushPhases:
             (CURSOR_PERSIST, "cursor"),
         ):
             if phase == PROBE and not self.probe_enabled:
+                continue
+            if phase == PROBE and self.probe_skipped:
+                parts.append("probe=skipped")
                 continue
             value = self._d.get(phase)
             if value is None and phase not in always:

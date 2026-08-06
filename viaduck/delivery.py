@@ -43,7 +43,7 @@ import pyarrow.compute as pc
 from viaduck import metrics
 from viaduck.apply import FlushDeadlineExceeded, append_only, apply_full_cdc
 from viaduck.config import ConfigError
-from viaduck.phases import CURSOR_PERSIST, FlushPhases
+from viaduck.phases import CURSOR_PERSIST, RESOLVE, FlushPhases
 
 if TYPE_CHECKING:
     from viaduck.config import DeliveryConfig
@@ -614,11 +614,15 @@ class DeliveryManager:
                 # not by the worker: the gap between submit and pickup is
                 # `queue_wait`, and a shared 8-worker pool serving ~17
                 # destinations can hide minutes of it inside what looks like
-                # a slow flush. `now` is this cycle's monotonic stamp, taken
-                # at the top of maybe_flush — at most one poll-cycle's worth
-                # of trigger evaluation older than the actual submit, which
-                # is noise next to the queue waits worth seeing.
-                phases = FlushPhases(now, probe_enabled=self._cfg.flush_probe_enabled)
+                # a slow flush.
+                #
+                # Stamped immediately before submit(), NOT from `now` at the
+                # top of maybe_flush: this loop runs under the manager lock
+                # and does per-destination slicing, so a destination late in
+                # the order would otherwise charge every earlier
+                # destination's trigger evaluation and buffer swap to the
+                # executor as queue wait it never spent.
+                phases = FlushPhases(time.monotonic(), probe_enabled=self._cfg.flush_probe_enabled)
                 future = self._executor.submit(self._flush, dest_id, tables, through, trigger, phases)
                 # _flush catches everything it expects; anything escaping
                 # (a bug) must not vanish into an unobserved Future.
@@ -849,7 +853,12 @@ class DeliveryManager:
         try:
             ops_count = 0
             if tables:
-                batch = tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
+                # Concatenating the buffered reads copies the whole window;
+                # on a multi-chunk catch-up swap that is real time inside
+                # the flush duration, and it belongs with the other
+                # batch-preparation work rather than in an unnamed gap.
+                with phases.time(RESOLVE):
+                    batch = tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
                 if self._full_cdc:
                     ops_count = apply_full_cdc(
                         self._pool,

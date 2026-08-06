@@ -21,7 +21,8 @@ import pyarrow.compute as pc
 
 from viaduck import metrics
 from viaduck.arrowutil import row_indices
-from viaduck.phases import ACQUIRE, APPEND, PROBE, PROJECTION, RETRY_BACKOFF
+from viaduck.phases import ACQUIRE, APPEND, PROBE, PROJECTION, RESOLVE, RETRY_BACKOFF
+from viaduck.phases import optional as _optional_phase
 from viaduck.router import RoutingError
 from viaduck.schema_projection import SchemaProjectionError
 from viaduck.source import strip_meta
@@ -377,15 +378,44 @@ def _catalog_probe(catalog) -> None:
     slow probe means slow catalog metadata for that append specifically, not
     a generally unhealthy store. Never raises: a diagnostic must not be able
     to fail a flush.
+
+    Returns True only when the read actually completed. A skip or a failure
+    must NOT be reported as a fast probe — `probe=0.0` reads as "the catalog
+    answered instantly", which is the exact conclusion that would send an
+    operator looking at object storage instead.
     """
     name = getattr(catalog, "name", "")
     if not _CATALOG_NAME_RE.match(name):
-        log.debug("Skipping catalog probe: catalog name %r is not a bare identifier", name)
-        return
+        # `destinations[].name` is free-form (operator YAML or a CP payload);
+        # nothing upstream constrains it to a bare identifier. A name that
+        # can't be interpolated safely means no probe for that destination.
+        _warn_probe_unavailable_once(name, f"catalog name {name!r} is not a bare identifier")
+        return False
     try:
         catalog.fetchall(f'SELECT max(snapshot_id) FROM "__ducklake_metadata_{name}".ducklake_snapshot')
-    except Exception:
-        log.debug("Catalog probe failed", exc_info=True)
+    except Exception as exc:
+        _warn_probe_unavailable_once(name, f"probe query failed: {exc}")
+        return False
+    return True
+
+
+_probe_warned: set[str] = set()
+_probe_warned_lock = threading.Lock()
+
+
+def _warn_probe_unavailable_once(name: str, reason: str) -> None:
+    """WARN the first time a catalog can't be probed, then stay quiet.
+
+    An operator who just switched `flush_probe_enabled` on needs to know it
+    isn't working, but the flush path runs this every flush — one line per
+    catalog is the whole budget. The per-flush signal is `probe=skipped` in
+    the flush log line.
+    """
+    with _probe_warned_lock:
+        if name in _probe_warned:
+            return
+        _probe_warned.add(name)
+    log.warning("Catalog probe unavailable for %r (%s); flushes will report probe=skipped", name, reason)
 
 
 def _timed_write(catalog, phases, write):
@@ -398,8 +428,15 @@ def _timed_write(catalog, phases, write):
     if phases is None:
         return write()
     if phases.probe_enabled:
-        with phases.time(PROBE):
-            _catalog_probe(catalog)
+        started = time.monotonic()
+        ran = _catalog_probe(catalog)
+        # Only a completed read gets a duration. A skip/failure records no
+        # `probe` sample at all — a fast-looking probe that never ran would
+        # falsely exonerate the catalog.
+        if ran:
+            phases.add(PROBE, time.monotonic() - started)
+        else:
+            phases.probe_skipped = True
     with phases.time(APPEND):
         return write()
 
@@ -656,26 +693,31 @@ def _apply_changes(
     - upserted: rows sent to upsert (input count)
     - upsert_matched: rows that matched existing rows during upsert (from UpsertResult.rows_updated)
     """
-    ct_col = batch.column("change_type")
+    # Change-type split + Winner(k) dedup: Arrow work proportional to the
+    # batch, re-run on every write-retry attempt (the lambda is the retry
+    # unit). Timed as `resolve`, same phase as Phase 2 — together they are
+    # "preparing the batch", as distinct from writing it.
+    with _optional_phase(phases, RESOLVE):
+        ct_col = batch.column("change_type")
 
-    # Separate by change type
-    delete_mask = pc.equal(ct_col, pa.scalar("delete"))
-    delete_rows = strip_meta(batch.filter(delete_mask))
+        # Separate by change type
+        delete_mask = pc.equal(ct_col, pa.scalar("delete"))
+        delete_rows = strip_meta(batch.filter(delete_mask))
 
-    upsert_mask = pc.or_(
-        pc.equal(ct_col, pa.scalar("insert")),
-        pc.equal(ct_col, pa.scalar("update_postimage")),
-    )
-    # Winner(k) BEFORE stripping meta — the dedup orders by snapshot_id/rowid.
-    upsert_rows = strip_meta(_dedupe_upserts_last_write_wins(batch.filter(upsert_mask), key_columns))
+        upsert_mask = pc.or_(
+            pc.equal(ct_col, pa.scalar("insert")),
+            pc.equal(ct_col, pa.scalar("update_postimage")),
+        )
+        # Winner(k) BEFORE stripping meta — the dedup orders by snapshot_id/rowid.
+        upsert_rows = strip_meta(_dedupe_upserts_last_write_wins(batch.filter(upsert_mask), key_columns))
 
-    # `_build_delete_filter` only consumes `key_columns`, and B2 guards
-    # guarantee key columns pass through the projection untouched. So skip
-    # projection on delete_rows entirely and narrow the batch to key columns
-    # only — avoids running (potentially per-value fallback) casts on payload
-    # columns whose values we're about to discard anyway.
-    if delete_rows.num_rows > 0:
-        delete_rows = delete_rows.select(key_columns)
+        # `_build_delete_filter` only consumes `key_columns`, and B2 guards
+        # guarantee key columns pass through the projection untouched. So skip
+        # projection on delete_rows entirely and narrow the batch to key columns
+        # only — avoids running (potentially per-value fallback) casts on payload
+        # columns whose values we're about to discard anyway.
+        if delete_rows.num_rows > 0:
+            delete_rows = delete_rows.select(key_columns)
 
     # Upsert rows still need the full projection: tbl.upsert writes every
     # column into the destination shape.
@@ -729,7 +771,12 @@ def apply_full_cdc(
     phases=None,
 ) -> int:
     """Phase 2 + Phase 3 for one destination flush. Returns ops applied."""
-    resolved = _resolve_conflicts(batch)
+    # Phase 2 is Arrow work on the whole buffered window — O(rows) hashing
+    # and filtering that runs BEFORE any connection is leased. On a big
+    # catch-up batch it is seconds, and unattributed it shows up as an
+    # unexplained gap in a slow full_cdc flush.
+    with _optional_phase(phases, RESOLVE):
+        resolved = _resolve_conflicts(batch)
     if resolved.num_rows == 0:
         return 0
 
