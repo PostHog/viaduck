@@ -28,7 +28,7 @@ Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* an
 - LRU connection pool for high fanout (local bench: ~43 destinations/s flat through 1000 destinations)
 - Persistent cursor tracking on plain Postgres
 - Horizontal scaling via hash or explicit destination partitioning
-- 32 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
+- 34 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
 - At-least-once delivery with documented failure modes
 - [TLA+ formally verified](tla/Viaduck.tla): 7 safety invariants checked across 19.9M states with NO crash conditioning — eventual consistency, phantom-freedom, no-data-loss, partition correctness, and buffer boundedness all hold through every modeled crash and failure window
 
@@ -82,6 +82,7 @@ Core modules:
 | [`destination.py`](viaduck/destination.py) | LRU connection pool for destination catalogs, lease pinning | Connections |
 | [`state.py`](viaduck/state.py) | Per-destination cursors on plain Postgres | State tracking |
 | [`arrowutil.py`](viaduck/arrowutil.py) | Shared Arrow kernel helpers | Vectorization |
+| [`phases.py`](viaduck/phases.py) | Per-flush phase timing (queue wait, acquire, probe, append, cursor) | Observability |
 | [`metrics.py`](viaduck/metrics.py) | Prometheus metric definitions | Observability |
 | [`server.py`](viaduck/server.py) | HTTP `/metrics`, `/healthz`, `/readyz`, status web UI | Health checks |
 
@@ -272,6 +273,7 @@ delivery:
   # flush_deadline_seconds: 0               # overall per-flush wall-clock bound (0 = derive: 2 x flush_interval)
   flush_circuit_failures: 3                 # consecutive failures before a destination's circuit breaker opens
   flush_circuit_max_seconds: 900            # cap on the circuit breaker's exponential resubmit backoff
+  # flush_probe_enabled: false              # time a catalog read before each write (see Flush phase attribution)
 
 server:
   port: 8000                                # metrics, health checks, status UI
@@ -439,7 +441,7 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `lagging` | CDC reads are behind the source — data exists that viaduck has not yet read |
 | `error` | The last flush failed; the buffered range was dropped and will be re-read (see Error states) |
 
-32 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
+34 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -464,6 +466,8 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_delivery_buffer_total_bytes` | Gauge | — | Total buffered + in-flight bytes (watermark input) |
 | `viaduck_delivery_flushes_total` | Counter | destination, trigger | Flushes by trigger (interval/rows/bytes/memory/shutdown) |
 | `viaduck_delivery_flush_seconds` | Histogram | destination | Flush duration (data flushes only) |
+| `viaduck_flush_phase_seconds` | Histogram | destination, phase | Wall time of one phase of a flush — see [Flush phase attribution](#flush-phase-attribution) |
+| `viaduck_flush_retry_attempts_total` | Counter | destination | Write attempts used per flush (1 when the first attempt succeeds) |
 | `viaduck_delivery_buffers_dropped_total` | Counter | destination | Buffers dropped on flush failure |
 | `viaduck_cdc_routing_mutations_total` | Counter | — | Cross-tenant routing value changes |
 | `viaduck_cdc_conflicts_resolved_total` | Counter | — | Rowid-level conflicts resolved in Phase 2 |
@@ -475,6 +479,56 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_partition_spec_total` | Counter | destination, outcome | Outcomes from destination partition-spec reconciliation |
 | `viaduck_projection_cast_null_fallback_total` | Counter | destination, column | Values nulled by schema projection's per-value cast fallback (producer format drift alarm) |
 | `viaduck_errors_total` | Counter | type, destination | Errors by type |
+
+### Flush phase attribution
+
+`viaduck_delivery_flush_seconds` says a flush was slow; `viaduck_flush_phase_seconds{phase=...}` says *where* it was slow. Every flush attributes its wall time to named phases ([`phases.py`](viaduck/phases.py)), emitted for data flushes on both the success and failure paths.
+
+**Partition phases** tile the flush and may be summed:
+
+| Phase | Covers |
+|-------|--------|
+| `queue_wait` | Submit → worker pickup. **Outside** the reported flush duration: the shared worker pool (`delivery.workers`) can hide minutes here that look like nothing at all today. |
+| `acquire` | The destination pool lease. Normally ~0 on a pooled hit. |
+| `probe` | The optional catalog probe (below). Absent unless enabled. |
+| `projection` | Schema projection. Absent when the destination has none. |
+| `append` | The pyducklake write itself — `tbl.append()` in `append_only`, the delete+upsert transaction in `full_cdc`. |
+| `retry_backoff` | Sleeps between write-retry attempts. Absent on a first-attempt success. |
+| `cursor_persist` | The Postgres cursor write. Already inside the reported duration; now visible separately. |
+
+Everything except `queue_wait` sums to ≈ the reported flush duration, whose definition is unchanged (worker pickup → cursor persisted).
+
+**Nested phases** subdivide a partition phase and must **not** be added to that sum: `cold_attach` is the part of `acquire` that built a new connection (a cold DuckLake ATTACH reads catalog metadata and has been measured at 10–20s — the leading suspect for the first-flush-after-restart penalty).
+
+The same breakdown is appended to the flush log line, so a slow flush explains itself without Prometheus:
+
+```
+Flushed team-2: 59104 ops through snapshot 8814 (trigger=sliced, 81.70s: queue=0.1 acquire=0.0 probe=62.3 append=18.9 cursor=0.2)
+```
+
+The prefix through the duration is byte-identical to the pre-instrumentation line. `acquire` renders as `acquire=14.2(cold)` on a cold attach, and `attempts=N` appears when a flush needed more than one write attempt.
+
+**Reading it.** To find which phase eats a stall, compare the same quantile across phases:
+
+```promql
+histogram_quantile(0.5, sum by (phase, le) (rate(viaduck_flush_phase_seconds_bucket{destination="team-2"}[1h])))
+```
+
+A bimodal population separates without needing log access: the fraction of flushes where a phase alone exceeded 60s is
+
+```promql
+sum by (phase) (rate(viaduck_flush_phase_seconds_bucket{destination="team-2", le="+Inf"}[1h]))
+  - sum by (phase) (rate(viaduck_flush_phase_seconds_bucket{destination="team-2", le="60"}[1h]))
+```
+
+Mean write attempts per flush — the retry-storm signal — is `rate(viaduck_flush_retry_attempts_total[5m]) / rate(viaduck_delivery_flushes_total[5m])`. (This counts *attempts*; `viaduck_dest_write_retries_total` counts only the failed ones.)
+
+**The catalog probe** (`delivery.flush_probe_enabled`, default `false`) is the answer to a gap in the above: pyducklake's `Table.append()` is a single `INSERT INTO … SELECT`, so parquet encode, the S3 PUT and the DuckLake catalog commit are one opaque call that cannot be split from Python. When enabled, viaduck times the cheapest possible catalog read (`max(snapshot_id)` off the metadata store) on the **same connection**, immediately before the write. If `probe` is slow exactly when `append` is slow, the stall is catalog-metadata reads; if `append` is slow while `probe` stays fast, it is not the catalog. It costs one extra round-trip to the metadata store per flush — the only catalog work this instrumentation adds, which is why it is opt-in:
+
+```yaml
+delivery:
+  flush_probe_enabled: true
+```
 
 ## Setup
 

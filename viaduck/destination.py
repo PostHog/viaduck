@@ -9,6 +9,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 from viaduck import metrics, schema_projection
+from viaduck.phases import COLD_ATTACH
 from viaduck.scrub import scrub_credentials
 from viaduck.source import with_connection_defaults
 
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
     from pyducklake.schema import Schema
 
     from viaduck.config import DestinationConfig, ViaduckConfig
+    from viaduck.phases import FlushPhases
     from viaduck.registry import DestinationRegistry
     from viaduck.schema_projection import ProjectionPlan
 
@@ -84,7 +86,7 @@ class DestinationPool:
         """Cache the source table schema to avoid repeated lookups."""
         self._source_schema = schema
 
-    def get(self, destination_id: str) -> tuple[Catalog, Table]:
+    def get(self, destination_id: str, phases: FlushPhases | None = None) -> tuple[Catalog, Table]:
         """Get or create a (Catalog, Table) pair for a destination, pinned
         until the matching release().
 
@@ -96,6 +98,14 @@ class DestinationPool:
         DIFFERENT destinations in parallel. (Concurrent creates for the
         same destination can't happen: the delivery layer's in-flight
         guard gives each destination at most one worker at a time.)
+
+        `phases`: optional per-flush timer. A pooled hit and a create are
+        wildly different costs — a cold DuckLake ATTACH reads the catalog's
+        metadata and has been measured at 10-20s, which is the leading
+        suspect for the first-flush-after-restart penalty — so the create
+        path is recorded separately as the nested `cold_attach` phase and
+        flagged for the flush log line. The caller times the whole call as
+        `acquire`; `cold_attach` is the part of it that built a connection.
         """
         to_close: list[tuple[str, Catalog]] = []
         with self._lock:
@@ -136,7 +146,12 @@ class DestinationPool:
                 log.warning("Error closing evicted connection for %s", evict_id)
 
         try:
-            catalog, table, plan = self._create(destination_id)
+            if phases is None:
+                catalog, table, plan = self._create(destination_id)
+            else:
+                phases.cold_attach = True
+                with phases.time(COLD_ATTACH):
+                    catalog, table, plan = self._create(destination_id)
         except Exception:
             with self._lock:
                 self._creating.discard(destination_id)

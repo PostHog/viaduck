@@ -43,6 +43,7 @@ import pyarrow.compute as pc
 from viaduck import metrics
 from viaduck.apply import FlushDeadlineExceeded, append_only, apply_full_cdc
 from viaduck.config import ConfigError
+from viaduck.phases import CURSOR_PERSIST, FlushPhases
 
 if TYPE_CHECKING:
     from viaduck.config import DeliveryConfig
@@ -609,7 +610,16 @@ class DeliveryManager:
                     self._position_dirty_since[dest_id] = None
                 metrics.delivery_buffer_rows.labels(destination=dest_id).set(rem_buf.rows)
                 metrics.delivery_buffer_bytes.labels(destination=dest_id).set(rem_buf.bytes)
-                future = self._executor.submit(self._flush, dest_id, tables, through, trigger)
+                # The phase timer is created HERE, by the submitting thread,
+                # not by the worker: the gap between submit and pickup is
+                # `queue_wait`, and a shared 8-worker pool serving ~17
+                # destinations can hide minutes of it inside what looks like
+                # a slow flush. `now` is this cycle's monotonic stamp, taken
+                # at the top of maybe_flush — at most one poll-cycle's worth
+                # of trigger evaluation older than the actual submit, which
+                # is noise next to the queue waits worth seeing.
+                phases = FlushPhases(now, probe_enabled=self._cfg.flush_probe_enabled)
+                future = self._executor.submit(self._flush, dest_id, tables, through, trigger, phases)
                 # _flush catches everything it expects; anything escaping
                 # (a bug) must not vanish into an unobserved Future.
                 future.add_done_callback(self._log_escaped_exception)
@@ -815,8 +825,16 @@ class DeliveryManager:
                 duration,
             )
 
-    def _flush(self, dest_id: str, tables: list[pa.Table], through: int, trigger: str) -> None:
+    def _flush(
+        self, dest_id: str, tables: list[pa.Table], through: int, trigger: str, phases: FlushPhases | None = None
+    ) -> None:
         """Worker: FlushCommit / FlushFail."""
+        phases = phases if phases is not None else FlushPhases()
+        # Closes out queue_wait. Deliberately BEFORE t0: the reported flush
+        # duration keeps its historical definition (worker pickup -> cursor
+        # persisted) so week-over-week comparisons hold, and queue_wait is
+        # reported alongside it rather than folded into it.
+        phases.start()
         t0 = time.monotonic()
         batch_bytes = sum(t.nbytes for t in tables)
         deadline = t0 + self._flush_deadline_s if self._flush_deadline_s is not None else None
@@ -834,10 +852,18 @@ class DeliveryManager:
                 batch = tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
                 if self._full_cdc:
                     ops_count = apply_full_cdc(
-                        self._pool, dest_id, batch, self._key_columns, stop_event=self._stopping, deadline=deadline
+                        self._pool,
+                        dest_id,
+                        batch,
+                        self._key_columns,
+                        stop_event=self._stopping,
+                        deadline=deadline,
+                        phases=phases,
                     )
                 else:
-                    ops_count = append_only(self._pool, dest_id, batch, stop_event=self._stopping, deadline=deadline)
+                    ops_count = append_only(
+                        self._pool, dest_id, batch, stop_event=self._stopping, deadline=deadline, phases=phases
+                    )
                 apply_done = True
             # Cursor persist AFTER the destination commit (the gap is the
             # spec's CrashDuringFlush window). A short retry here avoids
@@ -846,7 +872,8 @@ class DeliveryManager:
             # destination write already landed.
             with self._lock:
                 cumulative = self._rows_replicated[dest_id] + ops_count
-            self._advance_cursor_with_retry(dest_id, through, cumulative)
+            with phases.time(CURSOR_PERSIST):
+                self._advance_cursor_with_retry(dest_id, through, cumulative)
             duration = time.monotonic() - t0
             type_counts = self._change_type_counts(batch) if tables else None
             with self._lock:
@@ -896,21 +923,36 @@ class DeliveryManager:
                 # observe per-destination write latency under this name.
                 metrics.dest_write_seconds.labels(destination=dest_id).observe(duration)
                 self._adapt_flush_target(dest_id, duration, batch_bytes)
+                phases.observe(dest_id)
                 if self._on_flush_success is not None:
                     self._on_flush_success()
+                # Prefix through the duration is byte-identical to the
+                # pre-instrumentation line — dashboards and humans parse it.
+                # The breakdown is appended after the duration so a slow
+                # flush explains itself from the log alone, with no
+                # Prometheus access.
                 log.info(
-                    "Flushed %s: %d ops through snapshot %d (trigger=%s, %.2fs)",
+                    "Flushed %s: %d ops through snapshot %d (trigger=%s, %.2fs: %s)",
                     dest_id,
                     ops_count,
                     through,
                     trigger,
                     duration,
+                    phases.log_fragment(),
                 )
                 if circuit_was_open:
                     log.info("Flush circuit closed for %s (probe flush succeeded)", dest_id)
         except Exception as exc:
             duration = time.monotonic() - t0
-            log.exception("Flush failed for destination %s", dest_id)
+            if tables:
+                # Attribute FAILED flushes too. A flush that burned its whole
+                # retry budget or hit the deadline is the most expensive thing
+                # a worker does, and leaving it out of the phase histograms
+                # would hide exactly the pathology this instrumentation is
+                # for. Same data-flushes-only gate as the success path, so
+                # idle position-persists don't dilute the series.
+                phases.observe(dest_id)
+            log.exception("Flush failed for destination %s after %.2fs: %s", dest_id, duration, phases.log_fragment())
             # Invariant-restoring reset FIRST: if the bookkeeping below
             # (PG write, pool close) also fails, the position/buffer state
             # must already be consistent — otherwise the dropped range

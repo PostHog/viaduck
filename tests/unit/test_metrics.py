@@ -73,3 +73,23 @@ def test_init_binds_cdc_orphaned_preimages_metric():
     init("test-pipeline")
 
     assert hasattr(metrics.cdc_orphaned_preimages_total, "inc")
+
+
+def test_init_binds_flush_phase_metrics():
+    """After init(), the phase histogram and attempt counter should have
+    .labels() with the pipeline auto-injected."""
+    from viaduck import metrics
+
+    init("test-pipeline")
+
+    assert hasattr(metrics.flush_phase_seconds, "labels")
+    assert hasattr(metrics.flush_retry_attempts_total, "labels")
+
+
+def test_flush_phase_buckets_span_the_slow_flush_range():
+    """The bimodal team-2 population sits at ~15s and 80-200s; buckets that
+    topped out at 10s (the prometheus_client default) would collapse every
+    slow flush into +Inf and make the fast-vs-slow comparison impossible."""
+    from viaduck.metrics import _PHASE_LATENCY_BUCKETS
+
+    assert _PHASE_LATENCY_BUCKETS == (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)

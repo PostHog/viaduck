@@ -8,6 +8,7 @@ import pytest
 
 from viaduck.config import (
     ConfigError,
+    DeliveryConfig,
     PartitionConfig,
     RoutingConfig,
     _merge_defaults,
@@ -721,6 +722,7 @@ def test_log_summary_one_line_per_field_not_grouped(config_file, caplog):
         "config: delivery.flush_max_bytes=",
         "config: delivery.flush_deadline_seconds=",
         "config: delivery.flush_circuit_failures=",
+        "config: delivery.flush_probe_enabled=",
         "config: poll.interval_seconds=",
         "config: poll.cdc_chunk_snapshots=",
         "config: poll.cycle_time_budget_seconds=",
@@ -1043,3 +1045,16 @@ def test_destination_buffer_max_bytes_loader(tmp_path: Path):
 def test_destination_buffer_max_bytes_default_zero(config_file: Path):
     cfg = load(config_file)
     assert cfg.destinations[0].buffer_max_bytes == 0
+
+
+def test_flush_probe_is_off_by_default():
+    """The probe adds a catalog round-trip per flush — the only extra
+    catalog work the phase instrumentation does. It must stay opt-in."""
+    assert DeliveryConfig().flush_probe_enabled is False
+
+
+def test_flush_probe_enabled_loader_passthrough(tmp_path: Path):
+    raw = MINIMAL_YAML + "\ndelivery:\n  flush_probe_enabled: true\n"
+    p = tmp_path / "probe.yaml"
+    p.write_text(raw)
+    assert load(p).delivery.flush_probe_enabled is True

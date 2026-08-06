@@ -132,7 +132,7 @@ class _EvictRecordingPool:
     def __init__(self):
         self.evictions = 0
 
-    def get(self, destination_id):
+    def get(self, destination_id, phases=None):
         return (object(), object())
 
     def release(self, destination_id):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import threading
 import time
 
@@ -20,6 +21,7 @@ import pyarrow.compute as pc
 
 from viaduck import metrics
 from viaduck.arrowutil import row_indices
+from viaduck.phases import ACQUIRE, APPEND, PROBE, PROJECTION, RETRY_BACKOFF
 from viaduck.router import RoutingError
 from viaduck.schema_projection import SchemaProjectionError
 from viaduck.source import strip_meta
@@ -187,13 +189,26 @@ def _backoff_sleep(delay: float, stop_event: threading.Event | None) -> bool:
 
 
 def _write_with_retry(
-    dest_pool, destination_id, operation, stop_event: threading.Event | None = None, deadline: float | None = None
+    dest_pool,
+    destination_id,
+    operation,
+    stop_event: threading.Event | None = None,
+    deadline: float | None = None,
+    phases=None,
 ):
     """Execute a write operation on a destination with exponential backoff.
 
     operation: callable that takes (catalog, table) and performs the write.
     The pool lease (get/release) pins the connection so concurrent LRU
     eviction by other workers can't close it mid-transaction.
+
+    phases: optional FlushPhases. Records `acquire` (the pool lease, which
+    on a miss includes a cold DuckLake ATTACH) and `retry_backoff` (the
+    sleeps between attempts), and counts the attempts used. All three
+    accumulate ACROSS attempts, so a flush that burned five attempts
+    reports five appends' worth of `append` with the sleeps between them
+    accounted separately — otherwise a retry-storm flush would look like
+    one very slow write.
 
     stop_event: optional shutdown signal. When set, the retry loop's next
     backoff wakes early and the current exception propagates. Without this,
@@ -221,7 +236,12 @@ def _write_with_retry(
                     f"flush deadline exceeded before attempt {attempt + 1}/{_WRITE_MAX_RETRIES}"
                 )
             try:
-                catalog, table = dest_pool.get(destination_id)
+                if phases is not None:
+                    phases.attempts = attempt + 1
+                    with phases.time(ACQUIRE):
+                        catalog, table = dest_pool.get(destination_id, phases=phases)
+                else:
+                    catalog, table = dest_pool.get(destination_id)
                 try:
                     return operation(catalog, table)
                 finally:
@@ -324,10 +344,79 @@ def _write_with_retry(
                 # fired mid-wait; re-raise so the caller (delivery._flush)
                 # takes the FlushFail path immediately instead of another
                 # retry attempt.
-                if _backoff_sleep(delay, stop_event):
+                if phases is not None:
+                    with phases.time(RETRY_BACKOFF):
+                        stopped = _backoff_sleep(delay, stop_event)
+                else:
+                    stopped = _backoff_sleep(delay, stop_event)
+                if stopped:
                     raise
     finally:
         metrics.dest_write_retrying.labels(destination=destination_id).set(0)
+
+
+# Catalog names are operator-supplied (`destinations[].name`, or a CP payload
+# for discovered tenants) and get interpolated into the probe's metadata-schema
+# reference, which cannot be parameterized. Allowlist rather than escape: a
+# ducklake catalog alias is a bare DuckDB identifier, so anything outside this
+# set means either a misconfiguration or an injection attempt, and the right
+# answer for a diagnostic is to skip it.
+_CATALOG_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _catalog_probe(catalog) -> None:
+    """Time the cheapest catalog read there is: the current snapshot id.
+
+    Deliberately NOT `Table.current_snapshot()` — that fetches and orders
+    every row of `ducklake_snapshot` (pyducklake table.py:snapshots), which
+    on a catalog with a long snapshot history is itself a heavy query and
+    would manufacture the stall it is supposed to detect. A `max()` over the
+    same table is one round-trip to the metadata store and one row back.
+
+    Runs on the SAME pooled connection as the append that follows it, so a
+    slow probe means slow catalog metadata for that append specifically, not
+    a generally unhealthy store. Never raises: a diagnostic must not be able
+    to fail a flush.
+    """
+    name = getattr(catalog, "name", "")
+    if not _CATALOG_NAME_RE.match(name):
+        log.debug("Skipping catalog probe: catalog name %r is not a bare identifier", name)
+        return
+    try:
+        catalog.fetchall(f'SELECT max(snapshot_id) FROM "__ducklake_metadata_{name}".ducklake_snapshot')
+    except Exception:
+        log.debug("Catalog probe failed", exc_info=True)
+
+
+def _timed_write(catalog, phases, write):
+    """Run the destination write, attributing its wall time to phases.
+
+    Wraps every mode's write call so `append` means the same thing in
+    append_only and full_cdc: the pyducklake call that puts data in the
+    destination, excluding the pool lease and the schema projection.
+    """
+    if phases is None:
+        return write()
+    if phases.probe_enabled:
+        with phases.time(PROBE):
+            _catalog_probe(catalog)
+    with phases.time(APPEND):
+        return write()
+
+
+def _timed_projection(phases, projection, batch, on_null_fallback):
+    """Apply the per-destination projection, timed as the `projection` phase.
+
+    No projection configured is the common case and records nothing, which
+    keeps `projection=` out of the flush log line entirely rather than
+    printing a permanent `0.0`.
+    """
+    if projection is None:
+        return batch
+    if phases is None:
+        return projection.apply(batch, on_null_fallback=on_null_fallback)
+    with phases.time(PROJECTION):
+        return projection.apply(batch, on_null_fallback=on_null_fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +637,7 @@ def _apply_changes(
     key_columns: list[str],
     projection=None,
     on_null_fallback=None,
+    phases=None,
 ) -> dict[str, int]:
     """Apply CDC changes to a destination table atomically.
 
@@ -589,32 +679,37 @@ def _apply_changes(
 
     # Upsert rows still need the full projection: tbl.upsert writes every
     # column into the destination shape.
-    if projection is not None and upsert_rows.num_rows > 0:
-        upsert_rows = projection.apply(upsert_rows, on_null_fallback=on_null_fallback)
+    if upsert_rows.num_rows > 0:
+        upsert_rows = _timed_projection(phases, projection, upsert_rows, on_null_fallback)
 
     counts = {"deleted": 0, "upserted": 0, "upsert_matched": 0}
 
     if delete_rows.num_rows == 0 and upsert_rows.num_rows == 0:
         return counts
 
-    with catalog.begin_transaction() as txn:
-        tbl = txn.load_table(dest_table.identifier)
+    def _write():
+        with catalog.begin_transaction() as txn:
+            tbl = txn.load_table(dest_table.identifier)
 
-        if delete_rows.num_rows > 0:
-            # Chunked: a single filter over 100k+ keys builds an O(rows)
-            # expression tree and a giant SQL string (the composite-key path
-            # is one Or(And(...)) per row). 1,000 keys per delete() keeps
-            # each statement parseable; all chunks share the transaction, so
-            # atomicity is unchanged.
-            for start in range(0, delete_rows.num_rows, _DELETE_CHUNK_ROWS):
-                chunk = delete_rows.slice(start, _DELETE_CHUNK_ROWS)
-                tbl.delete(_build_delete_filter(chunk, key_columns))
-            counts["deleted"] = delete_rows.num_rows
+            if delete_rows.num_rows > 0:
+                # Chunked: a single filter over 100k+ keys builds an O(rows)
+                # expression tree and a giant SQL string (the composite-key path
+                # is one Or(And(...)) per row). 1,000 keys per delete() keeps
+                # each statement parseable; all chunks share the transaction, so
+                # atomicity is unchanged.
+                for start in range(0, delete_rows.num_rows, _DELETE_CHUNK_ROWS):
+                    chunk = delete_rows.slice(start, _DELETE_CHUNK_ROWS)
+                    tbl.delete(_build_delete_filter(chunk, key_columns))
+                counts["deleted"] = delete_rows.num_rows
 
-        if upsert_rows.num_rows > 0:
-            upsert_result = tbl.upsert(upsert_rows, join_cols=key_columns)
-            counts["upserted"] = upsert_rows.num_rows
-            counts["upsert_matched"] = upsert_result.rows_updated
+            if upsert_rows.num_rows > 0:
+                upsert_result = tbl.upsert(upsert_rows, join_cols=key_columns)
+                counts["upserted"] = upsert_rows.num_rows
+                counts["upsert_matched"] = upsert_result.rows_updated
+
+    # The transaction is the full_cdc analogue of append_only's tbl.append():
+    # both report under the `append` phase so one dashboard reads both modes.
+    _timed_write(catalog, phases, _write)
 
     return counts
 
@@ -631,6 +726,7 @@ def apply_full_cdc(
     key_columns: list[str],
     stop_event: threading.Event | None = None,
     deadline: float | None = None,
+    phases=None,
 ) -> int:
     """Phase 2 + Phase 3 for one destination flush. Returns ops applied."""
     resolved = _resolve_conflicts(batch)
@@ -663,9 +759,11 @@ def apply_full_cdc(
             key_columns,
             projection=dest_pool.projection_for(dest_id),
             on_null_fallback=_null_fallback,
+            phases=phases,
         ),
         stop_event=stop_event,
         deadline=deadline,
+        phases=phases,
     )
     for column, count in fallback_counts.items():
         metrics.projection_cast_null_fallback_total.labels(destination=dest_id, column=column).inc(count)
@@ -684,6 +782,7 @@ def append_only(
     batch: pa.Table,
     stop_event: threading.Event | None = None,
     deadline: float | None = None,
+    phases=None,
 ) -> int:
     """Append-only mode (mode=append_only): one tbl.append() per flush.
 
@@ -726,10 +825,10 @@ def append_only(
     def _apply(cat, tbl):
         # Resolve INSIDE the retry lambda — see comment in apply_full_cdc.
         projection = dest_pool.projection_for(dest_id)
-        b = batch if projection is None else projection.apply(batch, on_null_fallback=_null_fallback)
-        tbl.append(b)
+        b = _timed_projection(phases, projection, batch, _null_fallback)
+        _timed_write(cat, phases, lambda: tbl.append(b))
 
-    _write_with_retry(dest_pool, dest_id, _apply, stop_event=stop_event, deadline=deadline)
+    _write_with_retry(dest_pool, dest_id, _apply, stop_event=stop_event, deadline=deadline, phases=phases)
     for column, count in fallback_counts.items():
         metrics.projection_cast_null_fallback_total.labels(destination=dest_id, column=column).inc(count)
     metrics.dest_rows_written_total.labels(destination=dest_id).inc(batch.num_rows)

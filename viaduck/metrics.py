@@ -194,6 +194,34 @@ _delivery_flush_seconds = Histogram(
     ["pipeline", "destination"],
     buckets=_WRITE_LATENCY_BUCKETS,
 )
+# Phase attribution for a single flush. Same bucket span as the flush/write
+# latency histograms (a phase can eat the whole flush — that's the point) but
+# with a 2.5s edge instead of 2s: the fast-flush population clusters just
+# under 20s, and the extra resolution low down separates "trivial" from
+# "small but real" phases when comparing a fast flush to a slow one.
+#
+# `phase` splits into partition phases (queue_wait, acquire, probe,
+# projection, append, retry_backoff, cursor_persist — these tile the flush
+# and may be summed) and nested phases (cold_attach subdivides acquire;
+# append_meta/append_write/append_commit subdivide append). Summing a nested
+# phase into the top-level total double-counts. See viaduck/phases.py.
+_PHASE_LATENCY_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+
+_flush_phase_seconds = Histogram(
+    "viaduck_flush_phase_seconds",
+    "Wall time of one phase of a destination flush (see viaduck/phases.py for the phase vocabulary)",
+    ["pipeline", "destination", "phase"],
+    buckets=_PHASE_LATENCY_BUCKETS,
+)
+# Distinct from dest_write_retries_total, which counts RETRIES inside
+# apply._write_with_retry: this counts ATTEMPTS used per flush (>= 1 for
+# every data flush), so `rate(flush_retry_attempts_total) /
+# rate(delivery_flushes_total)` reads directly as mean attempts per flush.
+_flush_retry_attempts_total = Counter(
+    "viaduck_flush_retry_attempts_total",
+    "Write attempts used per destination flush (1 when the first attempt succeeds)",
+    ["pipeline", "destination"],
+)
 _delivery_reads_paused = Gauge(
     "viaduck_delivery_reads_paused",
     "1 while a destination's queue (buffer + in-flight) is at its per-destination cap and CDC reads for it are paused",
@@ -414,6 +442,8 @@ delivery_buffer_bytes = _delivery_buffer_bytes
 delivery_buffer_total_bytes = _delivery_buffer_total_bytes
 delivery_flushes_total = _delivery_flushes_total
 delivery_flush_seconds = _delivery_flush_seconds
+flush_phase_seconds = _flush_phase_seconds
+flush_retry_attempts_total = _flush_retry_attempts_total
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
 delivery_reads_paused = _delivery_reads_paused
 delivery_circuit_open = _delivery_circuit_open
@@ -469,6 +499,7 @@ def init(pipeline: str):
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
+    global flush_phase_seconds, flush_retry_attempts_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
     global delivery_circuit_open, delivery_circuit_opens_total, delivery_flush_deadlines_total
     global poll_cycle_timeboxed_total
@@ -488,6 +519,8 @@ def init(pipeline: str):
     delivery_buffer_bytes = _AutoPipelineLabels(_delivery_buffer_bytes, pipeline)
     delivery_flushes_total = _AutoPipelineLabels(_delivery_flushes_total, pipeline)
     delivery_flush_seconds = _AutoPipelineLabels(_delivery_flush_seconds, pipeline)
+    flush_phase_seconds = _AutoPipelineLabels(_flush_phase_seconds, pipeline)
+    flush_retry_attempts_total = _AutoPipelineLabels(_flush_retry_attempts_total, pipeline)
     delivery_buffers_dropped_total = _AutoPipelineLabels(_delivery_buffers_dropped_total, pipeline)
     delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
     delivery_circuit_open = _AutoPipelineLabels(_delivery_circuit_open, pipeline)

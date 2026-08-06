@@ -533,6 +533,21 @@ class DeliveryConfig:
     # success or re-opens it with the next backoff step on failure.
     flush_circuit_failures: int = 3
     flush_circuit_max_seconds: float = 900.0
+    # Diagnostic: time the cheapest possible catalog read (max snapshot id
+    # off the ducklake metadata store) on the SAME connection immediately
+    # before the destination write, reported as the `probe` flush phase.
+    #
+    # WHY it discriminates: pyducklake's Table.append() is one
+    # `INSERT INTO <ducklake table> SELECT * FROM <arrow>`, so parquet
+    # encode, the S3 PUT and the catalog commit are a single opaque call.
+    # If the probe is slow exactly when append is slow, the stall is
+    # catalog-metadata reads (the metadata Postgres), not object storage.
+    # If append is slow while the probe stays fast, it isn't the catalog.
+    #
+    # Costs one extra round-trip to the metadata store per flush, which is
+    # why it is opt-in rather than always on — it is the only catalog work
+    # this instrumentation adds.
+    flush_probe_enabled: bool = False
 
     def __post_init__(self):
         if self.workers < 1:
@@ -770,6 +785,10 @@ class ViaduckConfig:
             self.delivery.flush_circuit_failures,
             self.delivery.flush_circuit_max_seconds,
         )
+        log.info(
+            "config: delivery.flush_probe_enabled=%s",
+            self.delivery.flush_probe_enabled,
+        )
 
         log.info("config: server.port=%d", self.server.port)
         log.info("config: web.enabled=%s", self.web.enabled)
@@ -984,6 +1003,7 @@ def load(path: str | Path) -> ViaduckConfig:
             delivery_raw.get("flush_circuit_failures", 3), "delivery.flush_circuit_failures"
         ),
         flush_circuit_max_seconds=float(delivery_raw.get("flush_circuit_max_seconds", 900.0)),
+        flush_probe_enabled=bool(delivery_raw.get("flush_probe_enabled", False)),
     )
 
     inst_raw = raw.get("instance", {})

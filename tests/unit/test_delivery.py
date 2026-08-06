@@ -4,6 +4,8 @@ BufferRead, FlushStart, FlushCommit, FlushFail."""
 
 from __future__ import annotations
 
+import logging
+import re
 import threading
 import time as _time_mod
 from unittest.mock import MagicMock, patch
@@ -42,7 +44,7 @@ def _recording_flush(mgr):
     in-flight guard contract (the real _flush's finally block)."""
     calls = []
 
-    def _fake(dest, tables, through, trigger):
+    def _fake(dest, tables, through, trigger, phases=None):
         calls.append((dest, tables, through, trigger))
         with mgr._lock:
             mgr._inflight.discard(dest)
@@ -179,7 +181,7 @@ def test_no_second_flush_while_in_flight_and_swap_keeps_buffering():
     started = threading.Event()
     seen = []
 
-    def slow_flush(dest, tables, through, trigger):
+    def slow_flush(dest, tables, through, trigger, phases=None):
         seen.append((sum(t.num_rows for t in tables), through))
         started.set()
         release.wait(5)
@@ -279,7 +281,7 @@ def test_full_cdc_flush_concats_buffered_reads():
     mgr, _, _ = _manager(flush_interval_seconds=0.0, mode="full_cdc", key_columns=["value"])
     captured = {}
 
-    def fake_apply(pool, dest, batch, key_columns, stop_event=None, deadline=None):
+    def fake_apply(pool, dest, batch, key_columns, stop_event=None, deadline=None, phases=None):
         captured["rows"] = batch.num_rows
         return batch.num_rows
 
@@ -491,7 +493,7 @@ def test_drain_second_pass_flushes_rows_buffered_during_inflight_flush():
     release = threading.Event()
     flushed_batches = []
 
-    def slow_apply(pool, dest, batch, stop_event=None, deadline=None):
+    def slow_apply(pool, dest, batch, stop_event=None, deadline=None, phases=None):
         flushed_batches.append(batch.num_rows)
         if len(flushed_batches) == 1:
             release.wait(5)
@@ -517,7 +519,7 @@ def test_watermark_counts_inflight_bytes():
     mgr, _, _ = _manager(buffer_total_max_bytes=1, flush_interval_seconds=3600.0)
     release = threading.Event()
 
-    def slow_apply(pool, dest, batch, stop_event=None, deadline=None):
+    def slow_apply(pool, dest, batch, stop_event=None, deadline=None, phases=None):
         release.wait(5)
         return batch.num_rows
 
@@ -1730,3 +1732,108 @@ def test_startup_warn_counts_assigned_overrides_only(caplog):
     msg = warn.getMessage()
     assert "6000" in msg  # cap_sum = 5000 (d1 override) + 1000 (d2 default)
     assert "(1 override(s) + default 1000 x 1)" in msg
+
+
+# ---------------------------------------------------------------------------
+# Per-flush phase timing (see viaduck/phases.py and tests/unit/test_phases.py)
+# ---------------------------------------------------------------------------
+
+
+def test_flush_log_line_carries_the_phase_breakdown(caplog):
+    """The pre-instrumentation prefix — through the duration — must survive
+    byte-for-byte; dashboards and humans parse it."""
+    mgr, _, _ = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+    with patch("viaduck.delivery.append_only", return_value=4):
+        with caplog.at_level(logging.INFO, logger="viaduck.delivery"):
+            mgr.buffer("d1", _table(4), 7)
+            mgr.maybe_flush()
+            assert mgr.wait_idle()
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Flushed d1"))
+    assert re.match(
+        r"^Flushed d1: 4 ops through snapshot 7 \(trigger=\w+, \d+\.\d\ds: "
+        r"queue=\d+\.\d acquire=\d+\.\d append=\d+\.\d cursor=\d+\.\d\)$",
+        line,
+    ), line
+
+
+def test_flush_log_line_shows_probe_when_enabled(caplog):
+    mgr, _, _ = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0, flush_probe_enabled=True)
+    with patch("viaduck.delivery.append_only", return_value=4):
+        with caplog.at_level(logging.INFO, logger="viaduck.delivery"):
+            mgr.buffer("d1", _table(4), 7)
+            mgr.maybe_flush()
+            assert mgr.wait_idle()
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Flushed d1"))
+    assert "probe=" in line
+
+
+def test_flush_phases_are_passed_down_and_sum_to_the_reported_duration():
+    """The acceptance property: everything the flush spent time on lands in
+    a named phase. The apply call is faked, so `append` is attributed by
+    the real apply-path wiring only in test_phases.py — here the point is
+    that cursor_persist plus the apply call account for the duration."""
+    mgr, _, _ = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+    seen = {}
+
+    def fake_apply(pool, dest, batch, stop_event=None, deadline=None, phases=None):
+        # Stand in for the apply path's own phase recording.
+        phases.add("append", 0.05)
+        phases.attempts = 1
+        seen["phases"] = phases
+        return 4
+
+    with patch("viaduck.delivery.append_only", side_effect=fake_apply):
+        with patch.object(mgr, "_adapt_flush_target"):
+            mgr.buffer("d1", _table(4), 7)
+            mgr.maybe_flush()
+            assert mgr.wait_idle()
+
+    phases = seen["phases"]
+    assert phases.get("cursor_persist") > 0.0
+    assert phases.accounted() >= 0.05
+
+
+def test_queue_wait_is_measured_from_submit_not_worker_start():
+    """A flush that sat behind a busy worker pool must report the wait —
+    the whole reason the timer is built by the submitting thread."""
+    mgr, _, _ = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+    captured = []
+
+    def slow_pickup(dest, tables, through, trigger, phases=None):
+        _time_mod.sleep(0.05)
+        phases.start()
+        captured.append(phases)
+        with mgr._lock:
+            mgr._inflight.discard(dest)
+
+    with patch.object(mgr, "_flush", side_effect=slow_pickup):
+        mgr.buffer("d1", _table(4), 7)
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+
+    assert captured[0].get("queue_wait") >= 0.05
+
+
+def test_failed_flush_still_reports_its_phases(caplog):
+    """A flush that burned its retry budget is the most expensive thing a
+    worker does; leaving it out would hide the pathology."""
+    mgr, _, _ = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+    with patch("viaduck.delivery.append_only", side_effect=RuntimeError("dest down")):
+        with patch.object(metrics, "flush_phase_seconds") as hist:
+            with caplog.at_level(logging.ERROR, logger="viaduck.delivery"):
+                mgr.buffer("d1", _table(4), 7)
+                mgr.maybe_flush()
+                assert mgr.wait_idle()
+    assert hist.labels.called
+    assert any("Flush failed for destination d1 after" in r.getMessage() for r in caplog.records)
+
+
+def test_position_only_persist_records_no_phase_samples():
+    """Idle cursor persists never touch a destination; counting them would
+    dilute every phase series with zeros."""
+    mgr, _, _ = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+    mgr.advance_position("d1", 9)
+    with patch.object(metrics, "flush_phase_seconds") as hist:
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+    hist.labels.assert_not_called()
