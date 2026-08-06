@@ -219,6 +219,11 @@ _poll_cycle_timeboxed_total = Counter(
     "Poll cycles that hit the cycle time budget with cursor groups deferred to the next cycle",
     ["pipeline"],
 )
+_cdc_snapshots_skipped_total = Counter(
+    "viaduck_cdc_snapshots_skipped_total",
+    "Source snapshots fast-forwarded by the skip-scan probe (no changes to the CDC table) without a CDC read",
+    ["pipeline"],
+)
 _destination_lifecycle_state = Gauge(
     "viaduck_destination_lifecycle_state",
     "1 for the destination's current lifecycle state (active|paused|draining|retired); see viaduck/lifecycle.py",
@@ -415,6 +420,7 @@ delivery_circuit_open = _delivery_circuit_open
 delivery_circuit_opens_total = _delivery_circuit_opens_total
 delivery_flush_deadlines_total = _delivery_flush_deadlines_total
 poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total
+cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
 retention_clamp_total = _retention_clamp_total
@@ -451,7 +457,7 @@ def set_destination_lifecycle(dest_id: str, state: str, all_states) -> None:
 
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
-    global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id
+    global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id, cdc_snapshots_skipped_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
     global dest_time_lag_seconds, dest_flush_target_bytes
     global unrouted_rows_total
@@ -523,6 +529,7 @@ def init(pipeline: str):
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
     poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total.labels(pipeline=pipeline)
+    cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
     source_snapshot_id = _source_snapshot_id.labels(pipeline=pipeline)
