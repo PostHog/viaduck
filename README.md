@@ -28,7 +28,7 @@ Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* an
 - LRU connection pool for high fanout (local bench: ~43 destinations/s flat through 1000 destinations)
 - Persistent cursor tracking on plain Postgres
 - Horizontal scaling via hash or explicit destination partitioning
-- 34 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
+- 43 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
 - At-least-once delivery with documented failure modes
 - [TLA+ formally verified](tla/Viaduck.tla): 7 safety invariants checked across 19.9M states with NO crash conditioning — eventual consistency, phantom-freedom, no-data-loss, partition correctness, and buffer boundedness all hold through every modeled crash and failure window
 
@@ -441,14 +441,18 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `lagging` | CDC reads are behind the source — data exists that viaduck has not yet read |
 | `error` | The last flush failed; the buffered range was dropped and will be re-read (see Error states) |
 
-34 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
+43 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `viaduck_polls_total` | Counter | — | Poll cycles executed |
+| `viaduck_poll_cycle_seconds` | Histogram | — | Wall time of a poll cycle (source metadata, CDC reads, routing, buffering, flush submission) |
+| `viaduck_poll_cursor_groups_deferred_total` | Counter | — | Cursor groups deferred by the poll cycle's time budget |
 | `viaduck_cdc_read_seconds` | Histogram | — | Time to read CDC from source |
+| `viaduck_cdc_read_phase_seconds` | Histogram | phase | Time in one CDC-read phase: `changeset` (DuckLake's query) vs `to_arrow` (materializing it) |
 | `viaduck_cdc_rows_read_total` | Counter | — | Total rows read from source |
 | `viaduck_cdc_batch_rows` | Histogram | — | Rows per CDC read (monitors batch sizes; large values indicate poll interval too slow) |
+| `viaduck_cdc_batch_bytes` | Histogram | — | Arrow bytes per raw CDC read (pairs with `cdc_batch_rows` to show payload width) |
 | `viaduck_source_snapshot_id` | Gauge | — | Current source snapshot ID |
 | `viaduck_dest_write_seconds` | Histogram | destination | Time per destination write |
 | `viaduck_dest_rows_written_total` | Counter | destination | Rows appended (append-only mode) |
@@ -468,6 +472,11 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_delivery_flush_seconds` | Histogram | destination | Flush duration (data flushes only) |
 | `viaduck_flush_phase_seconds` | Histogram | destination, phase | Wall time of one phase of a flush — see [Flush phase attribution](#flush-phase-attribution) |
 | `viaduck_flush_retry_attempts_total` | Counter | destination | Write attempts used per flush (1 when the first attempt succeeds) |
+| `viaduck_delivery_flush_input_rows` | Histogram | destination | Rows in a flush's input batch, before conflict resolution or projection |
+| `viaduck_delivery_flush_input_bytes` | Histogram | destination | Arrow bytes in a flush's input batch, before conflict resolution or projection |
+| `viaduck_destination_cdc_chunk_rows` | Histogram | destination | Rows in a routed CDC chunk accepted into a destination's buffer |
+| `viaduck_destination_cdc_chunk_bytes` | Histogram | destination | Arrow bytes in a routed CDC chunk accepted into a destination's buffer |
+| `viaduck_destination_last_cdc_read_timestamp_seconds` | Gauge | destination | Unix time of the most recent CDC read buffered or cursor-advanced for a destination |
 | `viaduck_delivery_buffers_dropped_total` | Counter | destination | Buffers dropped on flush failure |
 | `viaduck_cdc_routing_mutations_total` | Counter | — | Cross-tenant routing value changes |
 | `viaduck_cdc_conflicts_resolved_total` | Counter | — | Rowid-level conflicts resolved in Phase 2 |

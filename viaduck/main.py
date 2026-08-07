@@ -1426,6 +1426,7 @@ def _poll_cycle(
 
                         try:
                             metrics.cdc_batch_rows.observe(raw_data.num_rows)
+                            metrics.cdc_batch_bytes.observe(raw_data.nbytes)
                         except Exception:
                             log.warning("Failed to record CDC batch size metric")
 
@@ -1473,6 +1474,8 @@ def _poll_cycle(
                             dest_id = rv_to_dest[routing_val]
                             routed_dest_ids.add(dest_id)
                             if batch.num_rows > 0:
+                                # Chunk-shape metrics are recorded inside
+                                # buffer(), past the epoch guard — see there.
                                 delivery.buffer(dest_id, batch, chunk_end, epoch=epochs[dest_id])
                         for did in readable:
                             if did not in routed_dest_ids:
@@ -1525,6 +1528,7 @@ def _poll_cycle(
             if timeboxed:
                 deferred = len(ordered_groups) - groups_completed
                 metrics.poll_cycle_timeboxed_total.inc()
+                metrics.poll_cursor_groups_deferred_total.inc(deferred)
                 log.info(
                     "Poll cycle time-boxed after %.1fs (budget %.1fs): %d cursor group(s) deferred to next cycle",
                     time.monotonic() - cycle_t0,
@@ -1596,6 +1600,7 @@ def _poll_cycle(
     # Per-cycle summary log. Quiet for empty cycles (no work) so steady-state
     # idleness doesn't flood the log; verbose when there's work to report.
     cycle_secs = time.monotonic() - cycle_t0
+    metrics.poll_cycle_seconds.observe(cycle_secs)
     if cycle_groups_processed > 0 or cycle_rows_read > 0 or flushes_submitted > 0:
         max_lag = max(((snap_now - delivery_snapshot[did].flushed_snapshot) for did in status_ids), default=0)
         buffered_rows = sum(delivery_snapshot[did].buffer_rows for did in status_ids)

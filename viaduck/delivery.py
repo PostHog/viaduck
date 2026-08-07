@@ -459,6 +459,15 @@ class DeliveryManager:
             metrics.delivery_buffer_rows.labels(destination=dest_id).set(buf.rows)
             metrics.delivery_buffer_bytes.labels(destination=dest_id).set(buf.bytes)
             metrics.delivery_buffer_total_bytes.set(self._total_bytes_locked())
+            # Chunk shape and the read timestamp are both recorded only after
+            # the epoch guard accepts the batch. Observing them at the call
+            # site in _poll_cycle would count reads this method then discards
+            # — and since a discarded range is re-read, the same rows would
+            # land in the histogram twice while the timestamp claimed a read
+            # that never reached a buffer.
+            metrics.destination_cdc_chunk_rows.labels(destination=dest_id).observe(table.num_rows)
+            metrics.destination_cdc_chunk_bytes.labels(destination=dest_id).observe(table.nbytes)
+            metrics.destination_last_cdc_read_timestamp_seconds.labels(destination=dest_id).set(time.time())
 
     def advance_position(self, dest_id: str, through_snapshot: int, epoch: int | None = None) -> None:
         """Advance the read position with no data (empty range for this
@@ -471,6 +480,7 @@ class DeliveryManager:
                 self._position[dest_id] = through_snapshot
                 if self._position_dirty_since[dest_id] is None:
                     self._position_dirty_since[dest_id] = time.monotonic()
+                metrics.destination_last_cdc_read_timestamp_seconds.labels(destination=dest_id).set(time.time())
 
     def _cap_for_locked(self, dest_id: str) -> int:
         """Effective queue cap for a destination: explicit override wins,
@@ -841,6 +851,13 @@ class DeliveryManager:
         phases.start()
         t0 = time.monotonic()
         batch_bytes = sum(t.nbytes for t in tables)
+        if tables:
+            # Input shape is observed before resolution/projection. This is
+            # the exact batch whose phase timings are emitted below, and
+            # lets dashboards identify a payload-width or batch-size cliff
+            # without putting size into a Prometheus label.
+            metrics.delivery_flush_input_rows.labels(destination=dest_id).observe(sum(t.num_rows for t in tables))
+            metrics.delivery_flush_input_bytes.labels(destination=dest_id).observe(batch_bytes)
         deadline = t0 + self._flush_deadline_s if self._flush_deadline_s is not None else None
         circuit_was_open = False
         # apply_done tracks whether the destination-write phase completed (or

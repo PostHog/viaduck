@@ -1793,6 +1793,24 @@ def test_flush_phases_are_passed_down_and_sum_to_the_reported_duration():
     assert phases.accounted() >= 0.05
 
 
+def test_flush_input_shape_metrics_describe_the_batch_timed_by_phases():
+    mgr, _, _ = _manager(cursors={"d1": 2}, flush_interval_seconds=0.0)
+    batch = _table(4)
+    with (
+        patch("viaduck.delivery.append_only", return_value=4),
+        patch.object(metrics, "delivery_flush_input_rows") as rows_hist,
+        patch.object(metrics, "delivery_flush_input_bytes") as bytes_hist,
+    ):
+        mgr.buffer("d1", batch, 7)
+        mgr.maybe_flush()
+        assert mgr.wait_idle()
+
+    rows_hist.labels.assert_called_once_with(destination="d1")
+    rows_hist.labels.return_value.observe.assert_called_once_with(4)
+    bytes_hist.labels.assert_called_once_with(destination="d1")
+    bytes_hist.labels.return_value.observe.assert_called_once_with(batch.nbytes)
+
+
 def test_queue_wait_is_measured_from_submit_not_worker_start():
     """A flush that sat behind a busy worker pool must report the wait —
     the whole reason the timer is built by the submitting thread."""
@@ -1874,3 +1892,27 @@ def test_queue_wait_excludes_earlier_destinations_swap_work():
     # instead track the loop's own progress: >= one slow_trigger apart.
     assert ordered[1] - ordered[0] >= 0.02, stamps
     assert ordered[2] - ordered[1] >= 0.02, stamps
+
+
+def test_chunk_shape_metrics_skip_a_read_the_epoch_guard_discards():
+    """A stale read is dropped and its range re-read, so observing chunk
+    shape at the call site would count the same rows twice and stamp a read
+    timestamp for a batch that never reached a buffer."""
+    mgr, _, _ = _manager(cursors={"d1": 2})
+    with (
+        patch.object(metrics, "destination_cdc_chunk_rows") as rows_hist,
+        patch.object(metrics, "destination_cdc_chunk_bytes") as bytes_hist,
+        patch.object(metrics, "destination_last_cdc_read_timestamp_seconds") as ts_gauge,
+    ):
+        mgr.buffer("d1", _table(4), 7, epoch=0)
+        assert rows_hist.labels.call_count == 1
+        assert ts_gauge.labels.call_count == 1
+
+        with mgr._lock:
+            mgr._epoch["d1"] += 1  # a flush failure reset the position mid-read
+        mgr.buffer("d1", _table(4), 9, epoch=0)
+
+    # Still one: the stale read recorded nothing.
+    assert rows_hist.labels.call_count == 1
+    assert bytes_hist.labels.call_count == 1
+    assert ts_gauge.labels.call_count == 1

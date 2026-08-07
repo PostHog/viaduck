@@ -2588,8 +2588,10 @@ def test_apply_changes_upsert_matched_nonzero():
     assert counts["upsert_matched"] == 3
 
 
-def test_cdc_batch_rows_metric_observed():
-    """cdc_batch_rows histogram should be observed with raw CDC row count."""
+def test_cdc_batch_shape_metrics_observed():
+    """The raw source-read shape is observed here. The per-destination chunk
+    shape is NOT — it is recorded inside delivery.buffer(), past the epoch
+    guard, so discarded reads don't inflate it (see test_delivery.py)."""
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
 
@@ -2602,6 +2604,7 @@ def test_cdc_batch_rows_metric_observed():
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc", return_value=arrow_data),
         patch("viaduck.main.metrics.cdc_batch_rows") as mock_batch_metric,
+        patch("viaduck.main.metrics.cdc_batch_bytes") as mock_batch_bytes,
     ):
         _poll_cycle(
             MagicMock(),
@@ -2616,6 +2619,7 @@ def test_cdc_batch_rows_metric_observed():
         )
 
     mock_batch_metric.observe.assert_called_once_with(3)
+    mock_batch_bytes.observe.assert_called_once_with(arrow_data.nbytes)
 
 
 # ---------------------------------------------------------------------------

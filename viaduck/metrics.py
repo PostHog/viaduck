@@ -18,6 +18,37 @@ class _AutoPipelineLabels:
         self._metric.remove(self._pipeline, *label_values)
 
 
+# --- Shared bucket sets ---
+#
+# Named rather than repeated inline: several histograms measure the same
+# physical quantity (a duration, a row count, an Arrow payload size) and are
+# routinely compared against each other — a read-side batch against the
+# flush-side batch it turns into, a CDC-read phase against a flush phase.
+# Divergent bucket edges would make those comparisons quietly wrong.
+
+# Durations that can span "instant" to "the retry budget ran out". Default
+# prometheus_client buckets top out at 10s, which collapses every slow flush
+# and every stalled CDC read into +Inf.
+_LATENCY_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+# Row counts, from a trickle poll to a full catch-up batch.
+_ROW_COUNT_BUCKETS = (100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, 10000000)
+# Arrow payload sizes, 1 KiB to 4 GiB. The top edges matter: the buffer caps
+# and the adaptive flush target are both expressed in bytes, so a batch at
+# the cap must land in a bucket rather than in the overflow.
+_BYTE_SIZE_BUCKETS = (
+    1024,
+    16384,
+    262144,
+    1048576,
+    8388608,
+    33554432,
+    134217728,
+    536870912,
+    1073741824,
+    2147483648,
+    4294967296,
+)
+
 # --- Raw metric definitions (with pipeline as first label) ---
 
 _polls_total = Counter(
@@ -30,6 +61,12 @@ _cdc_read_seconds = Histogram(
     "Time to read CDC insertions from source",
     ["pipeline"],
 )
+_cdc_read_phase_seconds = Histogram(
+    "viaduck_cdc_read_phase_seconds",
+    "Time in one source CDC-read phase (changeset = DuckLake's opaque query; to_arrow materializes its result)",
+    ["pipeline", "phase"],
+    buckets=_LATENCY_BUCKETS,
+)
 _cdc_rows_read_total = Counter(
     "viaduck_cdc_rows_read_total",
     "Total rows read from source via CDC",
@@ -38,6 +75,17 @@ _cdc_rows_read_total = Counter(
 _source_snapshot_id = Gauge(
     "viaduck_source_snapshot_id",
     "Current source snapshot ID",
+    ["pipeline"],
+)
+_poll_cycle_seconds = Histogram(
+    "viaduck_poll_cycle_seconds",
+    "Wall time of a poll cycle: source metadata, CDC reads, routing, buffering and flush submission",
+    ["pipeline"],
+    buckets=_LATENCY_BUCKETS,
+)
+_poll_cursor_groups_deferred_total = Counter(
+    "viaduck_poll_cursor_groups_deferred_total",
+    "Cursor groups deferred because a poll cycle exhausted its time budget",
     ["pipeline"],
 )
 
@@ -130,7 +178,25 @@ _cdc_batch_rows = Histogram(
     "viaduck_cdc_batch_rows",
     "Number of rows per CDC read from source",
     ["pipeline"],
-    buckets=[100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, 10000000],
+    buckets=_ROW_COUNT_BUCKETS,
+)
+_cdc_batch_bytes = Histogram(
+    "viaduck_cdc_batch_bytes",
+    "Arrow bytes per raw CDC read from source",
+    ["pipeline"],
+    buckets=_BYTE_SIZE_BUCKETS,
+)
+_destination_cdc_chunk_rows = Histogram(
+    "viaduck_destination_cdc_chunk_rows",
+    "Rows in a routed CDC chunk buffered for one destination",
+    ["pipeline", "destination"],
+    buckets=_ROW_COUNT_BUCKETS,
+)
+_destination_cdc_chunk_bytes = Histogram(
+    "viaduck_destination_cdc_chunk_bytes",
+    "Arrow bytes in a routed CDC chunk buffered for one destination",
+    ["pipeline", "destination"],
+    buckets=_BYTE_SIZE_BUCKETS,
 )
 _dest_rows_deleted_total = Counter(
     "viaduck_dest_rows_deleted_total",
@@ -194,29 +260,47 @@ _delivery_flush_seconds = Histogram(
     ["pipeline", "destination"],
     buckets=_WRITE_LATENCY_BUCKETS,
 )
-# Phase attribution for a single flush. Same bucket span as the flush/write
-# latency histograms (a phase can eat the whole flush — that's the point) but
-# with a 2.5s edge instead of 2s: the fast-flush population clusters just
-# under 20s, and the extra resolution low down separates "trivial" from
-# "small but real" phases when comparing a fast flush to a slow one.
+# Deliberately NOT labelled by trigger, though the trigger is known here.
+# Two reasons, both about the destination label being the expensive one:
+# viaduck is built for 100s-1000s of destinations, and a trigger label
+# multiplies every destination's series by the trigger count; and
+# remove_destination_series() can only drop a child when it can name every
+# label value, so a trigger-labelled series would outlive the retired tenant
+# forever. `delivery_flushes_total{trigger}` already carries the trigger mix.
+_delivery_flush_input_rows = Histogram(
+    "viaduck_delivery_flush_input_rows",
+    "Rows in the input batch of a destination flush, before conflict resolution or schema projection",
+    ["pipeline", "destination"],
+    buckets=_ROW_COUNT_BUCKETS,
+)
+_delivery_flush_input_bytes = Histogram(
+    "viaduck_delivery_flush_input_bytes",
+    "Arrow bytes in the input batch of a destination flush, before conflict resolution or schema projection",
+    ["pipeline", "destination"],
+    buckets=_BYTE_SIZE_BUCKETS,
+)
+# Phase attribution for a single flush. On _LATENCY_BUCKETS, shared with the
+# CDC-read phases and the poll cycle so a read-side phase and a flush-side
+# phase can be compared bucket-for-bucket. It differs from
+# _WRITE_LATENCY_BUCKETS only at one edge (2.5s vs 2s), which is deliberate:
+# the fast-flush population clusters just under 20s, and the extra resolution
+# low down separates "trivial" from "small but real" phases.
 #
-# `phase` splits into partition phases (queue_wait, acquire, probe,
+# `phase` splits into partition phases (queue_wait, acquire, resolve, probe,
 # projection, append, retry_backoff, cursor_persist — these tile the flush
-# and may be summed) and nested phases (cold_attach subdivides acquire;
-# append_meta/append_write/append_commit subdivide append). Summing a nested
-# phase into the top-level total double-counts. See viaduck/phases.py.
-_PHASE_LATENCY_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
-
+# and may be summed) and nested phases (cold_attach subdivides acquire).
+# Summing a nested phase into the top-level total double-counts. See
+# viaduck/phases.py.
 _flush_phase_seconds = Histogram(
     "viaduck_flush_phase_seconds",
     "Wall time of one phase of a destination flush (see viaduck/phases.py for the phase vocabulary)",
     ["pipeline", "destination", "phase"],
-    buckets=_PHASE_LATENCY_BUCKETS,
+    buckets=_LATENCY_BUCKETS,
 )
 # Distinct from dest_write_retries_total, which counts RETRIES inside
 # apply._write_with_retry: this counts ATTEMPTS used per flush (>= 1 for
-# every data flush), so `rate(flush_retry_attempts_total) /
-# rate(delivery_flushes_total)` reads directly as mean attempts per flush.
+# every data flush). Pair it with flush_phase_seconds_count{phase="acquire"},
+# NOT delivery_flushes_total — see the README's phase-attribution section.
 _flush_retry_attempts_total = Counter(
     "viaduck_flush_retry_attempts_total",
     "Write attempts used per destination flush (1 when the first attempt succeeds)",
@@ -246,6 +330,11 @@ _poll_cycle_timeboxed_total = Counter(
     "viaduck_poll_cycle_timeboxed_total",
     "Poll cycles that hit the cycle time budget with cursor groups deferred to the next cycle",
     ["pipeline"],
+)
+_destination_last_cdc_read_timestamp_seconds = Gauge(
+    "viaduck_destination_last_cdc_read_timestamp_seconds",
+    "Unix timestamp of the most recent successfully buffered or cursor-advanced CDC read for a destination",
+    ["pipeline", "destination"],
 )
 _cdc_snapshots_skipped_total = Counter(
     "viaduck_cdc_snapshots_skipped_total",
@@ -409,7 +498,10 @@ _projection_cast_null_fallback_total = Counter(
 # --- Public names (replaced by init() with pipeline-bound instances) ---
 
 polls_total = _polls_total
+poll_cycle_seconds = _poll_cycle_seconds
+poll_cursor_groups_deferred_total = _poll_cursor_groups_deferred_total
 cdc_read_seconds = _cdc_read_seconds
+cdc_read_phase_seconds = _cdc_read_phase_seconds
 cdc_rows_read_total = _cdc_rows_read_total
 source_snapshot_id = _source_snapshot_id
 
@@ -429,6 +521,9 @@ pool_creates_total = _pool_creates_total
 errors_total = _errors_total
 
 cdc_batch_rows = _cdc_batch_rows
+cdc_batch_bytes = _cdc_batch_bytes
+destination_cdc_chunk_rows = _destination_cdc_chunk_rows
+destination_cdc_chunk_bytes = _destination_cdc_chunk_bytes
 dest_rows_deleted_total = _dest_rows_deleted_total
 dest_rows_upserted_total = _dest_rows_upserted_total
 dest_upsert_matched_total = _dest_upsert_matched_total
@@ -442,6 +537,8 @@ delivery_buffer_bytes = _delivery_buffer_bytes
 delivery_buffer_total_bytes = _delivery_buffer_total_bytes
 delivery_flushes_total = _delivery_flushes_total
 delivery_flush_seconds = _delivery_flush_seconds
+delivery_flush_input_rows = _delivery_flush_input_rows
+delivery_flush_input_bytes = _delivery_flush_input_bytes
 flush_phase_seconds = _flush_phase_seconds
 flush_retry_attempts_total = _flush_retry_attempts_total
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
@@ -450,6 +547,7 @@ delivery_circuit_open = _delivery_circuit_open
 delivery_circuit_opens_total = _delivery_circuit_opens_total
 delivery_flush_deadlines_total = _delivery_flush_deadlines_total
 poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total
+destination_last_cdc_read_timestamp_seconds = _destination_last_cdc_read_timestamp_seconds
 cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
@@ -487,22 +585,29 @@ def set_destination_lifecycle(dest_id: str, state: str, all_states) -> None:
 
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
-    global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id, cdc_snapshots_skipped_total
+    global polls_total, poll_cycle_seconds, poll_cursor_groups_deferred_total
+    global \
+        cdc_read_seconds, \
+        cdc_read_phase_seconds, \
+        cdc_rows_read_total, \
+        source_snapshot_id, \
+        cdc_snapshots_skipped_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
     global dest_time_lag_seconds, dest_flush_target_bytes
     global unrouted_rows_total
     global pool_open_connections, pool_evictions_total, pool_creates_total
     global errors_total
-    global cdc_batch_rows
+    global cdc_batch_rows, cdc_batch_bytes, destination_cdc_chunk_rows, destination_cdc_chunk_bytes
     global dest_rows_deleted_total, dest_rows_upserted_total, dest_upsert_matched_total
     global cdc_routing_mutations_total, cdc_conflicts_resolved_total, cdc_orphaned_preimages_total
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
-    global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
+    global delivery_flushes_total, delivery_flush_seconds, delivery_flush_input_rows, delivery_flush_input_bytes
+    global delivery_buffers_dropped_total
     global flush_phase_seconds, flush_retry_attempts_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
     global delivery_circuit_open, delivery_circuit_opens_total, delivery_flush_deadlines_total
-    global poll_cycle_timeboxed_total
+    global poll_cycle_timeboxed_total, destination_last_cdc_read_timestamp_seconds
     global retention_clamp_total, secret_cache_stale_fallback_total
     global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
     global discovery_poll_failures_total, discovery_broken_entries_total
@@ -519,6 +624,8 @@ def init(pipeline: str):
     delivery_buffer_bytes = _AutoPipelineLabels(_delivery_buffer_bytes, pipeline)
     delivery_flushes_total = _AutoPipelineLabels(_delivery_flushes_total, pipeline)
     delivery_flush_seconds = _AutoPipelineLabels(_delivery_flush_seconds, pipeline)
+    delivery_flush_input_rows = _AutoPipelineLabels(_delivery_flush_input_rows, pipeline)
+    delivery_flush_input_bytes = _AutoPipelineLabels(_delivery_flush_input_bytes, pipeline)
     flush_phase_seconds = _AutoPipelineLabels(_flush_phase_seconds, pipeline)
     flush_retry_attempts_total = _AutoPipelineLabels(_flush_retry_attempts_total, pipeline)
     delivery_buffers_dropped_total = _AutoPipelineLabels(_delivery_buffers_dropped_total, pipeline)
@@ -526,6 +633,11 @@ def init(pipeline: str):
     delivery_circuit_open = _AutoPipelineLabels(_delivery_circuit_open, pipeline)
     delivery_circuit_opens_total = _AutoPipelineLabels(_delivery_circuit_opens_total, pipeline)
     delivery_flush_deadlines_total = _AutoPipelineLabels(_delivery_flush_deadlines_total, pipeline)
+    destination_last_cdc_read_timestamp_seconds = _AutoPipelineLabels(
+        _destination_last_cdc_read_timestamp_seconds, pipeline
+    )
+    destination_cdc_chunk_rows = _AutoPipelineLabels(_destination_cdc_chunk_rows, pipeline)
+    destination_cdc_chunk_bytes = _AutoPipelineLabels(_destination_cdc_chunk_bytes, pipeline)
     destination_lifecycle_state = _AutoPipelineLabels(_destination_lifecycle_state, pipeline)
     lifecycle_discarded_rows_total = _AutoPipelineLabels(_lifecycle_discarded_rows_total, pipeline)
     retention_clamp_total = _AutoPipelineLabels(_retention_clamp_total, pipeline)
@@ -561,9 +673,12 @@ def init(pipeline: str):
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
+    poll_cycle_seconds = _poll_cycle_seconds.labels(pipeline=pipeline)
+    poll_cursor_groups_deferred_total = _poll_cursor_groups_deferred_total.labels(pipeline=pipeline)
     poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total.labels(pipeline=pipeline)
     cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
+    cdc_read_phase_seconds = _AutoPipelineLabels(_cdc_read_phase_seconds, pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
     source_snapshot_id = _source_snapshot_id.labels(pipeline=pipeline)
     delivery_buffer_total_bytes = _delivery_buffer_total_bytes.labels(pipeline=pipeline)
@@ -572,6 +687,7 @@ def init(pipeline: str):
     pool_evictions_total = _pool_evictions_total.labels(pipeline=pipeline)
     pool_creates_total = _pool_creates_total.labels(pipeline=pipeline)
     cdc_batch_rows = _cdc_batch_rows.labels(pipeline=pipeline)
+    cdc_batch_bytes = _cdc_batch_bytes.labels(pipeline=pipeline)
     cdc_routing_mutations_total = _cdc_routing_mutations_total.labels(pipeline=pipeline)
     cdc_conflicts_resolved_total = _cdc_conflicts_resolved_total.labels(pipeline=pipeline)
     cdc_tombstones_emitted_total = _cdc_tombstones_emitted_total.labels(pipeline=pipeline)
@@ -596,11 +712,30 @@ def remove_destination_series(dest_id: str) -> None:
         delivery_circuit_open,
         delivery_circuit_opens_total,
         delivery_flush_deadlines_total,
+        delivery_flush_input_rows,
+        delivery_flush_input_bytes,
+        flush_retry_attempts_total,
+        destination_last_cdc_read_timestamp_seconds,
+        destination_cdc_chunk_rows,
+        destination_cdc_chunk_bytes,
         discovery_stop_countdown,
     )
     for m in per_dest:
         try:
             m.remove(dest_id)
+        except KeyError:
+            pass
+    # flush_phase_seconds carries a third label, and prometheus_client can
+    # only drop a child when every label value is named — a partial remove
+    # raises ValueError (which the loop above deliberately does NOT catch, so
+    # a future 3-label metric added there fails loudly rather than silently
+    # leaking). The phase vocabulary is a closed set, so enumerate it.
+    # Imported inside the function: phases.py imports this module.
+    from viaduck.phases import NESTED_PHASES, PARTITION_PHASES
+
+    for phase in PARTITION_PHASES + NESTED_PHASES:
+        try:
+            flush_phase_seconds.remove(dest_id, phase)
         except KeyError:
             pass
     # Function-level import: lifecycle imports metrics at module top, so a

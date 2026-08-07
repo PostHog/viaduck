@@ -380,8 +380,12 @@ def read_cdc(
     if filter_expr is not None:
         kwargs["filter_expr"] = filter_expr
 
+    phase_t0 = time.monotonic()
     changeset: ChangeSet = table.table_insertions(**kwargs)
+    metrics.cdc_read_phase_seconds.labels(phase="changeset").observe(time.monotonic() - phase_t0)
+    phase_t0 = time.monotonic()
     result = changeset.to_arrow()
+    metrics.cdc_read_phase_seconds.labels(phase="to_arrow").observe(time.monotonic() - phase_t0)
 
     duration = time.monotonic() - t0
     metrics.cdc_read_seconds.observe(duration)
@@ -424,8 +428,12 @@ def read_cdc_changes(
     if filter_expr is not None:
         kwargs["filter_expr"] = filter_expr
 
+    phase_t0 = time.monotonic()
     changeset: ChangeSet = table.table_changes(**kwargs)
+    metrics.cdc_read_phase_seconds.labels(phase="changeset").observe(time.monotonic() - phase_t0)
+    phase_t0 = time.monotonic()
     result = changeset.to_arrow()
+    metrics.cdc_read_phase_seconds.labels(phase="to_arrow").observe(time.monotonic() - phase_t0)
 
     duration = time.monotonic() - t0
     metrics.cdc_read_seconds.observe(duration)
