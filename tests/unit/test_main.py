@@ -962,7 +962,7 @@ def test_poll_cycle_chunks_large_range():
 
     read_calls = []
 
-    def fake_read_cdc(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+    def fake_read_cdc(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
         read_calls.append((after_snapshot, end_snapshot))
         return arrow_data
 
@@ -1003,7 +1003,7 @@ def test_poll_cycle_chunk_end_not_current_id():
     empty = pa.table({"company": pa.array([], type=pa.string())})
     call_count = [0]
 
-    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
         call_count[0] += 1
         return row_a if call_count[0] == 1 else empty
 
@@ -1184,7 +1184,7 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
 
     read_calls: list[tuple[int, int]] = []
 
-    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
         read_calls.append((after_snapshot, end_snapshot))
         return pa.table({"company": pa.array([], type=pa.string())})
 
@@ -1237,7 +1237,7 @@ def test_poll_cycle_stuck_destination_at_cap_does_not_block_healthy_peer():
 
     read_calls: list[tuple[int, int]] = []
 
-    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
         read_calls.append((after_snapshot, end_snapshot))
         return pa.table({"company": pa.array([], type=pa.string())})
 
@@ -1344,7 +1344,7 @@ def test_poll_cycle_lagging_group_cannot_monopolize_reads():
 
     read_calls: list[tuple[int, int]] = []
 
-    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None):
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
         read_calls.append((after_snapshot, end_snapshot))
         return pa.table({"company": pa.array([], type=pa.string())})
 
@@ -2799,7 +2799,7 @@ def test_seed_new_destinations_multiple():
     rows_acme = pa.table({"company": ["acme"], "value": [1]})
     rows_beta = pa.table({"company": ["beta"], "value": [2]})
 
-    def mock_scan(row_filter, snapshot_id=None):
+    def mock_scan(row_filter, selected_fields=("*",), snapshot_id=None):
         scan = MagicMock()
         # EqualTo stores the value — extract it from the filter
         if "acme" in str(row_filter):

@@ -35,6 +35,16 @@ _cdc_rows_read_total = Counter(
     "Total rows read from source via CDC",
     ["pipeline"],
 )
+# Source columns viaduck refuses to replicate because pyducklake cannot
+# represent their DuckDB type (e.g. VARIANT, which also cannot cross the
+# DuckDB→Arrow boundary as of duckdb 1.5.5). Incremented once per excluded
+# column per source-schema load; a nonzero value means the destination is
+# missing columns the source has — deliberate, but worth a dashboard.
+_source_columns_excluded_total = Counter(
+    "viaduck_source_columns_excluded_total",
+    "Source columns excluded from replication due to unrepresentable types",
+    ["pipeline", "column", "type"],
+)
 _source_snapshot_id = Gauge(
     "viaduck_source_snapshot_id",
     "Current source snapshot ID",
@@ -383,6 +393,7 @@ _projection_cast_null_fallback_total = Counter(
 polls_total = _polls_total
 cdc_read_seconds = _cdc_read_seconds
 cdc_rows_read_total = _cdc_rows_read_total
+source_columns_excluded_total = _source_columns_excluded_total
 source_snapshot_id = _source_snapshot_id
 
 dest_write_seconds = _dest_write_seconds
@@ -458,6 +469,7 @@ def set_destination_lifecycle(dest_id: str, state: str, all_states) -> None:
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
     global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id, cdc_snapshots_skipped_total
+    global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
     global dest_time_lag_seconds, dest_flush_target_bytes
     global unrouted_rows_total
@@ -532,6 +544,7 @@ def init(pipeline: str):
     cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
+    source_columns_excluded_total = _AutoPipelineLabels(_source_columns_excluded_total, pipeline)
     source_snapshot_id = _source_snapshot_id.labels(pipeline=pipeline)
     delivery_buffer_total_bytes = _delivery_buffer_total_bytes.labels(pipeline=pipeline)
     unrouted_rows_total = _unrouted_rows_total.labels(pipeline=pipeline)

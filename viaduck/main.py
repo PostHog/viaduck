@@ -435,7 +435,7 @@ def _derive_dest_status(d, snap_now: int, lifecycle_state: str = "active") -> st
     return "healthy"
 
 
-def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
+def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids, source_columns=None):
     """Seed newly added destinations from a source table scan.
 
     For each destination at snapshot_id=0 (just initialized), reads the current
@@ -577,6 +577,9 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids):
             # cursor and the scanned data refer to the same point in time.
             scan = src_table.scan(
                 row_filter=EqualTo(cfg.routing.field, routing_value),
+                # Explicit projection (see run()'s source_columns): unrepresentable
+                # or post-startup source columns must not enter the seed either.
+                selected_fields=source_columns if source_columns is not None else ("*",),
                 snapshot_id=current_id,
             )
             # Stream record batches so peak memory is bounded by DuckDB's
@@ -705,6 +708,12 @@ def run(cfg: config.ViaduckConfig) -> None:
     # Connect to source
     src_catalog = source.connect(cfg.source)
     src_table = source.load_table(src_catalog, cfg.source.table)
+    # Explicit projection for every source read (CDC + seed): pins the
+    # column set to the startup schema — which load_table already filtered
+    # to types pyducklake can represent — so an upstream column added
+    # mid-stream (e.g. millpond's VARIANT dual-write companions) can't
+    # fail reads or destination appends; it stays invisible until restart.
+    source_columns = source.replicated_column_names(src_table)
 
     # Initialize state and destinations. Cursor state lives on plain
     # Postgres (NOT a DuckLake table): a cursor advance must not create
@@ -908,7 +917,7 @@ def run(cfg: config.ViaduckConfig) -> None:
                     "Skipping seed for non-active destination(s) %s; they stay read-gated until a restart seeds them",
                     sorted(seed_pending),
                 )
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, seed_eligible)
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, seed_eligible, source_columns=source_columns)
 
     key_columns = cfg.routing.key_columns
     mode = cfg.routing.mode
@@ -1043,6 +1052,7 @@ def run(cfg: config.ViaduckConfig) -> None:
                 reg_snap.rv_to_dest,
                 key_columns,
                 mode,
+                source_columns=source_columns,
                 read_ids=read_ids,
                 lifecycle_states=tracker.states(),
                 dest_configs=reg_snap.configs,
@@ -1203,6 +1213,7 @@ def _poll_cycle(
     key_columns,
     mode,
     *,
+    source_columns=None,
     read_ids=None,
     lifecycle_states=None,
     dest_configs=None,
@@ -1414,11 +1425,19 @@ def _poll_cycle(
                     try:
                         if full_cdc:
                             raw_data = source.read_cdc_changes(
-                                src_table, after_snapshot=chunk_start, end_snapshot=chunk_end, filter_expr=filter_expr
+                                src_table,
+                                after_snapshot=chunk_start,
+                                end_snapshot=chunk_end,
+                                filter_expr=filter_expr,
+                                columns=source_columns,
                             )
                         else:
                             raw_data = source.read_cdc(
-                                src_table, after_snapshot=chunk_start, end_snapshot=chunk_end, filter_expr=filter_expr
+                                src_table,
+                                after_snapshot=chunk_start,
+                                end_snapshot=chunk_end,
+                                filter_expr=filter_expr,
+                                columns=source_columns,
                             )
 
                         read_elapsed = time.monotonic() - chunk_t0
