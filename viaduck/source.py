@@ -177,9 +177,131 @@ def connect(cfg: SourceConfig) -> Catalog:
     )
 
 
-def load_table(catalog: Catalog, table_name: str) -> Table:
-    """Load the source table. Raises if it doesn't exist."""
-    return catalog.load_table(table_name)
+# Source-column types viaduck deliberately tolerates excluding from
+# replication: they cannot cross the DuckDB→Arrow boundary (so reads would
+# stall) and pyducklake cannot represent them (so load_table would crash).
+# The allowlist is deliberately exact-match and narrow — any OTHER type that
+# fails to parse keeps the old loud startup failure, because a parser edge
+# case must surface as an error an operator resolves, not a silently
+# narrower destination table.
+EXCLUDABLE_SOURCE_TYPES = frozenset({"VARIANT"})
+
+
+def load_table(catalog: Catalog, table_name: str, *, required_columns: tuple[str, ...] = ()) -> Table:
+    """Load the source table, tolerating columns of explicitly excludable types.
+
+    Delegates to pyducklake's loader — the canonical implementation — and only
+    when that raises on an unparseable column type rebuilds the schema by
+    hand, excluding columns whose type is in EXCLUDABLE_SOURCE_TYPES (DuckDB
+    VARIANT being the live example: millpond's dual-write companions, a type
+    that also cannot cross the DuckDB→Arrow boundary as of duckdb 1.5.5).
+    Without this, an upstream column addition becomes a startup
+    CrashLoopBackOff.
+
+    Exclusions are loud (warning + source_columns_excluded_total per column)
+    and guarded: an unparseable type outside the allowlist, an excluded
+    column named in ``required_columns`` (routing/key columns — replication
+    cannot function without them), a kept column whose name embeds a double
+    quote (the forced read projection cannot escape it), or a schema left
+    empty all raise instead of degrading silently. The filtered schema flows
+    everywhere downstream — destination creation, projection plans — and
+    read_cdc/read_cdc_changes project explicit columns from it, so an
+    excluded (or post-startup) source column is never read and cannot stall
+    CDC. Raises NoSuchTableError if the table doesn't exist.
+    """
+    try:
+        return catalog.load_table(table_name)
+    except ValueError:
+        # At least one column type pyducklake cannot parse; rebuild below
+        # with allowlisted exclusions. Anything else (NoSuchTableError,
+        # connection failures) propagates untouched.
+        pass
+
+    # Private pyducklake surfaces, pinned dependency; this module already
+    # reaches into Table._catalog/_identifier for the snapshot helpers.
+    from pyducklake.catalog import _duckdb_type_to_ducklake, escape_string_literal
+    from pyducklake.schema import Schema
+    from pyducklake.table import Table as DucklakeTable
+    from pyducklake.types import NestedField
+
+    namespace, name = catalog._resolve_identifier(table_name)
+    rows = catalog.fetchall(
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+        f"WHERE table_catalog = '{escape_string_literal(catalog.name)}' "
+        f"AND table_schema = '{escape_string_literal(namespace)}' "
+        f"AND table_name = '{escape_string_literal(name)}' "
+        "ORDER BY ordinal_position"
+    )
+    field_id_counter = [1]
+    fields: list[NestedField] = []
+    excluded: list[str] = []
+    for col_name, col_type, is_nullable in rows:
+        checkpoint = field_id_counter[0]
+        try:
+            dtype = _duckdb_type_to_ducklake(col_type, field_id_counter)
+        except (ValueError, TypeError):
+            # Nested parses may allocate element ids before raising; rewind
+            # so kept columns match pyducklake's canonical id assignment.
+            field_id_counter[0] = checkpoint
+            if col_type.strip().upper() not in EXCLUDABLE_SOURCE_TYPES:
+                raise
+            if col_name in required_columns:
+                raise ValueError(
+                    f"Source column {col_name!r} ({col_type}) is a routing/key column; "
+                    f"its type cannot be replicated and it cannot be excluded — refusing to start"
+                )
+            log.warning(
+                "Excluding source column %r (type %s) from replication: "
+                "pyducklake cannot represent it; destinations will not receive it",
+                col_name,
+                col_type,
+            )
+            try:
+                metrics.source_columns_excluded_total.labels(column=col_name, type=col_type).inc()
+            except Exception:
+                # Unbound pre-init metric must not fail the load whose whole
+                # purpose is surviving this column.
+                log.debug("Failed to record source-column exclusion metric", exc_info=True)
+            excluded.append(col_name)
+            continue
+        if '"' in col_name:
+            # Exclusions force explicit read projection, and pyducklake's
+            # projection interpolates identifiers without escaping embedded
+            # quotes — refuse loudly rather than emit malformed SQL per poll.
+            raise ValueError(
+                f"Source column {col_name!r} embeds a double quote and cannot be projected "
+                f"alongside excluded column(s) {excluded!r}; rename it or drop the excluded columns"
+            )
+        fid = field_id_counter[0]
+        field_id_counter[0] += 1
+        fields.append(NestedField(field_id=fid, name=col_name, field_type=dtype, required=is_nullable == "NO"))
+    if not fields:
+        raise ValueError(f"All columns of {namespace}.{name} were excluded ({excluded!r}); refusing an empty schema")
+    return DucklakeTable(identifier=(namespace, name), schema=Schema(*fields), catalog=catalog)
+
+
+def replicated_column_names(table: Table) -> tuple[str, ...] | None:
+    """The source columns viaduck reads and replicates, in schema order.
+
+    Derived from the (filtered) schema returned by load_table. Passed as the
+    explicit projection on every CDC read so a column added upstream after
+    startup — representable or not — is invisible until a restart re-derives
+    the schema, instead of failing the read (VARIANT cannot convert to Arrow)
+    or the positional destination append (column-count binder error).
+
+    Returns None — reverting to unprojected SELECT * reads, the pre-existing
+    behavior — when any column name embeds a double quote, which pyducklake's
+    projection would interpolate into malformed SQL. (When exclusions make
+    the projection load-bearing, load_table refuses such names outright.)
+    """
+    names = tuple(f.name for f in table.schema.fields)
+    if any('"' in n for n in names):
+        log.warning(
+            "A source column name embeds a double quote; falling back to unprojected "
+            "SELECT * reads — a mid-stream source column addition will fail reads until restart"
+        )
+        return None
+    return names
 
 
 def current_snapshot_id(table: Table) -> int | None:
@@ -360,6 +482,7 @@ def read_cdc(
     end_snapshot: int,
     *,
     filter_expr: str | None = None,
+    columns: tuple[str, ...] | None = None,
 ) -> pa.Table:
     """Read CDC insertions in the range (after_snapshot, end_snapshot].
 
@@ -370,6 +493,11 @@ def read_cdc(
 
     Uses table_insertions with optional filter pushdown for efficiency.
     For append-only mode (no key_columns).
+
+    `columns` (from replicated_column_names) makes the projection explicit
+    instead of SELECT * — a source column added after startup is then
+    invisible rather than a read failure (VARIANT cannot export to Arrow)
+    or a destination-append binder error.
     """
     t0 = time.monotonic()
 
@@ -379,6 +507,8 @@ def read_cdc(
     }
     if filter_expr is not None:
         kwargs["filter_expr"] = filter_expr
+    if columns is not None:
+        kwargs["columns"] = columns
 
     changeset: ChangeSet = table.table_insertions(**kwargs)
     result = changeset.to_arrow()
@@ -405,6 +535,7 @@ def read_cdc_changes(
     end_snapshot: int,
     *,
     filter_expr: str | None = None,
+    columns: tuple[str, ...] | None = None,
 ) -> pa.Table:
     """Read all CDC changes in the range (after_snapshot, end_snapshot].
 
@@ -414,6 +545,9 @@ def read_cdc_changes(
     Uses table_changes which includes inserts, deletes, and update pre/post images.
     The result contains metadata columns: change_type, snapshot_id, rowid.
     For full CDC mode (key_columns configured).
+
+    `columns` covers the data columns only (pyducklake prepends the CDC meta
+    columns itself); see read_cdc for why the explicit projection matters.
     """
     t0 = time.monotonic()
 
@@ -423,6 +557,8 @@ def read_cdc_changes(
     }
     if filter_expr is not None:
         kwargs["filter_expr"] = filter_expr
+    if columns is not None:
+        kwargs["columns"] = columns
 
     changeset: ChangeSet = table.table_changes(**kwargs)
     result = changeset.to_arrow()

@@ -239,7 +239,13 @@ class DestinationPool:
             properties=with_connection_defaults(src_cfg.resolved_properties(), name=f"{src_cfg.name}-schema"),
         )
         try:
-            src_tbl = src_catalog.load_table(src_cfg.table)
+            # Tolerant loader, NOT raw Catalog.load_table: the raw loader
+            # raises on excludable column types (VARIANT) and would
+            # reintroduce the startup crash this fallback path otherwise
+            # escapes only by run()'s set_source_schema call ordering.
+            from viaduck import source as viaduck_source
+
+            src_tbl = viaduck_source.load_table(src_catalog, src_cfg.table)
             # `Table.schema` is a property in pyducklake -- do not call it.
             self._source_schema = src_tbl.schema
         finally:

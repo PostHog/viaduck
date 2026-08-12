@@ -193,7 +193,7 @@ There is **no data loss path** — machine-checked, not just argued: every consi
 ## Not Yet Supported
 
 - **Dynamic destination discovery** — destinations are defined statically in YAML. No runtime discovery from a DuckLake table.
-- **Schema evolution propagation** — source schema changes are not automatically applied to existing destination tables. Requires viaduck restart.
+- **Schema evolution propagation** — source schema changes are not automatically applied to existing destination tables. Requires viaduck restart. Source reads project the explicit startup column set, so a column added upstream mid-stream is invisible (not an error) until restart; columns with types pyducklake cannot represent (e.g. DuckDB `VARIANT`, which cannot export to Arrow) are excluded at load with a warning and `viaduck_source_columns_excluded_total`.
 - **Exactly-once delivery** — at-least-once only. No deduplication layer.
 - **PostHog events integration** — operational events (flush failures, seeds, drains, halted destinations) emitted as PostHog events for product-side observability.
 - **Rowid-reuse tolerance** — DuckLake reuses a rowid when an upsert re-creates a deleted key; if the re-create lands in the same flush window as its predecessor's delete, Phase 2 mistakes them for one row and the new row is lost (pre-existing; both old and new conflict rules affected; append-only mode immune). Fix in design: snapshot-ordered latest-event-wins conflict resolution.
@@ -305,7 +305,7 @@ When using full CDC mode (`key_columns` configured), the source table must not u
 
 By default the destination table must match the source schema exactly. `schema_projection_enabled: true` on a destination instead **projects** each routed batch onto the destination's *existing* schema ([`schema_projection.py`](viaduck/schema_projection.py)): columns listed in `drop_source_columns` are removed, columns are reordered to the destination's order, and columns whose types differ are cast when the cast is safe (e.g. `varchar` → `timestamptz`). This bridges pipelines where the source is a raw ingest shape and the destination is a curated canonical table.
 
-Guards, enforced when the plan is built (per flush, so schema changes are picked up on retry):
+Guards, enforced when the plan is built. NB: plans are built per cold-connect against the source schema captured at startup — a source schema change is only picked up by a process restart, not per flush or retry:
 
 - **Refuses** to drop or cast a `key_columns` member or the routing field — those must survive byte-identical.
 - **Refuses** casts that could silently violate a destination `NOT NULL` constraint.
