@@ -177,36 +177,54 @@ def connect(cfg: SourceConfig) -> Catalog:
     )
 
 
-def load_table(catalog: Catalog, table_name: str) -> Table:
-    """Load the source table, excluding columns pyducklake cannot represent.
+# Source-column types viaduck deliberately tolerates excluding from
+# replication: they cannot cross the DuckDB→Arrow boundary (so reads would
+# stall) and pyducklake cannot represent them (so load_table would crash).
+# The allowlist is deliberately exact-match and narrow — any OTHER type that
+# fails to parse keeps the old loud startup failure, because a parser edge
+# case must surface as an error an operator resolves, not a silently
+# narrower destination table.
+EXCLUDABLE_SOURCE_TYPES = frozenset({"VARIANT"})
 
-    pyducklake's Catalog.load_table parses every column type through
-    _duckdb_type_to_ducklake and raises ValueError on anything outside its
-    type map — DuckDB VARIANT being the live example (millpond's dual-write
-    companions), a type that also cannot cross the DuckDB→Arrow boundary at
-    all as of duckdb 1.5.5. Delegating would turn an upstream column
-    addition into a startup CrashLoopBackOff.
 
-    Instead, build the schema ourselves from information_schema and skip
-    unrepresentable columns loudly (warning + source_columns_excluded_total
-    per column). The filtered schema flows everywhere downstream —
-    destination creation, projection plans — and read_cdc/read_cdc_changes
-    project explicit columns from it, so an excluded (or post-startup) source
-    column is never read and cannot stall CDC. Raises NoSuchTableError if the
-    table doesn't exist.
+def load_table(catalog: Catalog, table_name: str, *, required_columns: tuple[str, ...] = ()) -> Table:
+    """Load the source table, tolerating columns of explicitly excludable types.
+
+    Delegates to pyducklake's loader — the canonical implementation — and only
+    when that raises on an unparseable column type rebuilds the schema by
+    hand, excluding columns whose type is in EXCLUDABLE_SOURCE_TYPES (DuckDB
+    VARIANT being the live example: millpond's dual-write companions, a type
+    that also cannot cross the DuckDB→Arrow boundary as of duckdb 1.5.5).
+    Without this, an upstream column addition becomes a startup
+    CrashLoopBackOff.
+
+    Exclusions are loud (warning + source_columns_excluded_total per column)
+    and guarded: an unparseable type outside the allowlist, an excluded
+    column named in ``required_columns`` (routing/key columns — replication
+    cannot function without them), a kept column whose name embeds a double
+    quote (the forced read projection cannot escape it), or a schema left
+    empty all raise instead of degrading silently. The filtered schema flows
+    everywhere downstream — destination creation, projection plans — and
+    read_cdc/read_cdc_changes project explicit columns from it, so an
+    excluded (or post-startup) source column is never read and cannot stall
+    CDC. Raises NoSuchTableError if the table doesn't exist.
     """
+    try:
+        return catalog.load_table(table_name)
+    except ValueError:
+        # At least one column type pyducklake cannot parse; rebuild below
+        # with allowlisted exclusions. Anything else (NoSuchTableError,
+        # connection failures) propagates untouched.
+        pass
+
     # Private pyducklake surfaces, pinned dependency; this module already
     # reaches into Table._catalog/_identifier for the snapshot helpers.
     from pyducklake.catalog import _duckdb_type_to_ducklake, escape_string_literal
-    from pyducklake.exceptions import NoSuchTableError
     from pyducklake.schema import Schema
     from pyducklake.table import Table as DucklakeTable
     from pyducklake.types import NestedField
 
     namespace, name = catalog._resolve_identifier(table_name)
-    if not catalog.table_exists((namespace, name)):
-        raise NoSuchTableError(f"Table does not exist: {namespace}.{name}")
-
     rows = catalog.fetchall(
         "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
         f"WHERE table_catalog = '{escape_string_literal(catalog.name)}' "
@@ -216,25 +234,53 @@ def load_table(catalog: Catalog, table_name: str) -> Table:
     )
     field_id_counter = [1]
     fields: list[NestedField] = []
+    excluded: list[str] = []
     for col_name, col_type, is_nullable in rows:
+        checkpoint = field_id_counter[0]
         try:
             dtype = _duckdb_type_to_ducklake(col_type, field_id_counter)
         except (ValueError, TypeError):
+            # Nested parses may allocate element ids before raising; rewind
+            # so kept columns match pyducklake's canonical id assignment.
+            field_id_counter[0] = checkpoint
+            if col_type.strip().upper() not in EXCLUDABLE_SOURCE_TYPES:
+                raise
+            if col_name in required_columns:
+                raise ValueError(
+                    f"Source column {col_name!r} ({col_type}) is a routing/key column; "
+                    f"its type cannot be replicated and it cannot be excluded — refusing to start"
+                )
             log.warning(
                 "Excluding source column %r (type %s) from replication: "
                 "pyducklake cannot represent it; destinations will not receive it",
                 col_name,
                 col_type,
             )
-            metrics.source_columns_excluded_total.labels(column=col_name, type=col_type).inc()
+            try:
+                metrics.source_columns_excluded_total.labels(column=col_name, type=col_type).inc()
+            except Exception:
+                # Unbound pre-init metric must not fail the load whose whole
+                # purpose is surviving this column.
+                log.debug("Failed to record source-column exclusion metric", exc_info=True)
+            excluded.append(col_name)
             continue
+        if '"' in col_name:
+            # Exclusions force explicit read projection, and pyducklake's
+            # projection interpolates identifiers without escaping embedded
+            # quotes — refuse loudly rather than emit malformed SQL per poll.
+            raise ValueError(
+                f"Source column {col_name!r} embeds a double quote and cannot be projected "
+                f"alongside excluded column(s) {excluded!r}; rename it or drop the excluded columns"
+            )
         fid = field_id_counter[0]
         field_id_counter[0] += 1
         fields.append(NestedField(field_id=fid, name=col_name, field_type=dtype, required=is_nullable == "NO"))
+    if not fields:
+        raise ValueError(f"All columns of {namespace}.{name} were excluded ({excluded!r}); refusing an empty schema")
     return DucklakeTable(identifier=(namespace, name), schema=Schema(*fields), catalog=catalog)
 
 
-def replicated_column_names(table: Table) -> tuple[str, ...]:
+def replicated_column_names(table: Table) -> tuple[str, ...] | None:
     """The source columns viaduck reads and replicates, in schema order.
 
     Derived from the (filtered) schema returned by load_table. Passed as the
@@ -242,8 +288,20 @@ def replicated_column_names(table: Table) -> tuple[str, ...]:
     startup — representable or not — is invisible until a restart re-derives
     the schema, instead of failing the read (VARIANT cannot convert to Arrow)
     or the positional destination append (column-count binder error).
+
+    Returns None — reverting to unprojected SELECT * reads, the pre-existing
+    behavior — when any column name embeds a double quote, which pyducklake's
+    projection would interpolate into malformed SQL. (When exclusions make
+    the projection load-bearing, load_table refuses such names outright.)
     """
-    return tuple(f.name for f in table.schema.fields)
+    names = tuple(f.name for f in table.schema.fields)
+    if any('"' in n for n in names):
+        log.warning(
+            "A source column name embeds a double quote; falling back to unprojected "
+            "SELECT * reads — a mid-stream source column addition will fail reads until restart"
+        )
+        return None
+    return names
 
 
 def current_snapshot_id(table: Table) -> int | None:

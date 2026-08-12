@@ -497,7 +497,7 @@ def test_seed_round_trip(source_catalog, source_table, dest_catalog_a, dest_tabl
 
     expected_snap = source_mod.current_snapshot_id(source_table)
 
-    _seed_new_destinations(source_table, sm, dest_pool, cfg, ["dest-acme"])
+    _seed_new_destinations(source_table, sm, dest_pool, cfg, ["dest-acme"], source_columns=None)
 
     # Verify destination has 2 acme rows
     dest_scan = _read_all(dest_table_a)
@@ -537,7 +537,7 @@ def test_seed_rejects_duplicate_keys(source_table, dest_catalog_a, dest_table_a,
     dest_pool.get.return_value = (dest_catalog_a, dest_table_a)
 
     with pytest.raises(RoutingError, match="not unique"):
-        _seed_new_destinations(source_table, sm, dest_pool, cfg, ["dest-acme"])
+        _seed_new_destinations(source_table, sm, dest_pool, cfg, ["dest-acme"], source_columns=None)
 
     # Cursor untouched: the seed re-runs after the operator fixes the source.
     assert sm.load_cursors(["dest-acme"])["dest-acme"].last_snapshot_id == 0
@@ -635,7 +635,9 @@ def test_seed_truncates_leftovers_from_crashed_seed(
     sm = StateManager(pg_uri, "seed-instance", StateConfig(table=state_table_name))
     sm.initialize_destinations(["dest-acme"])
 
-    _seed_new_destinations(source_table, sm, _seed_pool(dest_catalog_a, dest_table_a), _seed_cfg(), ["dest-acme"])
+    _seed_new_destinations(
+        source_table, sm, _seed_pool(dest_catalog_a, dest_table_a), _seed_cfg(), ["dest-acme"], source_columns=None
+    )
 
     rows = _read_all(dest_table_a)
     assert sorted(rows.column("event_id").to_pylist()) == [1, 2, 500]  # 99 gone; beta's 500 intact
@@ -653,7 +655,12 @@ def test_seed_truncates_in_append_only_mode(source_table, dest_catalog_a, dest_t
     sm.initialize_destinations(["dest-acme"])
 
     _seed_new_destinations(
-        source_table, sm, _seed_pool(dest_catalog_a, dest_table_a), _seed_cfg(key_columns=[]), ["dest-acme"]
+        source_table,
+        sm,
+        _seed_pool(dest_catalog_a, dest_table_a),
+        _seed_cfg(key_columns=[]),
+        ["dest-acme"],
+        source_columns=None,
     )
 
     rows = _read_all(dest_table_a)
@@ -676,7 +683,12 @@ def test_seed_refuses_nonempty_destination_when_truncate_disabled(
 
     with pytest.raises(RoutingError, match="seed_truncate"):
         _seed_new_destinations(
-            source_table, sm, _seed_pool(dest_catalog_a, dest_table_a), _seed_cfg(seed_truncate=False), ["dest-acme"]
+            source_table,
+            sm,
+            _seed_pool(dest_catalog_a, dest_table_a),
+            _seed_cfg(seed_truncate=False),
+            ["dest-acme"],
+            source_columns=None,
         )
 
     # Untouched: data intact, cursor still 0.
@@ -701,11 +713,11 @@ def test_seed_uniqueness_failure_then_retry_truncates(
     pool = _seed_pool(dest_catalog_a, dest_table_a)
 
     with pytest.raises(RoutingError, match="not unique"):
-        _seed_new_destinations(source_table, sm, pool, _seed_cfg(), ["dest-acme"])
+        _seed_new_destinations(source_table, sm, pool, _seed_cfg(), ["dest-acme"], source_columns=None)
     first_count = _read_all(dest_table_a).num_rows
 
     with pytest.raises(RoutingError, match="not unique"):
-        _seed_new_destinations(source_table, sm, pool, _seed_cfg(), ["dest-acme"])
+        _seed_new_destinations(source_table, sm, pool, _seed_cfg(), ["dest-acme"], source_columns=None)
     assert _read_all(dest_table_a).num_rows == first_count  # truncated, not stacked
     assert sm.load_cursors(["dest-acme"])["dest-acme"].last_snapshot_id == 0
     sm.close()

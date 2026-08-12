@@ -121,6 +121,62 @@ def test_load_table_without_exotic_columns_is_unchanged(source_catalog):
     source_catalog.create_table("plain", SOURCE_SCHEMA)
     table = load_table(source_catalog, "plain")
     assert replicated_column_names(table) == ("event_id", "properties")
-    # Same shape pyducklake's own loader produces.
+    # Same shape pyducklake's own loader produces (the happy path delegates).
     upstream = source_catalog.load_table("plain")
     assert [f.name for f in upstream.schema.fields] == list(replicated_column_names(table))
+
+
+def test_required_column_with_excludable_type_fails_loudly(source_catalog, variant_table):
+    # A routing/key column that would be excluded must fail startup, not
+    # start "healthy" and break every flush downstream.
+    with pytest.raises(ValueError, match="routing/key column"):
+        load_table(source_catalog, "events", required_columns=("properties_variant",))
+
+
+def test_non_allowlisted_unparseable_type_keeps_failing_loudly(source_catalog):
+    # UHUGEINT is storable by ducklake but unparseable by pyducklake and NOT
+    # in EXCLUDABLE_SOURCE_TYPES: exclusion tolerance is a narrow allowlist,
+    # not a blanket except — anything unexpected keeps the old loud failure.
+    source_catalog.create_table("with_uhugeint", SOURCE_SCHEMA)
+    source_catalog.connection.execute("ALTER TABLE source.main.with_uhugeint ADD COLUMN u UHUGEINT")
+    with pytest.raises(ValueError, match="Cannot parse DuckDB type"):
+        load_table(source_catalog, "with_uhugeint")
+
+
+def test_all_columns_excluded_fails_loudly(source_catalog):
+    # An empty surviving schema would render 'SELECT  FROM ...' per poll.
+    conn = source_catalog.connection
+    conn.execute("CREATE TABLE source.main.only_variant (v VARIANT)")
+    with pytest.raises(ValueError, match="refusing an empty schema"):
+        load_table(source_catalog, "only_variant")
+
+
+def test_quote_bearing_column_name_falls_back_to_unprojected(source_catalog):
+    # Projection can't escape embedded quotes (pyducklake interpolates
+    # f'"{name}"' verbatim), so replicated_column_names opts out and reads
+    # revert to the pre-existing SELECT * behavior.
+    conn = source_catalog.connection
+    conn.execute('CREATE TABLE source.main.quoted ("a""b" INTEGER, x VARCHAR)')
+    table = load_table(source_catalog, "quoted")
+    assert replicated_column_names(table) is None
+
+
+def test_quote_bearing_name_with_exclusions_fails_loudly(source_catalog):
+    # When exclusions make projection load-bearing, an unprojectable name
+    # must be a startup error, not malformed SQL every poll.
+    conn = source_catalog.connection
+    conn.execute('CREATE TABLE source.main.quoted_variant ("a""b" INTEGER, v VARIANT)')
+    with pytest.raises(ValueError, match="embeds a double quote"):
+        load_table(source_catalog, "quoted_variant")
+
+
+def test_metric_failure_does_not_break_exclusion(source_catalog, variant_table, monkeypatch):
+    # load_table's purpose is surviving the column — an unbound/broken
+    # metric (e.g. metrics.init() not yet called) must not resurrect the crash.
+    class _Boom:
+        def labels(self, **kwargs):
+            raise ValueError("metric not initialised")
+
+    monkeypatch.setattr(metrics, "source_columns_excluded_total", _Boom())
+    table = load_table(source_catalog, "events")
+    assert replicated_column_names(table) == ("event_id", "properties")

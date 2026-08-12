@@ -736,7 +736,18 @@ def test_poll_cycle_no_snapshots():
     cfg = _make_cfg([])
 
     with patch("viaduck.main.source.snapshot_bounds", return_value=None):
-        _poll_cycle(MagicMock(), delivery, MagicMock(), router, cfg, [], {}, key_columns=[], mode="append_only")
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            [],
+            {},
+            key_columns=[],
+            mode="append_only",
+            source_columns=None,
+        )
 
     delivery.read_plan.assert_not_called()
     delivery.maybe_flush.assert_called_once()
@@ -759,6 +770,7 @@ def test_poll_cycle_all_caught_up():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     router.build_filter_expr.assert_not_called()
@@ -790,6 +802,7 @@ def test_poll_cycle_routes_and_buffers():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
@@ -818,6 +831,7 @@ def test_poll_cycle_empty_changeset_advances_positions():
             {"a": "dest-1", "b": "dest-2"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     assert delivery.advance_position.call_count == 2
@@ -849,6 +863,7 @@ def test_poll_cycle_skip_scan_fast_forwards_span_without_read():
             {"a": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     read_cdc.assert_not_called()
@@ -880,6 +895,7 @@ def test_poll_cycle_skip_scan_jumps_to_next_touching_snapshot():
             {"a": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # Cursor-only advance over (5, 8], then a normal read of (8, 10].
@@ -913,6 +929,7 @@ def test_poll_cycle_skip_scan_probe_failure_falls_back_to_sequential_read():
             {"a": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     read_cdc.assert_called_once()
@@ -943,6 +960,7 @@ def test_poll_cycle_routing_error_breaks_gracefully():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     delivery.buffer.assert_not_called()
@@ -980,6 +998,7 @@ def test_poll_cycle_chunks_large_range():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     assert read_calls == [(0, 5), (5, 10)], f"expected two chunk reads, got {read_calls}"
@@ -1024,6 +1043,7 @@ def test_poll_cycle_chunk_end_not_current_id():
             {"a": "dest-1", "b": "dest-2"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # First chunk (0→3): dest-1 buffered at 3, dest-2 advanced to 3
@@ -1058,6 +1078,7 @@ def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # cursor advanced to each chunk_end incrementally, not directly to 10
@@ -1091,6 +1112,7 @@ def test_poll_cycle_advances_no_data_destinations():
             {"a": "dest-1", "b": "dest-2"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
@@ -1117,6 +1139,7 @@ def test_poll_cycle_pauses_reads_at_watermark():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     delivery.read_plan.assert_not_called()
@@ -1151,6 +1174,7 @@ def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # chunk 0→5 completed: cursor advanced and flushed
@@ -1204,6 +1228,7 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
             {"cup": "dest-caughtup", "lag": "dest-lagging"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # Only one read should have happened (the second group's chunk was
@@ -1257,6 +1282,7 @@ def test_poll_cycle_stuck_destination_at_cap_does_not_block_healthy_peer():
             {"stk": "dest-stuck", "ok": "dest-healthy"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # The healthy destination read its range; the stuck one was skipped.
@@ -1308,6 +1334,7 @@ def test_poll_cycle_mixed_group_reads_only_members_with_headroom():
             {"full": "dest-full", "ok": "dest-ok"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # The CDC filter only ever asked for the healthy member's rows.
@@ -1364,6 +1391,7 @@ def test_poll_cycle_lagging_group_cannot_monopolize_reads():
             {"lag": "dest-lagging", "ok": "dest-healthy"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # The lagging group read exactly the cap, no more.
@@ -1396,6 +1424,7 @@ def test_poll_cycle_snapshot_at_zero():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     router.build_filter_expr.assert_not_called()
@@ -2105,6 +2134,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
             {"quacksworth": "dest-1"},
             key_columns=["value"],
             mode="full_cdc",
+            source_columns=None,
         )
     assert delivery.wait_idle()
 
@@ -2145,6 +2175,7 @@ def test_poll_cycle_append_only_unchanged():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
     assert delivery.wait_idle()
 
@@ -2194,6 +2225,7 @@ def test_poll_cycle_cdc_delete_only_changeset():
             {"quacksworth": "dest-1"},
             key_columns=["company"],
             mode="full_cdc",
+            source_columns=None,
         )
     assert delivery.wait_idle()
 
@@ -2249,6 +2281,7 @@ def test_poll_cycle_cdc_write_failure_isolation():
             {"quacksworth": "dest-1"},
             key_columns=["company"],
             mode="full_cdc",
+            source_columns=None,
         )
         # Keep wait_idle INSIDE the patch scope. The flush worker is
         # burning through the OCC retry budget (`_WRITE_MAX_RETRIES` attempts
@@ -2318,6 +2351,7 @@ def test_poll_cycle_cdc_routing_value_mutation():
             {"quacksworth": "dest-1", "mallardine": "dest-2"},
             key_columns=["company"],
             mode="full_cdc",
+            source_columns=None,
         )
     assert delivery.wait_idle()
 
@@ -2351,6 +2385,7 @@ def test_poll_cycle_branches_on_key_columns():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
         mock_read_cdc.assert_called_once()
         mock_read_changes.assert_not_called()
@@ -2377,6 +2412,7 @@ def test_poll_cycle_branches_on_key_columns():
             {"quacksworth": "dest-1"},
             key_columns=["company"],
             mode="full_cdc",
+            source_columns=None,
         )
         mock_read_changes2.assert_called_once()
         mock_read_cdc2.assert_not_called()
@@ -2613,6 +2649,7 @@ def test_cdc_batch_rows_metric_observed():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     mock_batch_metric.observe.assert_called_once_with(3)
@@ -2645,7 +2682,7 @@ def test_seed_new_destinations_populates_from_scan():
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     assert mock_table.append.call_count == 1
     written = mock_table.append.call_args[0][0]
@@ -2669,7 +2706,7 @@ def test_seed_new_destinations_skips_existing():
     state_mgr.load_cursors.return_value = {"dest-1": cursor}
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     src_table.scan.assert_not_called()
     dest_pool.get.assert_not_called()
@@ -2686,7 +2723,7 @@ def test_seed_new_destinations_empty_source():
     cfg.routing.seed_mode = "scan"
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=None):
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     state_mgr.load_cursors.assert_not_called()
     src_table.scan.assert_not_called()
@@ -2713,7 +2750,7 @@ def test_seed_new_destinations_no_matching_rows():
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     # Only the REPLACE-guard get/release; no rows means no writes.
     dest_pool.get.assert_called_once_with("dest-1")
@@ -2745,7 +2782,7 @@ def test_seed_new_destinations_uses_upsert_with_key_columns():
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     assert mock_table.upsert.call_count == 1
     written = mock_table.upsert.call_args[0][0]
@@ -2776,7 +2813,7 @@ def test_seed_new_destinations_uses_append_without_key_columns():
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     assert mock_table.append.call_count == 1
     written = mock_table.append.call_args[0][0]
@@ -2821,7 +2858,7 @@ def test_seed_new_destinations_multiple():
     dest_pool.get.side_effect = mock_get
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=100):
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1", "dest-2"])
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1", "dest-2"], source_columns=None)
 
     assert state_mgr.advance_cursor.call_count == 2
     assert "dest-1" in tables
@@ -2849,7 +2886,7 @@ def test_seed_new_destinations_pins_snapshot():
     dest_pool.get.return_value = (MagicMock(), mock_table)
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=42):
-        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+        _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     # Verify scan was called with snapshot_id pinned to the captured value
     call_kwargs = src_table.scan.call_args.kwargs
@@ -3128,7 +3165,7 @@ def test_seed_new_destinations_logs_prescan_stats(caplog):
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=42):
         with caplog.at_level("INFO", logger="viaduck.main"):
-            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     src_table.inspect.return_value.files.assert_called_once_with(snapshot_id=42)
 
@@ -3165,7 +3202,7 @@ def test_seed_new_destinations_continues_when_prescan_stats_fail(caplog):
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=42):
         with caplog.at_level("WARNING", logger="viaduck.main"):
-            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     state_mgr.advance_cursor.assert_called_once()
     err = [r for r in caplog.records if r.levelname == "ERROR" and "snapshot file inventory" in r.message]
@@ -3195,7 +3232,7 @@ def test_seed_new_destinations_logs_first_batch_milestone(caplog):
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=99):
         with caplog.at_level("INFO", logger="viaduck.main"):
-            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     msgs = [r.message for r in caplog.records]
     milestone = [m for m in msgs if "first batch in" in m and "dest-1" in m]
@@ -3554,7 +3591,7 @@ def test_seed_passes_source_connection_to_heartbeat():
 
     with patch("viaduck.main.source.current_snapshot_id", return_value=42):
         with patch("viaduck.main._start_progress_heartbeat") as mock_hb:
-            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"])
+            _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, ["dest-1"], source_columns=None)
 
     seed_calls = [c for c in mock_hb.call_args_list if "Seed scan" in c.args[0]]
     assert seed_calls, f"No seed-scan heartbeat started; calls: {mock_hb.call_args_list}"
@@ -3820,6 +3857,7 @@ def test_poll_cycle_wires_time_lag_export():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
     ex.assert_called_once()
     args = ex.call_args[0]
@@ -3914,6 +3952,7 @@ def test_poll_cycle_clamps_before_reading_and_reads_from_floor():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     delivery.clamp_to_retention.assert_called_once_with("dest-1", 99)
@@ -3942,6 +3981,7 @@ def test_poll_cycle_excludes_destination_whose_clamp_failed():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     # The expired destination sat the cycle out instead of fataling it.
@@ -3972,6 +4012,7 @@ def test_poll_cycle_contains_group_read_failure():
             {"quacksworth": "dest-1"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
 
     delivery.maybe_flush.assert_called()
@@ -4002,6 +4043,7 @@ def test_poll_cycle_survives_membership_smaller_than_assigned():
             {"a": "dest-1", "b": "dest-2"},
             key_columns=[],
             mode="append_only",
+            source_columns=None,
         )
     delivery.maybe_flush.assert_called()
 
@@ -4061,6 +4103,7 @@ def _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads, advance_af
             key_columns=[],
             mode="append_only",
             rotation=rotation,
+            source_columns=None,
         )
 
 
@@ -4141,6 +4184,7 @@ def test_timebox_floor_guarantees_one_group_per_cycle():
             key_columns=[],
             mode="append_only",
             rotation=rotation,
+            source_columns=None,
         )
     assert reads == [3], f"floor: exactly the first work-group reads despite an eaten budget, got {reads}"
     assert rotation["offset"] == 1

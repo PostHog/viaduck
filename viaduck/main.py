@@ -435,7 +435,7 @@ def _derive_dest_status(d, snap_now: int, lifecycle_state: str = "active") -> st
     return "healthy"
 
 
-def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids, source_columns=None):
+def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids, *, source_columns):
     """Seed newly added destinations from a source table scan.
 
     For each destination at snapshot_id=0 (just initialized), reads the current
@@ -705,14 +705,21 @@ def run(cfg: config.ViaduckConfig) -> None:
     # leftovers survive container restarts and hold real bytes).
     source.sweep_spill_dirs()
 
-    # Connect to source
+    # Connect to source. required_columns: an excludable-typed routing/key
+    # column must fail startup loudly — replication cannot function without
+    # them and every downstream error would be more confusing than this one.
     src_catalog = source.connect(cfg.source)
-    src_table = source.load_table(src_catalog, cfg.source.table)
+    src_table = source.load_table(
+        src_catalog,
+        cfg.source.table,
+        required_columns=(cfg.routing.field, *cfg.routing.key_columns),
+    )
     # Explicit projection for every source read (CDC + seed): pins the
     # column set to the startup schema — which load_table already filtered
     # to types pyducklake can represent — so an upstream column added
     # mid-stream (e.g. millpond's VARIANT dual-write companions) can't
     # fail reads or destination appends; it stays invisible until restart.
+    # None only when a column name embeds a double quote (legacy SELECT *).
     source_columns = source.replicated_column_names(src_table)
 
     # Initialize state and destinations. Cursor state lives on plain
@@ -1213,7 +1220,10 @@ def _poll_cycle(
     key_columns,
     mode,
     *,
-    source_columns=None,
+    # Required, no default: the implicit fallback would be the unprojected
+    # SELECT-* read that a VARIANT source column stalls. Pass None only to
+    # deliberately read unprojected (quote-bearing column names).
+    source_columns,
     read_ids=None,
     lifecycle_states=None,
     dest_configs=None,
