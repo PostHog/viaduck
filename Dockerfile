@@ -14,6 +14,19 @@ ARG VIADUCK_VERSION=0.0.0.dev0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=$VIADUCK_VERSION
 RUN uv sync --frozen --no-dev
 
+# Overwrite the PyPI 1.5.5 wheel with the PostHog fork (VARIANT shred
+# allowlist + extract pushdown). version stays 1.5.5 so INSTALL ducklake
+# still hits the official 1.5.5 channel (SHA asserted below).
+ARG TARGETARCH
+ARG DUCKDB_RELEASE=v1.5.5-posthog.2
+RUN test -n "$TARGETARCH" \
+    && case "$TARGETARCH" in amd64) WHEEL_ARCH=x86_64 ;; arm64) WHEEL_ARCH=aarch64 ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
+    && apt-get update && apt-get install -y --no-install-recommends curl \
+    && curl -fsSL "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb-1.5.5-cp312-cp312-linux_${WHEEL_ARCH}.whl" -o /tmp/duckdb.whl \
+    && uv pip install --python /app/.venv/bin/python --no-deps /tmp/duckdb.whl \
+    && rm /tmp/duckdb.whl \
+    && apt-get remove -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
 FROM python:3.12-slim
 
 COPY --from=builder /app/.venv /app/.venv
@@ -38,6 +51,9 @@ USER viaduck
 # hypothesis-1.md, then update the hash here.
 RUN python -c "\
 import duckdb; c = duckdb.connect(); \
+ver, sid = c.execute('SELECT library_version, source_id FROM pragma_version()').fetchone(); \
+assert ver == 'v1.5.5', ver; \
+assert sid.startswith('2a514c18f7'), f'expected PostHog fork source_id, got {sid!r}'; \
 c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres'); \
 v = c.execute(\"SELECT extension_version FROM duckdb_extensions() WHERE extension_name='ducklake'\").fetchone()[0]; \
 assert v == 'd8a1881e', f'unexpected ducklake build {v!r} — see Dockerfile comment'"
