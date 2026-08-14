@@ -17,20 +17,25 @@ RUN uv sync --frozen --no-dev
 # Overwrite the PyPI 1.5.5 wheel with the PostHog fork (VARIANT shred
 # allowlist + extract pushdown). version stays 1.5.5 so INSTALL ducklake
 # still hits the official 1.5.5 channel (SHA asserted below).
-# TARGETARCH is a BuildKit automatic ARG (linux/amd64 → amd64, linux/arm64
-# → arm64). Wheel tags use the GNU tuple (x86_64 / aarch64). uv 0.12
-# requires a PEP 427 filename, so install from the release URL directly.
-# --reinstall is required: the fork is also versioned 1.5.5, so without it
-# uv reports "Checked 1 package" and leaves the official PyPI wheel
-# (source_id d8cdaa33fd) in place. --no-cache is required too: uv 0.12
-# keys the wheel cache by version, so --reinstall alone reinstalls the
-# official 1.5.5 bits ("Prepared 1 package in 0.60ms").
+# Do NOT use `uv pip install` for this: the fork is also versioned 1.5.5,
+# and uv 0.12 resolves that to the locked PyPI artifact even when given
+# the GitHub URL (--reinstall / --no-cache still leave source_id
+# d8cdaa33fd). Unpack the wheel into site-packages instead.
 ARG TARGETARCH
-ARG DUCKDB_RELEASE=v1.5.5-posthog.2
+ARG DUCKDB_RELEASE=v1.5.5-posthog.5
+ARG DUCKDB_SOURCE_ID=697fa6fb44
 RUN test -n "$TARGETARCH" \
     && case "$TARGETARCH" in amd64) WHEEL_ARCH=x86_64 ;; arm64) WHEEL_ARCH=aarch64 ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
-    && uv pip install --python /app/.venv/bin/python --reinstall --no-cache --no-deps \
-         "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb-1.5.5-cp312-cp312-linux_${WHEEL_ARCH}.whl"
+    && DUCKDB_RELEASE="$DUCKDB_RELEASE" WHEEL_ARCH="$WHEEL_ARCH" DUCKDB_SOURCE_ID="$DUCKDB_SOURCE_ID" \
+       /app/.venv/bin/python -c "\
+import os, pathlib, sysconfig, urllib.request, zipfile; \
+url = f\"https://github.com/PostHog/duckdb/releases/download/{os.environ['DUCKDB_RELEASE']}/duckdb-1.5.5-cp312-cp312-linux_{os.environ['WHEEL_ARCH']}.whl\"; \
+whl = pathlib.Path('/tmp/duckdb-fork.whl'); urllib.request.urlretrieve(url, whl); \
+zipfile.ZipFile(whl).extractall(sysconfig.get_paths()['purelib']); whl.unlink(); \
+import duckdb; c = duckdb.connect(); \
+ver, sid = c.execute('SELECT library_version, source_id FROM pragma_version()').fetchone(); \
+assert ver == 'v1.5.5', ver; \
+assert sid.startswith(os.environ['DUCKDB_SOURCE_ID']), sid"
 
 FROM python:3.12-slim
 
@@ -58,7 +63,7 @@ RUN python -c "\
 import duckdb; c = duckdb.connect(); \
 ver, sid = c.execute('SELECT library_version, source_id FROM pragma_version()').fetchone(); \
 assert ver == 'v1.5.5', ver; \
-assert sid.startswith('2a514c18f7'), f'expected PostHog fork source_id, got {sid!r}'; \
+assert sid.startswith('697fa6fb44'), f'expected PostHog fork source_id, got {sid!r}'; \
 c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres'); \
 v = c.execute(\"SELECT extension_version FROM duckdb_extensions() WHERE extension_name='ducklake'\").fetchone()[0]; \
 assert v == 'd8a1881e', f'unexpected ducklake build {v!r} — see Dockerfile comment'"
