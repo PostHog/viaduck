@@ -22,12 +22,14 @@ RUN uv sync --frozen --no-dev
 # requires a PEP 427 filename, so install from the release URL directly.
 # --reinstall is required: the fork is also versioned 1.5.5, so without it
 # uv reports "Checked 1 package" and leaves the official PyPI wheel
-# (source_id d8cdaa33fd) in place.
+# (source_id d8cdaa33fd) in place. --no-cache is required too: uv 0.12
+# keys the wheel cache by version, so --reinstall alone reinstalls the
+# official 1.5.5 bits ("Prepared 1 package in 0.60ms").
 ARG TARGETARCH
 ARG DUCKDB_RELEASE=v1.5.5-posthog.2
 RUN test -n "$TARGETARCH" \
     && case "$TARGETARCH" in amd64) WHEEL_ARCH=x86_64 ;; arm64) WHEEL_ARCH=aarch64 ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
-    && uv pip install --python /app/.venv/bin/python --reinstall --no-deps \
+    && uv pip install --python /app/.venv/bin/python --reinstall --no-cache --no-deps \
          "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb-1.5.5-cp312-cp312-linux_${WHEEL_ARCH}.whl"
 
 FROM python:3.12-slim
