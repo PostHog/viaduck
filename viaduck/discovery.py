@@ -5,10 +5,12 @@ Polls the duckgres control plane's read-only discovery endpoint
 secret) and maps (warehouse, team) pairs onto destination configs:
 
 - id ``org-<org_id>-team-<team_id>``; routing value = the team id.
-- **Table = the payload's ``events_table`` VERBATIM** — the CP owns
-  naming (schema-per-team + legacy bare-name overrides resolve there);
-  viaduck never derives a table name. Renames are not allowed upstream,
-  so the table is immutable for a destination's lifetime.
+- **Table = a payload table field VERBATIM** — ``events_table`` by
+  default; a persons pipeline sets ``discovery.table_field`` to
+  ``persons_table``/``persons_distinct_ids_table``. The CP owns naming
+  (schema-per-team + legacy bare-name overrides resolve there); viaduck
+  never derives a table name. Renames are not allowed upstream, so the
+  table is immutable for a destination's lifetime.
 - Metadata-store credentials come from the payload's connection fields
   plus a Kubernetes Secret reference (``password_secret_ref``) resolved
   by reading the Secret directly with viaduck's ServiceAccount (RBAC
@@ -244,18 +246,19 @@ class ClassifiedView:
         object.__setattr__(self, "entries", MappingProxyType(first))
 
 
-def classify_payload(payload: dict, *, count_broken: bool = True) -> ClassifiedView:
+def classify_payload(payload: dict, *, count_broken: bool = True, table_field: str = "events_table") -> ClassifiedView:
     """Classify every enumerable destination id in the raw payload as
     startable (mapped config) or merely mentioned (fenced, degraded —
     the reason is counted, not carried). Never raises on data problems:
     un-enumerable content poisons the view (see ClassifiedView).
     `count_broken` keeps the startup/loud vs drift-poll/quiet split of
-    map_payload."""
+    map_payload. `table_field` names the team-payload field read as the
+    destination table (see DiscoveryConfig.table_field)."""
     entries: list[ClassifiedEntry] = []
     poisoned = False
     for wh in payload.get("warehouses", []):
         try:
-            if not _classify_warehouse(wh, entries, count_broken):
+            if not _classify_warehouse(wh, entries, count_broken, table_field):
                 poisoned = True
         except Exception as e:
             _broken("malformed", f"warehouse entry unparseable: {e!r}", count=count_broken)
@@ -290,16 +293,18 @@ def derive_absent(view: ClassifiedView | None, registry_snapshot) -> frozenset[s
     return frozenset(d for d in routable_discovered if d not in view.entries)
 
 
-def map_payload(payload: dict, *, count_broken: bool = True) -> list[MappedDestination]:
+def map_payload(
+    payload: dict, *, count_broken: bool = True, table_field: str = "events_table"
+) -> list[MappedDestination]:
     """STARTABLE entries of the classified view, in payload order with
     duplicates preserved (materialize() owns dedupe + its counter).
     Startup-compatible shape; the classification is the single parsing
     path so the two can never drift."""
-    view = classify_payload(payload, count_broken=count_broken)
+    view = classify_payload(payload, count_broken=count_broken, table_field=table_field)
     return [e.mapped for e in view.entry_list if e.mapped is not None]
 
 
-def _classify_warehouse(wh: dict, entries: list[ClassifiedEntry], count_broken: bool) -> bool:
+def _classify_warehouse(wh: dict, entries: list[ClassifiedEntry], count_broken: bool, table_field: str) -> bool:
     """Classify one warehouse's teams into `entries`. Returns False when
     any content was UN-ENUMERABLE (a team id we cannot even name — that
     id would falsely read as ABSENT, so the caller poisons the view).
@@ -352,7 +357,7 @@ def _classify_warehouse(wh: dict, entries: list[ClassifiedEntry], count_broken: 
 
     for team in teams:
         team_id = team.get("team_id")
-        events_table = team.get("events_table")
+        table = team.get(table_field)
         if team_id is None:
             # An id we cannot name — the poison case. Deliberate cadence
             # change vs the pre-v6 parser: this fires for unstartable
@@ -363,8 +368,8 @@ def _classify_warehouse(wh: dict, entries: list[ClassifiedEntry], count_broken: 
             enumerable = False
             continue
         dest_id = f"org-{org}-team-{team_id}"
-        if startable and not events_table:
-            _broken("bad_team_row", f"org {org} team row missing events_table", count=count_broken)
+        if startable and not table:
+            _broken("bad_team_row", f"org {org} team row missing {table_field}", count=count_broken)
             entries.append(ClassifiedEntry(dest_id=dest_id, mapped=None))
             continue
         if not startable:
@@ -381,7 +386,7 @@ def _classify_warehouse(wh: dict, entries: list[ClassifiedEntry], count_broken: 
                     dest_id=dest_id,
                     org_id=org,
                     team_id=team_id,
-                    table=events_table,
+                    table=table,
                     data_path=f"s3://{bucket}/",
                     pg_endpoint=ms["endpoint"],
                     pg_port=ms.get("port") or 5432,
@@ -574,6 +579,10 @@ class DriftWatcher:
     poll_interval_s: float
     baseline: dict[str, MappedDestination]
     startup_generation: int
+    # Team-payload field read as the destination table — must match the
+    # field the startup map_payload used, or every discovered entry reads
+    # as changed drift.
+    table_field: str = "events_table"
     # True when the C3 reconciler is applying views (discovery.
     # apply_enabled): the vs-STARTUP drift comparison below is then
     # permanently wrong after the first applied change (an applied add
@@ -636,7 +645,7 @@ class DriftWatcher:
         # static-only alert (round-2 review).
         metrics.discovery_config_generation.set(payload["config_generation"])
         metrics.discovery_last_success_timestamp_seconds.set_to_current_time()
-        view = classify_payload(payload, count_broken=False)
+        view = classify_payload(payload, count_broken=False, table_field=self.table_field)
         with self._view_lock:
             self._view = view
         startable = sum(1 for e in view.entries.values() if e.startable)

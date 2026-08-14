@@ -764,7 +764,7 @@ def run(cfg: config.ViaduckConfig) -> None:
                         time.sleep(min(2**attempt, 5))
             if payload is None:
                 raise last_err  # type: ignore[misc]
-            mapped = disco.map_payload(payload)
+            mapped = disco.map_payload(payload, table_field=cfg.discovery.table_field)
             if len(mapped) < cfg.discovery.min_destinations:
                 raise disco.DiscoveryError(
                     f"payload mapped {len(mapped)} destination(s) < discovery.min_destinations "
@@ -837,6 +837,7 @@ def run(cfg: config.ViaduckConfig) -> None:
             baseline=baseline,
             startup_generation=generation,
             apply_mode=cfg.discovery.apply_enabled,
+            table_field=cfg.discovery.table_field,
         )
     # The registry is built from the post-merge cfg and is THE runtime
     # resolution path for destination configs — the pool, the poll cycle,

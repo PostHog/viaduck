@@ -1043,3 +1043,65 @@ def test_destination_buffer_max_bytes_loader(tmp_path: Path):
 def test_destination_buffer_max_bytes_default_zero(config_file: Path):
     cfg = load(config_file)
     assert cfg.destinations[0].buffer_max_bytes == 0
+
+
+def test_discovery_table_field_loads_from_yaml(tmp_path):
+    import yaml
+
+    from viaduck.config import load
+
+    cfg_yaml = {
+        "source": {"name": "s", "postgres_uri_env": "SRC", "data_path": "/d", "table": "t"},
+        "routing": {"field": "company", "mode": "append_only"},
+        "destinations": [
+            {
+                "id": "d1",
+                "routing_value": "a",
+                "name": "n",
+                "postgres_uri_env": "DST",
+                "data_path": "/d",
+                "table": "t",
+            }
+        ],
+        "discovery": {"enabled": True, "url": "http://cp/api/v1/warehouses", "table_field": "persons_table"},
+    }
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(yaml.safe_dump(cfg_yaml))
+    cfg = load(str(p))
+    assert cfg.discovery.table_field == "persons_table"
+
+
+def test_discovery_table_field_defaults_to_events_table(config_file):
+    from viaduck.config import load
+
+    cfg = load(config_file)
+    assert cfg.discovery.table_field == "events_table"
+
+
+def test_discovery_table_field_rejects_unknown_field(tmp_path):
+    import pytest
+    import yaml
+
+    from viaduck.config import ConfigError, load
+
+    cfg_yaml = {
+        "source": {"name": "s", "postgres_uri_env": "SRC", "data_path": "/d", "table": "t"},
+        "routing": {"field": "company", "mode": "append_only"},
+        "destinations": [
+            {
+                "id": "d1",
+                "routing_value": "a",
+                "name": "n",
+                "postgres_uri_env": "DST",
+                "data_path": "/d",
+                "table": "t",
+            }
+        ],
+        # A typo here must fail fast: silently falling back to
+        # events_table would route person rows into the events tables.
+        "discovery": {"table_field": "person_table"},
+    }
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(yaml.safe_dump(cfg_yaml))
+    with pytest.raises(ConfigError, match="table_field"):
+        load(str(p))
