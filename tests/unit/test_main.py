@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC
 from unittest.mock import MagicMock, call, patch
 
@@ -4188,3 +4189,97 @@ def test_timebox_floor_guarantees_one_group_per_cycle():
         )
     assert reads == [3], f"floor: exactly the first work-group reads despite an eaten budget, got {reads}"
     assert rotation["offset"] == 1
+
+
+# --- watermark self-recycle ---
+
+
+def _mem(enabled=True, fraction=0.75, gib=0.0, min_uptime=3600.0):
+    """Real MemoryConfig (not a stand-in): field renames must break these
+    tests, not just run()'s startup."""
+    from viaduck.config import MemoryConfig
+
+    return MemoryConfig(
+        self_recycle_enabled=enabled,
+        self_recycle_rss_fraction=fraction,
+        self_recycle_rss_gib=gib,
+        self_recycle_min_uptime_seconds=min_uptime,
+    )
+
+
+def test_recycle_watermark_absolute_wins():
+    from viaduck.main import resolve_recycle_watermark
+
+    with patch("viaduck.main._cgroup_memory_limit_gib", return_value=96.0):
+        assert resolve_recycle_watermark(_mem(gib=70.0, fraction=0.5)) == 70.0
+
+
+def test_recycle_watermark_fraction_of_cgroup_limit():
+    from viaduck.main import resolve_recycle_watermark
+
+    with patch("viaduck.main._cgroup_memory_limit_gib", return_value=96.0):
+        assert resolve_recycle_watermark(_mem(fraction=0.75)) == pytest.approx(72.0)
+
+
+def test_recycle_watermark_disabled_by_config():
+    from viaduck.main import resolve_recycle_watermark
+
+    assert resolve_recycle_watermark(_mem(enabled=False)) == 0.0
+
+
+def test_recycle_watermark_disabled_without_cgroup_limit():
+    """Bare-metal/dev: no readable limit and no absolute knob -> disabled."""
+    from viaduck.main import resolve_recycle_watermark
+
+    with patch("viaduck.main._cgroup_memory_limit_gib", return_value=0.0):
+        assert resolve_recycle_watermark(_mem()) == 0.0
+
+
+def test_should_self_recycle_trips_above_watermark_after_uptime():
+    from viaduck.main import _should_self_recycle
+
+    with patch("viaduck.main._read_rss_gib", return_value=73.0):
+        started = time.monotonic() - 7200
+        assert _should_self_recycle(72.0, started, 3600.0) is True
+
+
+def test_should_self_recycle_respects_min_uptime():
+    """A young process never recycles, however hot — post-restart catch-up
+    runs high legitimately, and an eager watermark would flap-restart."""
+    from viaduck.main import _should_self_recycle
+
+    with patch("viaduck.main._read_rss_gib", return_value=95.0):
+        assert _should_self_recycle(72.0, time.monotonic(), 3600.0) is False
+
+
+def test_should_self_recycle_below_watermark_and_disabled():
+    from viaduck.main import _should_self_recycle
+
+    started = time.monotonic() - 7200
+    with patch("viaduck.main._read_rss_gib", return_value=40.0):
+        assert _should_self_recycle(72.0, started, 3600.0) is False
+    # watermark 0 = disabled: RSS is never even read
+    with patch("viaduck.main._read_rss_gib", side_effect=AssertionError("must not be called")):
+        assert _should_self_recycle(0.0, started, 3600.0) is False
+
+
+def test_should_self_recycle_never_trips_on_read_failure():
+    """/proc absent (macOS dev) or transient read error must not restart."""
+    from viaduck.main import _should_self_recycle
+
+    started = time.monotonic() - 7200
+    with patch("viaduck.main._read_rss_gib", side_effect=OSError("no procfs")):
+        assert _should_self_recycle(72.0, started, 3600.0) is False
+
+
+def test_read_rss_gib_raises_when_vmrss_absent(tmp_path):
+    """A 'successful' 0.0 read would silently disarm the watermark on Linux;
+    absence of VmRSS must surface as a failure (caught + warn-limited by
+    _should_self_recycle)."""
+    from unittest.mock import mock_open
+
+    from viaduck.main import _read_rss_gib
+
+    with patch("builtins.open", mock_open(read_data="VmSize:\t123 kB\n")):
+        with pytest.raises(RuntimeError):
+            _read_rss_gib()

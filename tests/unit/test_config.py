@@ -1043,3 +1043,50 @@ def test_destination_buffer_max_bytes_loader(tmp_path: Path):
 def test_destination_buffer_max_bytes_default_zero(config_file: Path):
     cfg = load(config_file)
     assert cfg.destinations[0].buffer_max_bytes == 0
+
+
+# --- memory / self-recycle ---
+
+
+def test_memory_defaults(config_file: Path):
+    cfg = load(config_file)
+    assert cfg.memory.self_recycle_enabled is True
+    assert cfg.memory.self_recycle_rss_fraction == 0.75
+    assert cfg.memory.self_recycle_rss_gib == 0.0
+    assert cfg.memory.self_recycle_min_uptime_seconds == 3600.0
+
+
+def test_memory_explicit_values(tmp_path: Path):
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(
+        MINIMAL_YAML
+        + """
+memory:
+  self_recycle_enabled: false
+  self_recycle_rss_fraction: 0.5
+  self_recycle_rss_gib: 70
+  self_recycle_min_uptime_seconds: 0
+"""
+    )
+    cfg = load(p)
+    assert cfg.memory.self_recycle_enabled is False
+    assert cfg.memory.self_recycle_rss_fraction == 0.5
+    assert cfg.memory.self_recycle_rss_gib == 70.0
+    assert cfg.memory.self_recycle_min_uptime_seconds == 0.0
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "  self_recycle_rss_fraction: 0",
+        "  self_recycle_rss_fraction: 1",
+        "  self_recycle_rss_fraction: 1.5",
+        "  self_recycle_rss_gib: -1",
+        "  self_recycle_min_uptime_seconds: -5",
+    ],
+)
+def test_memory_validation_rejects(tmp_path: Path, snippet: str):
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(MINIMAL_YAML + "\nmemory:\n" + snippet + "\n")
+    with pytest.raises(ConfigError):
+        load(p)

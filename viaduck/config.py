@@ -371,6 +371,49 @@ class PollConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    # Watermark self-recycle: the shipped ducklake extension still accrues
+    # untracked native memory (~2.5-4 GiB/h on prod; see hypothesis-1.md
+    # residual) with a horizon of roughly a day per pod. A mid-flight OOM
+    # rewinds every destination to its durable cursor and tips the
+    # cursor-group system into the degraded scattered regime (2026-07-31 and
+    # 2026-08-14 incidents); a CLEAN exit after drain() leaves cursors tight
+    # at the read position, so the kubelet restart resumes with no rewind.
+    # When RSS crosses the watermark, finish the current poll cycle, drain,
+    # exit 0.
+    self_recycle_enabled: bool = True
+    # Watermark as a fraction of the cgroup memory limit. Used when
+    # self_recycle_rss_gib is 0 and the limit is readable; if the limit is
+    # unreadable/unlimited the recycle is disabled (logged at startup).
+    # SIZING: the watermark must clear the deployment's LEGITIMATE peak —
+    # roughly delivery.buffer_total_max_bytes + the pool's native footprint
+    # + process baseline — or leak-free load recycles the pod every
+    # min-uptime. On sized deployments prefer the absolute knob, set from
+    # that envelope plus headroom (prod-us: ~74GiB envelope on a 96Gi pod
+    # → 0.75 x limit is BELOW it; the chart sets self_recycle_rss_gib
+    # explicitly instead).
+    self_recycle_rss_fraction: float = 0.75
+    # Absolute watermark override in GiB; 0 derives from the fraction.
+    self_recycle_rss_gib: float = 0.0
+    # Never recycle a young process: a post-restart catch-up legitimately
+    # runs hot, and a too-eager watermark would flap-restart into the exact
+    # churn this feature exists to avoid.
+    self_recycle_min_uptime_seconds: float = 3600.0
+
+    def __post_init__(self):
+        if not 0.0 < self.self_recycle_rss_fraction < 1.0:
+            raise ConfigError(
+                f"memory.self_recycle_rss_fraction must be in (0, 1), got {self.self_recycle_rss_fraction}"
+            )
+        if self.self_recycle_rss_gib < 0:
+            raise ConfigError(f"memory.self_recycle_rss_gib must be >= 0, got {self.self_recycle_rss_gib}")
+        if self.self_recycle_min_uptime_seconds < 0:
+            raise ConfigError(
+                f"memory.self_recycle_min_uptime_seconds must be >= 0, got {self.self_recycle_min_uptime_seconds}"
+            )
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     port: int = 8000
 
@@ -682,6 +725,7 @@ class ViaduckConfig:
     destinations: list[DestinationConfig]
     poll: PollConfig = field(default_factory=PollConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     web: WebConfig = field(default_factory=WebConfig)
     instance: InstanceConfig = field(default_factory=InstanceConfig)
     state: StateConfig = field(default_factory=StateConfig)
@@ -943,6 +987,14 @@ def load(path: str | Path) -> ViaduckConfig:
     server_raw = raw.get("server", {})
     server = ServerConfig(port=server_raw.get("port", 8000))
 
+    memory_raw = raw.get("memory", {})
+    memory = MemoryConfig(
+        self_recycle_enabled=bool(memory_raw.get("self_recycle_enabled", True)),
+        self_recycle_rss_fraction=float(memory_raw.get("self_recycle_rss_fraction", 0.75)),
+        self_recycle_rss_gib=float(memory_raw.get("self_recycle_rss_gib", 0.0)),
+        self_recycle_min_uptime_seconds=float(memory_raw.get("self_recycle_min_uptime_seconds", 3600.0)),
+    )
+
     web_raw = raw.get("web", {})
     web = WebConfig(enabled=web_raw.get("enabled", True))
 
@@ -1032,6 +1084,7 @@ def load(path: str | Path) -> ViaduckConfig:
         destinations=destinations,
         poll=poll,
         server=server,
+        memory=memory,
         web=web,
         instance=instance,
         state=state,

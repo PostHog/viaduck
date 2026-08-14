@@ -25,6 +25,11 @@ _polls_total = Counter(
     "Poll cycles executed",
     ["pipeline"],
 )
+_self_recycles_total = Counter(
+    "viaduck_self_recycles_total",
+    "Clean watermark-triggered restarts (drain + exit 0 on RSS watermark)",
+    ["pipeline"],
+)
 _cdc_read_seconds = Histogram(
     "viaduck_cdc_read_seconds",
     "Time to read CDC insertions from source",
@@ -391,6 +396,7 @@ _projection_cast_null_fallback_total = Counter(
 # --- Public names (replaced by init() with pipeline-bound instances) ---
 
 polls_total = _polls_total
+self_recycles_total = _self_recycles_total
 cdc_read_seconds = _cdc_read_seconds
 cdc_rows_read_total = _cdc_rows_read_total
 source_columns_excluded_total = _source_columns_excluded_total
@@ -469,6 +475,7 @@ def set_destination_lifecycle(dest_id: str, state: str, all_states) -> None:
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
     global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id, cdc_snapshots_skipped_total
+    global self_recycles_total
     global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
     global dest_time_lag_seconds, dest_flush_target_bytes
@@ -540,6 +547,7 @@ def init(pipeline: str):
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
+    self_recycles_total = _self_recycles_total.labels(pipeline=pipeline)
     poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total.labels(pipeline=pipeline)
     cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
