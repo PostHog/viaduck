@@ -17,15 +17,15 @@ RUN uv sync --frozen --no-dev
 # Overwrite the PyPI 1.5.5 wheel with the PostHog fork (VARIANT shred
 # allowlist + extract pushdown). version stays 1.5.5 so INSTALL ducklake
 # still hits the official 1.5.5 channel (SHA asserted below).
+# TARGETARCH is a BuildKit automatic ARG (linux/amd64 → amd64, linux/arm64
+# → arm64). Wheel tags use the GNU tuple (x86_64 / aarch64). uv 0.12
+# requires a PEP 427 filename, so install from the release URL directly.
 ARG TARGETARCH
 ARG DUCKDB_RELEASE=v1.5.5-posthog.2
 RUN test -n "$TARGETARCH" \
     && case "$TARGETARCH" in amd64) WHEEL_ARCH=x86_64 ;; arm64) WHEEL_ARCH=aarch64 ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
-    && apt-get update && apt-get install -y --no-install-recommends curl \
-    && curl -fsSL "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb-1.5.5-cp312-cp312-linux_${WHEEL_ARCH}.whl" -o /tmp/duckdb.whl \
-    && uv pip install --python /app/.venv/bin/python --no-deps /tmp/duckdb.whl \
-    && rm /tmp/duckdb.whl \
-    && apt-get remove -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+    && uv pip install --python /app/.venv/bin/python --no-deps \
+         "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb-1.5.5-cp312-cp312-linux_${WHEEL_ARCH}.whl"
 
 FROM python:3.12-slim
 
