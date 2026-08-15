@@ -60,9 +60,10 @@ from datetime import UTC, datetime
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from viaduck import config, lifecycle, logging_config, metrics, source
+from viaduck import config, feed, lifecycle, logging_config, metrics, source
 from viaduck.apply import _require_non_null_rowids
 from viaduck.arrowutil import full_bool, row_indices
+from viaduck.config import ConfigError
 from viaduck.delivery import DeliveryManager
 from viaduck.destination import DestinationPool
 from viaduck.registry import DestinationRegistry
@@ -722,6 +723,27 @@ def run(cfg: config.ViaduckConfig) -> None:
     # None only when a column name embeds a double quote (legacy SELECT *).
     source_columns = source.replicated_column_names(src_table)
 
+    # Direct-SQL feed (source.cdc_reader=direct): bypasses the extension
+    # changefeed's per-bind cost (~2.4-3s/call fixed) with indexed catalog
+    # SQL + stock parquet scans. append_only only — full_cdc's delete stream
+    # and preimage resolution have no feed implementation (fail loudly at
+    # startup rather than silently reading inserts-only). The extension path
+    # stays as the rollback while the flag exists.
+    feed_reader = None
+    if cfg.source.cdc_reader == "direct":
+        if cfg.routing.mode != "append_only":
+            raise ConfigError(
+                f"source.cdc_reader='direct' requires routing.mode='append_only', got {cfg.routing.mode!r}: "
+                "the feed implements table_insertions semantics only (no delete stream)"
+            )
+        feed_reader = feed.FeedReader(
+            postgres_uri=cfg.source.postgres_uri,
+            catalog_name=cfg.source.name,
+            data_path=cfg.source.data_path,
+        )
+        feed_reader.verify_catalog()
+        log.info("Direct-SQL feed reader enabled for source %s", cfg.source.name)
+
     # Initialize state and destinations. Cursor state lives on plain
     # Postgres (NOT a DuckLake table): a cursor advance must not create
     # catalog snapshots, or idle destinations generate CDC work forever.
@@ -1068,6 +1090,7 @@ def run(cfg: config.ViaduckConfig) -> None:
                 lifecycle_states=tracker.states(),
                 dest_configs=reg_snap.configs,
                 rotation=cycle_rotation,
+                feed_reader=feed_reader,
             )
         except Exception:
             log.exception("Fatal error in poll cycle")
@@ -1115,6 +1138,11 @@ def run(cfg: config.ViaduckConfig) -> None:
     delivery.drain(timeout_s=_RECYCLE_DRAIN_TIMEOUT_S if recycling else 60.0)
     dest_pool.close_all()
     state_mgr.close()
+    if feed_reader is not None:
+        try:
+            feed_reader.close()
+        except Exception:
+            log.warning("Feed reader close failed", exc_info=True)
     try:
         src_catalog.close()
     except Exception:
@@ -1261,6 +1289,7 @@ def _poll_cycle(
     lifecycle_states=None,
     dest_configs=None,
     rotation=None,
+    feed_reader=None,
 ):
     # Local boolean so the existing branch sites stay terse. Threading mode
     # (not full_cdc) through the call signature avoids reconstructing the
@@ -1471,6 +1500,18 @@ def _poll_cycle(
                                 src_table,
                                 after_snapshot=chunk_start,
                                 end_snapshot=chunk_end,
+                                filter_expr=filter_expr,
+                                columns=source_columns,
+                            )
+                        elif feed_reader is not None:
+                            # src_table._catalog.connection: same private
+                            # reach source.py's snapshot helpers already use;
+                            # the connection carries the S3 credentials.
+                            raw_data = feed_reader.read(
+                                src_table,
+                                src_table._catalog.connection,
+                                chunk_start,
+                                chunk_end,
                                 filter_expr=filter_expr,
                                 columns=source_columns,
                             )

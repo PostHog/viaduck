@@ -40,6 +40,24 @@ _cdc_rows_read_total = Counter(
     "Total rows read from source via CDC",
     ["pipeline"],
 )
+# Direct-SQL feed (cdc_reader=direct; log-consumer-proposal.md §6.1).
+# surface: catalog (psycopg metadata queries) vs parquet (duckdb data plane) —
+# the split that makes the extension bypass measurable.
+_cdc_feed_query_seconds = Histogram(
+    "viaduck_cdc_feed_query_seconds",
+    "Direct-SQL feed read latency by surface",
+    ["pipeline", "surface"],
+)
+_cdc_feed_files_total = Counter(
+    "viaduck_cdc_feed_files_total",
+    "Data files enumerated by the direct-SQL feed",
+    ["pipeline"],
+)
+_cdc_feed_inlined_rows_total = Counter(
+    "viaduck_cdc_feed_inlined_rows_total",
+    "Rows read from ducklake inline stores by the direct-SQL feed",
+    ["pipeline"],
+)
 # Source columns viaduck refuses to replicate because pyducklake cannot
 # represent their DuckDB type (e.g. VARIANT, which also cannot cross the
 # DuckDB→Arrow boundary as of duckdb 1.5.5). Incremented once per excluded
@@ -399,6 +417,9 @@ polls_total = _polls_total
 self_recycles_total = _self_recycles_total
 cdc_read_seconds = _cdc_read_seconds
 cdc_rows_read_total = _cdc_rows_read_total
+cdc_feed_query_seconds = _cdc_feed_query_seconds
+cdc_feed_files_total = _cdc_feed_files_total
+cdc_feed_inlined_rows_total = _cdc_feed_inlined_rows_total
 source_columns_excluded_total = _source_columns_excluded_total
 source_snapshot_id = _source_snapshot_id
 
@@ -475,6 +496,7 @@ def set_destination_lifecycle(dest_id: str, state: str, all_states) -> None:
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
     global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id, cdc_snapshots_skipped_total
+    global cdc_feed_query_seconds, cdc_feed_files_total, cdc_feed_inlined_rows_total
     global self_recycles_total
     global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
@@ -552,6 +574,9 @@ def init(pipeline: str):
     cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
+    cdc_feed_query_seconds = _AutoPipelineLabels(_cdc_feed_query_seconds, pipeline)
+    cdc_feed_files_total = _cdc_feed_files_total.labels(pipeline=pipeline)
+    cdc_feed_inlined_rows_total = _cdc_feed_inlined_rows_total.labels(pipeline=pipeline)
     source_columns_excluded_total = _AutoPipelineLabels(_source_columns_excluded_total, pipeline)
     source_snapshot_id = _source_snapshot_id.labels(pipeline=pipeline)
     delivery_buffer_total_bytes = _delivery_buffer_total_bytes.labels(pipeline=pipeline)
