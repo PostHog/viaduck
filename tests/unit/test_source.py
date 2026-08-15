@@ -154,7 +154,11 @@ def test_connect(tmp_path):
             assert any(c.startswith("SET ducklake_max_retry_count") for c in set_calls)
             assert any(c.startswith("SET ducklake_retry_wait_ms") for c in set_calls)
             assert any(c.startswith("SET ducklake_retry_backoff") for c in set_calls)
-            assert set_calls[-1] == "SET TimeZone = 'UTC'"
+            # NO TimeZone pin — on the mismatched registry `SET TimeZone`
+            # poisons the extension's UINT64 retry slot with a string and
+            # every commit fails (2026-08-15 zero-flush outage). Nothing
+            # outside the verified loop may SET anything.
+            assert not any("TimeZone" in c and c.startswith("SET ") for c in set_calls)
 
 
 # --- read_cdc_changes tests ---
