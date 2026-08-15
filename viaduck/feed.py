@@ -38,16 +38,30 @@ Scope: append_only only (no delete stream). Encrypted catalogs are refused
 loudly until the key-grouped read path is built (per-file random keys,
 encryption_config.footer_key_value per parquet_scan — DuckDB secrets do
 not map per-file keys).
+
+Two data-plane contracts worth knowing:
+
+- filter_expr is evaluated by TWO SQL engines (DuckDB for parquet scans,
+  Postgres for inline stores) — it must stay in the dialect intersection.
+  router.build_filter_expr's `col IN (...)` literal form is; anything
+  fancier needs a parity test first.
+- Temporal columns are normalized to the pinned schema's tz/unit after the
+  parquet scan (pyducklake pins timestamp[us, tz=UTC]; a parquet read
+  inherits the DuckDB session TimeZone — without the cast, a mixed
+  parquet+inline read raises or drifts on a non-UTC host).
 """
 
 from __future__ import annotations
 
+import datetime
+import decimal
 import logging
 import time
 from typing import TYPE_CHECKING
 
 import psycopg
 import pyarrow as pa
+import pyarrow.compute as pc
 
 if TYPE_CHECKING:
     from pyducklake import Table
@@ -73,11 +87,19 @@ _SNAP_ALIAS = "__viaduck_snap"
 
 def _is_missing_file_error(exc: Exception) -> bool:
     """True when a parquet read failed because a listed file vanished —
-    the plan/execute-skew race (duckdb raises IOException with the path).
-    Matching on the message is brittle across duckdb builds, so this checks
-    the exception type and the message shape together."""
-    return type(exc).__name__ == "IOException" and (
-        "No files found that match" in str(exc) or "NoSuchKey" in str(exc) or "404" in str(exc)
+    the plan/execute-skew race. Local FS raises duckdb IOException ("No
+    files found that match"); S3 raises duckdb HTTPException with the HTTP
+    404 body ("NoSuchKey" / "Not Found" — verified against the httpfs
+    1.5.5 binary). Matching on messages is brittle across duckdb builds,
+    so this checks the exception type AND the message shape together.
+    Asymmetry is deliberate: a false positive costs one spurious re-plan;
+    a false negative fails loudly without one."""
+    if type(exc).__name__ not in ("IOException", "HTTPException"):
+        return False
+    msg = str(exc)
+    return any(
+        needle in msg
+        for needle in ("No files found that match", "NoSuchKey", "404", "Not Found", "The specified key does not exist")
     )
 
 
@@ -290,8 +312,13 @@ class FeedReader:
         if not file_rows and not inline_rows:
             return _empty_table(table, columns)
 
+        full_schema = table.schema.as_arrow()
+        target_schema = pa.schema([full_schema.field(c) for c in data_columns])
+
         def scan(rows) -> pa.Table | None:
-            return self._scan_files(conn, rows, path_info, after_snapshot, end_snapshot, data_columns, filter_expr)
+            return self._scan_files(
+                conn, rows, path_info, after_snapshot, end_snapshot, data_columns, filter_expr, target_schema
+            )
 
         try:
             result = scan(file_rows)
@@ -396,6 +423,7 @@ class FeedReader:
         end_snapshot: int,
         data_columns: tuple[str, ...],
         filter_expr: str | None,
+        target_schema: pa.Schema,
     ) -> pa.Table | None:
         """Parquet data plane for one plan. None when the plan has no files.
 
@@ -438,7 +466,7 @@ class FeedReader:
                 sql = f"SELECT {proj_sql} FROM parquet_scan({_path_list_sql(paths)})"
                 if filter_expr:
                     sql += f" WHERE {filter_expr}"
-                parts.append(conn.execute(sql).to_arrow_table())
+                parts.append(_align_temporal_types(conn.execute(sql).to_arrow_table(), target_schema))
         if partial_filtered:
             paths_sql = _path_list_sql(partial_filtered)
             sql = (
@@ -448,7 +476,7 @@ class FeedReader:
             )
             if filter_expr:
                 sql += f" AND ({filter_expr})"
-            parts.append(conn.execute(sql).to_arrow_table())
+            parts.append(_align_temporal_types(conn.execute(sql).to_arrow_table(), target_schema))
         metrics.cdc_feed_query_seconds.labels(surface="parquet").observe(time.monotonic() - read_t0)
         if not parts:
             return None
@@ -484,6 +512,7 @@ class FeedReader:
         # other tenants' data into the read.)
         filter_sql = f" AND ({filter_expr})" if filter_expr else ""
         for (store,) in registry:
+            store = store.replace('"', '""')
             rows.extend(
                 conn.execute(
                     f'SELECT {data_cols} FROM "{self._meta_schema}"."{store}" '
@@ -525,6 +554,26 @@ class FeedReader:
         return parent.rstrip("/") + "/" + path
 
 
+def _align_temporal_types(tbl: pa.Table, target: pa.Schema) -> pa.Table:
+    """Cast timestamp columns to the pinned schema's tz/unit when they
+    differ. parquet_scan inherits the DuckDB session TimeZone while the
+    pinned schema (pyducklake) is timestamp[us, tz=UTC] — without this, a
+    read mixing parquet and inline rows raises (or worse, drifts) on any
+    non-UTC host. Instant-preserving cast; naive↔aware mismatches raise
+    (loud). Non-timestamp columns are untouched (concat's promote rules
+    handle the rest).
+    """
+    out = tbl
+    for field in target:
+        idx = out.schema.get_field_index(field.name)
+        if idx == -1:
+            continue
+        actual = out.schema.field(field.name).type
+        if pa.types.is_timestamp(field.type) and pa.types.is_timestamp(actual) and actual != field.type:
+            out = out.set_column(idx, field, pc.cast(out.column(field.name), field.type))
+    return out
+
+
 def _projection_sql(columns: tuple[str, ...] | None) -> str:
     """Explicit projection (see read_cdc: pins the read to the startup
     schema). Identifiers are double-quoted with embedded quotes escaped —
@@ -553,28 +602,55 @@ def _inline_to_arrow(table: Table, columns: tuple[str, ...], rows: list[tuple]) 
     The inline store's PG column types do NOT match the source types
     (verified on a live catalog): VARCHAR lands in `bytea` (psycopg hands
     back bytes), TIMESTAMP/TIMESTAMPTZ/DATE land in `varchar` (str), the
-    numerics are native. Coerce per target arrow type; anything unexpected
-    raises here (fail loud) rather than drifting.
+    numerics are native. Coercion is an explicit ALLOWLIST of
+    (python type, arrow type) pairs — anything else raises FeedError with
+    column context. A bare pass-through is a silent-corruption vector
+    (e.g. PG interval arrives as a timedelta that pyarrow would silently
+    pack into month_day_nano with 30-day months).
     """
-    import datetime as _dt
 
-    def coerce(value, pa_type):
+    def coerce(value, pa_type, col: str):
         if value is None:
             return None
-        if isinstance(value, (bytes, memoryview)) and (
-            pa.types.is_string(pa_type) or pa.types.is_large_string(pa_type)
-        ):
-            return bytes(value).decode("utf-8")
-        if isinstance(value, str):
+        if isinstance(value, bool) and pa.types.is_boolean(pa_type):
+            return value
+        if isinstance(value, bytes | memoryview):
+            if pa.types.is_string(pa_type) or pa.types.is_large_string(pa_type):
+                return bytes(value).decode("utf-8")
+            if pa.types.is_binary(pa_type) or pa.types.is_large_binary(pa_type):
+                return bytes(value)
+        elif isinstance(value, str):
+            if pa.types.is_string(pa_type) or pa.types.is_large_string(pa_type):
+                return value
             if pa.types.is_timestamp(pa_type):
-                return _dt.datetime.fromisoformat(value)
+                return datetime.datetime.fromisoformat(value)
             if pa.types.is_date32(pa_type) or pa.types.is_date64(pa_type):
-                return _dt.date.fromisoformat(value)
+                return datetime.date.fromisoformat(value)
             if pa.types.is_time32(pa_type) or pa.types.is_time64(pa_type):
-                return _dt.time.fromisoformat(value)
-        return value
+                return datetime.time.fromisoformat(value)
+        elif isinstance(value, int) and (
+            pa.types.is_integer(pa_type) or pa.types.is_floating(pa_type) or pa.types.is_decimal(pa_type)
+        ):
+            return value
+        elif isinstance(value, float) and (pa.types.is_floating(pa_type) or pa.types.is_decimal(pa_type)):
+            return value
+        elif isinstance(value, decimal.Decimal) and pa.types.is_decimal(pa_type):
+            return value
+        elif isinstance(value, datetime.datetime) and pa.types.is_timestamp(pa_type):
+            return value
+        elif isinstance(value, datetime.date) and (pa.types.is_date32(pa_type) or pa.types.is_date64(pa_type)):
+            return value
+        elif isinstance(value, datetime.time) and (pa.types.is_time32(pa_type) or pa.types.is_time64(pa_type)):
+            return value
+        raise FeedError(
+            f"inline store column {col!r}: cannot convert {type(value).__name__} to {pa_type} "
+            f"— refusing to guess (extend the allowlist deliberately)"
+        )
 
     schema = table.schema.as_arrow()
     schema = pa.schema([schema.field(c) for c in columns])
-    arrays = [pa.array([coerce(r[i], field.type) for r in rows], type=field.type) for i, field in enumerate(schema)]
+    arrays = [
+        pa.array([coerce(r[i], field.type, field.name) for r in rows], type=field.type)
+        for i, field in enumerate(schema)
+    ]
     return pa.Table.from_arrays(arrays, schema=schema)

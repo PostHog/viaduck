@@ -32,6 +32,7 @@ def _fresh_database(pg_dsn: str, name: str) -> str:
     every catalog fixture beyond the first gets its own database."""
     import psycopg
 
+    assert "dbname=test" in pg_dsn, f"unexpected container dbname in {pg_dsn!r} — update the replace() below"
     admin = psycopg.connect(pg_dsn, autocommit=True)
     admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
     admin.execute(f'CREATE DATABASE "{name}"')
@@ -39,7 +40,7 @@ def _fresh_database(pg_dsn: str, name: str) -> str:
     return pg_dsn.replace("dbname=test", f"dbname={name}")
 
 
-def _new_catalog(pg_dsn: str, tmp_path_factory, name: str, db: str, *, encrypted: bool = False):
+def _new_catalog(tmp_path_factory, name: str, db: str, *, encrypted: bool = False):
     data_dir = tmp_path_factory.mktemp(f"feed-{name}-data")
     return Catalog(name, f"postgres:{db}", data_path=str(data_dir), encrypted=encrypted)
 
@@ -423,8 +424,9 @@ class TestSchemaEvolution:
         import duckdb
         import psycopg
 
-        with pytest.raises((duckdb.Error, psycopg.Error)):
+        with pytest.raises((duckdb.Error, psycopg.Error)) as exc_info:
             reader.read(tbl, catalog.connection, renamed_created, head)
+        assert "event_renamed" in str(exc_info.value)
 
 
 class TestAddDataFiles:
@@ -458,7 +460,7 @@ class TestAddDataFiles:
 class TestEncryptionRefusal:
     def test_encrypted_catalog_refused_loudly(self, pg_dsn, tmp_path_factory):
         enc_db = _fresh_database(pg_dsn, "feed_enc_db")
-        cat = _new_catalog(pg_dsn, tmp_path_factory, "enclake", enc_db, encrypted=True)
+        cat = _new_catalog(tmp_path_factory, "enclake", enc_db, encrypted=True)
         try:
             cat.connection.execute("CREATE TABLE enclake.main.t (x BIGINT)")
             r = FeedReader(postgres_uri=enc_db, catalog_name="enclake", data_path=cat._data_path)
@@ -486,7 +488,7 @@ class TestMissingFileDrill:
             conn.execute("RESET ducklake_default_data_inlining_row_limit")
         return catalog.load_table(f"main.{name}"), created
 
-    def test_merge_skew_recovers(self, pg_dsn, reader, catalog):
+    def test_merge_skew_recovers(self, pg_dsn, catalog):
         tbl, fresh_created = self._files_table(catalog, "drill_recover")
         fresh = _new_reader(catalog, pg_dsn)
         try:
@@ -508,13 +510,17 @@ class TestMissingFileDrill:
             fresh._plan = stale_plan
             head = tbl.current_snapshot().snapshot_id
             created = fresh_created
+            from viaduck import metrics as m
+
+            before = m.cdc_feed_replans_total._value.get()
             got = fresh.read(tbl, catalog.connection, created, head)
             want = _insertions(tbl, created, head)
             assert _rows(got) == want
+            assert m.cdc_feed_replans_total._value.get() == before + 1  # the re-plan actually fired
         finally:
             fresh.close()
 
-    def test_untracked_missing_file_propagates(self, pg_dsn, reader, catalog):
+    def test_untracked_missing_file_propagates(self, pg_dsn, catalog):
         import duckdb
 
         tbl, fresh_created = self._files_table(catalog, "drill_propagate")
@@ -617,3 +623,94 @@ class TestSortedTable:
         for lo in range(created, head - 1):
             for hi in range(lo + 1, head + 1):
                 assert _feed(reader, catalog.connection, tbl, lo, hi) == _insertions(tbl, lo, hi), f"({lo}, {hi}]"
+
+
+class TestFilterAcrossBuckets:
+    """filter_expr must hold in ALL THREE scan buckets — plain parquet,
+    true-straddle (two-sided-filtered), and inline (covered in TestInline).
+    The M1 leak shipped in exactly one bucket while the others were fine."""
+
+    def test_plain_parquet_filter(self, pg_dsn, reader, catalog):
+        conn = catalog.connection
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute("CREATE TABLE lake.main.pf (team_id BIGINT, event VARCHAR, value BIGINT)")
+            created = _head_snapshot(catalog)
+            _insert(catalog, [(2, "keep", 1), (7, "drop", 2)], "main.pf")
+            _insert(catalog, [(2, "keep2", 3)], "main.pf")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        tbl = catalog.load_table("main.pf")
+        head = tbl.current_snapshot().snapshot_id
+        filt = "team_id IN (2)"
+        got = reader.read(tbl, catalog.connection, created, head, filter_expr=filt)
+        want = _insertions(tbl, created, head, filt)
+        assert _rows(got) == want
+        assert _rows(got).get((7, "drop", 2)) is None  # filtered out
+        assert _rows(got).get((2, "keep", 1)) == 1  # present once
+
+    def test_straddle_filter(self, pg_dsn, reader, catalog):
+        """A merged file read mid-window WITH a routing filter: the two
+        filters must compose (snapshot window AND team)."""
+        conn = catalog.connection
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute("CREATE TABLE lake.main.sf (team_id BIGINT, event VARCHAR, value BIGINT)")
+            created = _head_snapshot(catalog)
+            for i in range(6):
+                _insert(catalog, [(2, f"a{i}", i), (7, f"b{i}", i)], "main.sf")
+            conn.execute("CALL ducklake_merge_adjacent_files('lake')")
+            merged_snap = _head_snapshot(catalog)
+            _insert(catalog, [(2, "post", 100), (7, "post7", 101)], "main.sf")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        tbl = catalog.load_table("main.sf")
+        head = _head_snapshot(catalog)
+        filt = "team_id IN (2)"
+        # Windows straddling the merged file's range, with the team filter.
+        for lo in range(created, head - 1):
+            for hi in range(lo + 1, head + 1):
+                got = _feed(reader, catalog.connection, tbl, lo, hi, filt)
+                want = _insertions(tbl, lo, hi, filt)
+                assert got == want, f"({lo}, {hi}] filter"
+                assert all(t[0] == 2 for t in got), f"filter leak in ({lo}, {hi}]"
+        assert merged_snap > created + 6  # the merge committed (non-vacuous)
+
+
+class TestMixedPlaneFidelity:
+    """One read spanning BOTH planes (inline rows + parquet files) — the
+    shape that exposes cross-plane type/tz divergence (a UTC-pinned inline
+    column concat'd with a session-tz parquet column)."""
+
+    def test_mixed_inline_and_parquet_with_timestamps(self, pg_dsn, reader, catalog):
+        conn = catalog.connection
+        conn.execute(
+            "CREATE TABLE lake.main.mixed (team_id BIGINT, s VARCHAR, tstz TIMESTAMPTZ, d DATE, dec DECIMAL(10,2))"
+        )
+        created = _head_snapshot(catalog)
+        tbl = catalog.load_table("main.mixed")
+        # Rows 1-2 stay inline (default limit > 0 in this build)…
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 100")
+        try:
+            conn.execute(
+                "INSERT INTO lake.main.mixed VALUES "
+                "(2, 'inlined', '2026-03-01 12:00:00+00', '2026-03-01', 1.50), "
+                "(7, 'inlined7', '2026-03-01 13:00:00+00', '2026-03-02', 2.25)"
+            )
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        # …rows 3-4 are real parquet files.
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute(
+                "INSERT INTO lake.main.mixed VALUES (2, 'filed', '2026-03-03 09:00:00+00', '2026-03-03', 3.75)"
+            )
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        head = _head_snapshot(catalog)
+        got = reader.read(tbl, catalog.connection, created, head)  # raises if planes' tz diverge
+        want = _insertions(tbl, created, head)
+        assert _rows(got) == want
+        assert sum(_rows(got).values()) == 3
+        # The parquet leg must have been normalized to the pinned UTC schema.
+        assert got.column("tstz").type == pa.timestamp("us", tz="UTC")

@@ -73,6 +73,18 @@ from viaduck.state import StateManager
 
 log = logging.getLogger(__name__)
 
+
+def _validate_feed_mode(cfg) -> None:
+    """source.cdc_reader=direct requires append_only: the feed implements
+    table_insertions semantics only (no delete stream). Startup refuses the
+    combination loudly rather than silently reading inserts-only."""
+    if cfg.routing.mode != "append_only":
+        raise ConfigError(
+            f"source.cdc_reader='direct' requires routing.mode='append_only', got {cfg.routing.mode!r}: "
+            "the feed implements table_insertions semantics only (no delete stream)"
+        )
+
+
 # Per-cycle read budget per cursor group. Bounds how many CDC chunks one
 # group may read before the poll cycle moves to the next group — the fairness
 # valve that keeps a deeply-lagging (or flush-failing, position-resetting)
@@ -731,11 +743,7 @@ def run(cfg: config.ViaduckConfig) -> None:
     # stays as the rollback while the flag exists.
     feed_reader = None
     if cfg.source.cdc_reader == "direct":
-        if cfg.routing.mode != "append_only":
-            raise ConfigError(
-                f"source.cdc_reader='direct' requires routing.mode='append_only', got {cfg.routing.mode!r}: "
-                "the feed implements table_insertions semantics only (no delete stream)"
-            )
+        _validate_feed_mode(cfg)
         feed_reader = feed.FeedReader(
             postgres_uri=cfg.source.postgres_uri,
             catalog_name=cfg.source.name,

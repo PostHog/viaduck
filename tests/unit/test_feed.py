@@ -297,3 +297,79 @@ class TestPathResolution:
         r = FeedReader(postgres_uri="postgresql://x", catalog_name="lake", data_path=None)
         with pytest.raises(FeedError, match="Relative data file path"):
             r._resolve_path("f.parquet", True, (None, False), (None, False))
+
+
+class TestInlineCoercion:
+    """The allowlist in _inline_to_arrow: pass-through pairs stay exact,
+    everything else raises FeedError (never silent)."""
+
+    def _table(self):
+        table = MagicMock()
+        f1 = MagicMock()
+        f1.name = "s"
+        f2 = MagicMock()
+        f2.name = "ts"
+        table.schema.fields = [f1, f2]
+        table.schema.as_arrow.return_value = pa.schema(
+            [pa.field("s", pa.string()), pa.field("ts", pa.timestamp("us", tz="UTC"))]
+        )
+        return table
+
+    def test_bytes_to_string_and_str_to_timestamp(self):
+        import datetime
+
+        out = feed._inline_to_arrow(self._table(), ("s", "ts"), [(b"duck", "2026-01-02 03:04:05+00:00")])
+        assert out.column("s").to_pylist() == ["duck"]
+        assert out.column("ts").to_pylist() == [datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.UTC)]
+
+    def test_interval_refused_loudly(self):
+        import datetime
+
+        table = MagicMock()
+        f = MagicMock()
+        f.name = "i"
+        table.schema.fields = [f]
+        table.schema.as_arrow.return_value = pa.schema([pa.field("i", pa.month_day_nano_interval())])
+        with pytest.raises(FeedError, match="column 'i'"):
+            feed._inline_to_arrow(table, ("i",), [(datetime.timedelta(days=3),)])
+
+    def test_uuid_refused_loudly(self):
+        import uuid
+
+        table = MagicMock()
+        f = MagicMock()
+        f.name = "u"
+        table.schema.fields = [f]
+        table.schema.as_arrow.return_value = pa.schema([pa.field("u", pa.string())])
+        with pytest.raises(FeedError, match="column 'u'"):
+            feed._inline_to_arrow(table, ("u",), [(uuid.uuid4(),)])
+
+
+class TestMissingFileMatcher:
+    @pytest.mark.parametrize(
+        "type_name,msg,want",
+        [
+            ("IOException", 'No files found that match the pattern "x.parquet"', True),
+            ("HTTPException", "HTTP 404 Not Found", True),
+            ("HTTPException", "NoSuchKey: The specified key does not exist.", True),
+            ("IOException", "disk full", False),
+            ("RuntimeError", "HTTP 404 Not Found", False),
+            ("HTTPException", "connection refused", False),
+        ],
+    )
+    def test_matcher(self, type_name, msg, want):
+        exc = type(type_name, (Exception,), {})(msg)
+        assert feed._is_missing_file_error(exc) is want
+
+
+class TestRunLevelFeedGate:
+    def test_direct_requires_append_only(self):
+        from viaduck.config import ConfigError
+        from viaduck.main import _validate_feed_mode
+
+        cfg = MagicMock()
+        cfg.routing.mode = "full_cdc"
+        with pytest.raises(ConfigError, match="append_only"):
+            _validate_feed_mode(cfg)
+        cfg.routing.mode = "append_only"
+        _validate_feed_mode(cfg)  # no raise
