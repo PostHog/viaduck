@@ -165,11 +165,89 @@ def sweep_spill_dirs(base: str | None = None) -> None:
             log.info("Swept leftover spill dirs under %s", root)
 
 
-def connect(cfg: SourceConfig) -> Catalog:
-    """Create a Catalog connection to the source DuckLake."""
+# Extension-owned settings must NOT go through pyducklake's pre-attach
+# property loop. 2026-08-15 incident: the PostHog duckdb fork engine
+# (viaduck#71) + the stock-channel ducklake extension have MISMATCHED
+# setting registries — `SET ducklake_max_retry_count` wrote its value into
+# the core `TimeZone` slot (and `ducklake_retry_wait_ms` into `Calendar`),
+# so every TIMESTAMPTZ fetch raised pytz.UnknownTimeZoneError('20') and the
+# time-lag gauge went dark fleet-wide, while the retry tuning silently
+# never applied. The registries alias BIDIRECTIONALLY and attach order
+# doesn't help, so the only safe application is: SET, observe the full
+# settings diff, and revert + skip loudly when the effect isn't exactly
+# the intended key.
+_EXTENSION_SETTING_PREFIX = "ducklake_"
+
+
+def split_extension_settings(props: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """(engine-safe properties, extension settings needing verified apply)."""
+    safe = {k: v for k, v in props.items() if not k.startswith(_EXTENSION_SETTING_PREFIX)}
+    ext = {k: v for k, v in props.items() if k.startswith(_EXTENSION_SETTING_PREFIX)}
+    return safe, ext
+
+
+def apply_extension_settings_verified(conn, settings: dict[str, str], *, context: str) -> None:
+    """SET each extension setting, verifying the observed effect is exactly
+    {key: value}. Any collateral change to OTHER settings (the registry-
+    mismatch signature) is reverted and the key skipped with a WARN — a
+    degraded-but-correct connection beats silently corrupted core settings.
+    """
+
+    def snapshot() -> dict[str, str]:
+        return dict(conn.execute("SELECT name, value FROM duckdb_settings()").fetchall())
+
+    for key, value in settings.items():
+        before = snapshot()
+        try:
+            conn.execute(f"SET {key} = '{value.replace(chr(39), chr(39) * 2)}'")
+        except Exception:
+            log.warning("%s: SET %s failed; extension default stays in effect", context, key, exc_info=True)
+            continue
+        after = snapshot()
+        collateral = sorted(k for k in after if before.get(k) != after[k] and k != key)
+        if collateral:
+            for k in collateral:
+                try:
+                    conn.execute(f"SET {k} = '{before[k].replace(chr(39), chr(39) * 2)}'")
+                except Exception:
+                    log.warning("%s: could not revert corrupted setting %s", context, k, exc_info=True)
+            log.warning(
+                "%s: SET %s = %s corrupted unrelated settings %s "
+                "(engine/extension setting-registry mismatch — see viaduck#71 fork-wheel note); "
+                "reverted them and SKIPPED the setting — the extension default stays in effect",
+                context,
+                key,
+                value,
+                collateral,
+            )
+
+
+def safe_catalog(name: str, uri: str, *, data_path: str, properties: dict[str, str]) -> Catalog:
+    """Build a pyducklake Catalog with extension settings applied safely.
+
+    pyducklake applies `properties` as bare SETs before ATTACH; extension-
+    owned keys are stripped from that loop and applied post-attach with
+    verification (see _EXTENSION_SETTING_PREFIX rationale above). TimeZone
+    is then pinned to UTC explicitly: deterministic timestamps regardless of
+    container locale, and it heals the slot even if a mismatch corrupted it
+    through some path the verifier didn't see.
+    """
     from pyducklake import Catalog
 
-    return Catalog(
+    safe_props, ext_settings = split_extension_settings(properties)
+    catalog = Catalog(name, uri, data_path=data_path, properties=safe_props)
+    try:
+        apply_extension_settings_verified(catalog.connection, ext_settings, context=name)
+        catalog.connection.execute("SET TimeZone = 'UTC'")
+    except Exception:
+        catalog.close()
+        raise
+    return catalog
+
+
+def connect(cfg: SourceConfig) -> Catalog:
+    """Create a Catalog connection to the source DuckLake."""
+    return safe_catalog(
         cfg.name,
         cfg.postgres_uri,
         data_path=cfg.data_path,

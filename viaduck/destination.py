@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from viaduck import metrics, schema_projection
 from viaduck.scrub import scrub_credentials
-from viaduck.source import with_connection_defaults
+from viaduck.source import safe_catalog, with_connection_defaults
 
 if TYPE_CHECKING:
     from pyducklake import Catalog, Table
@@ -229,10 +229,8 @@ class DestinationPool:
         if self._source_schema is not None:
             return self._source_schema
 
-        from pyducklake import Catalog as PyCatalog
-
         src_cfg = self._config.source
-        src_catalog = PyCatalog(
+        src_catalog = safe_catalog(
             src_cfg.name,
             src_cfg.postgres_uri,
             data_path=src_cfg.data_path,
@@ -348,8 +346,6 @@ class DestinationPool:
         `self._projections` under `self._lock` — every `_projections` mutation
         must happen with the pool lock held.
         """
-        from pyducklake import Catalog
-
         dest_cfg: DestinationConfig = self._registry.config_for(destination_id)
         schema = self._get_source_schema()
 
@@ -362,7 +358,10 @@ class DestinationPool:
             # during connect storms — bad endpoint, reshard fence).
             uri = self._resolve_uri(dest_cfg)
             props = with_connection_defaults(dest_cfg.resolved_properties(), name=dest_cfg.name)
-            catalog = Catalog(
+            # safe_catalog, not Catalog: extension settings applied post-
+            # attach with verification (viaduck#71 fork-wheel registry
+            # mismatch — see source.safe_catalog).
+            catalog = safe_catalog(
                 dest_cfg.name,
                 uri,
                 data_path=dest_cfg.data_path,
