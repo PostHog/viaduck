@@ -122,6 +122,9 @@ def test_connect(tmp_path):
         with patch("pyducklake.Catalog") as MockCatalog:
             from viaduck.source import connect
 
+            # settings snapshots come back empty -> verified apply sees no
+            # collateral and treats every SET as clean
+            MockCatalog.return_value.connection.execute.return_value.fetchall.return_value = []
             connect(cfg)
             MockCatalog.assert_called_once()
             args, kwargs = MockCatalog.call_args
@@ -134,16 +137,24 @@ def test_connect(tmp_path):
             temp_dir = props.pop("temp_directory")
             assert temp_dir.startswith(str(tmp_path))
             assert f"{os.sep}viaduck-spill{os.sep}src-" in temp_dir
+            # ducklake_* settings are DELIBERATELY absent: pyducklake would
+            # SET them pre-attach, where the fork-engine/stock-extension
+            # registry mismatch corrupts core settings (TimeZone, Calendar).
+            # They go through apply_extension_settings_verified post-attach
+            # instead (asserted below).
             assert props == {
                 "pg_connection_limit": "64",
                 "arrow_large_buffer_size": "true",
                 "enable_progress_bar": "true",
                 "enable_progress_bar_print": "false",
                 "enable_external_file_cache": "false",
-                "ducklake_max_retry_count": "20",
-                "ducklake_retry_wait_ms": "50",
-                "ducklake_retry_backoff": "1.0",
             }
+            set_calls = [c.args[0] for c in MockCatalog.return_value.connection.execute.call_args_list]
+            assert "SELECT name, value FROM duckdb_settings()" in set_calls[0]
+            assert any(c.startswith("SET ducklake_max_retry_count") for c in set_calls)
+            assert any(c.startswith("SET ducklake_retry_wait_ms") for c in set_calls)
+            assert any(c.startswith("SET ducklake_retry_backoff") for c in set_calls)
+            assert set_calls[-1] == "SET TimeZone = 'UTC'"
 
 
 # --- read_cdc_changes tests ---
@@ -430,3 +441,92 @@ def test_next_snapshot_touching_table_none_when_span_is_other_tables():
 
     table = _make_skipscan_table("cat", [(16,), (None,)])
     assert next_snapshot_touching_table(table, 100, 200) is None
+
+
+# --- extension-setting verified apply (viaduck#71 fork-wheel registry mismatch) ---
+
+
+class _SettingsResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeSettingsConn:
+    """DuckDB-shaped connection where SETs can be aliased to the wrong slot
+    (the engine/extension registry-mismatch signature) or fail outright."""
+
+    def __init__(self, alias: dict[str, str] | None = None, fail: set[str] | None = None):
+        self.settings = {"TimeZone": "Etc/UTC", "Calendar": "gregorian"}
+        self.alias = alias or {}
+        self.fail = fail or set()
+        self.sql: list[str] = []
+
+    def execute(self, sql):
+        import re as _re
+
+        self.sql.append(sql)
+        if sql.startswith("SELECT name, value"):
+            return _SettingsResult(list(self.settings.items()))
+        m = _re.match(r"SET (\w+) = '(.*)'", sql)
+        assert m, sql
+        key, val = m.group(1), m.group(2)
+        if key in self.fail:
+            raise RuntimeError(f"unrecognized configuration parameter {key}")
+        target = self.alias.get(key, key)
+        self.settings[target] = val
+        if target != key:
+            # the real mismatch mirrors the value under the extension name too
+            self.settings[key] = val
+        return _SettingsResult([])
+
+
+def test_split_extension_settings():
+    from viaduck.source import split_extension_settings
+
+    safe, ext = split_extension_settings(
+        {"s3_region": "us-east-1", "ducklake_max_retry_count": "20", "memory_limit": "4GB"}
+    )
+    assert ext == {"ducklake_max_retry_count": "20"}
+    assert "ducklake_max_retry_count" not in safe
+    assert safe["s3_region"] == "us-east-1"
+
+
+def test_verified_apply_healthy_engine_applies_cleanly(caplog):
+    from viaduck.source import apply_extension_settings_verified
+
+    conn = _FakeSettingsConn()
+    with caplog.at_level("WARNING"):
+        apply_extension_settings_verified(
+            conn, {"ducklake_max_retry_count": "20", "ducklake_retry_backoff": "1.0"}, context="t"
+        )
+    assert conn.settings["ducklake_max_retry_count"] == "20"
+    assert conn.settings["ducklake_retry_backoff"] == "1.0"
+    assert conn.settings["TimeZone"] == "Etc/UTC"
+    assert not [r for r in caplog.records if r.name == "viaduck.source"]
+
+
+def test_verified_apply_reverts_aliased_collateral(caplog):
+    """The prod signature: SET ducklake_max_retry_count lands in TimeZone.
+    The corrupted slot must be restored and the mismatch WARNed."""
+    from viaduck.source import apply_extension_settings_verified
+
+    conn = _FakeSettingsConn(alias={"ducklake_max_retry_count": "TimeZone"})
+    with caplog.at_level("WARNING"):
+        apply_extension_settings_verified(conn, {"ducklake_max_retry_count": "20"}, context="t")
+    assert conn.settings["TimeZone"] == "Etc/UTC"  # reverted
+    assert any("corrupted unrelated settings" in r.getMessage() for r in caplog.records)
+
+
+def test_verified_apply_set_failure_continues(caplog):
+    from viaduck.source import apply_extension_settings_verified
+
+    conn = _FakeSettingsConn(fail={"ducklake_retry_wait_ms"})
+    with caplog.at_level("WARNING"):
+        apply_extension_settings_verified(
+            conn, {"ducklake_retry_wait_ms": "50", "ducklake_retry_backoff": "1.0"}, context="t"
+        )
+    assert conn.settings["ducklake_retry_backoff"] == "1.0"  # later key still applied
+    assert any("SET ducklake_retry_wait_ms failed" in r.getMessage() for r in caplog.records)
