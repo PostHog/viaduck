@@ -20,11 +20,42 @@ from pyducklake import Catalog
 from testcontainers.postgres import PostgresContainer
 
 from viaduck import metrics
-from viaduck.feed import FeedReader
+from viaduck.feed import FeedError, FeedReader
 
 
 def setup_module():
     metrics.init("integration_test")
+
+
+def _fresh_database(pg_dsn: str, name: str) -> str:
+    """A PG database hosts ONE ducklake catalog's metadata (public schema) —
+    every catalog fixture beyond the first gets its own database."""
+    import psycopg
+
+    admin = psycopg.connect(pg_dsn, autocommit=True)
+    admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin.execute(f'CREATE DATABASE "{name}"')
+    admin.close()
+    return pg_dsn.replace("dbname=test", f"dbname={name}")
+
+
+def _new_catalog(pg_dsn: str, tmp_path_factory, name: str, db: str, *, encrypted: bool = False):
+    data_dir = tmp_path_factory.mktemp(f"feed-{name}-data")
+    return Catalog(name, f"postgres:{db}", data_path=str(data_dir), encrypted=encrypted)
+
+
+def _head_snapshot(catalog: Catalog) -> int:
+    """Catalog head snapshot id (direct metadata read — never
+    table.snapshots(), the OOM-pattern the app avoids)."""
+    name = f"__ducklake_metadata_{catalog.name}".replace('"', '""')
+    row = catalog.connection.execute(f'SELECT MAX(snapshot_id) FROM "{name}".ducklake_snapshot').fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _new_reader(catalog: Catalog, dsn: str) -> FeedReader:
+    r = FeedReader(postgres_uri=dsn, catalog_name=catalog.name, data_path=catalog._data_path)
+    r.verify_catalog()
+    return r
 
 
 @pytest.fixture(scope="module")
@@ -266,3 +297,323 @@ class TestInline:
 def _inline_insert(catalog: Catalog, rows: list[tuple[int, str, int]]):
     vals = ", ".join(f"({t}, '{e}', {v})" for t, e, v in rows)
     catalog.connection.execute(f"INSERT INTO laked.main.inlined VALUES {vals}")
+
+
+class TestForeignSnapshots:
+    """Other tables' commits interleave (snapshot ids are global); the feed
+    must neither skip nor double-read across the noise."""
+
+    def test_interleaved_noise(self, reader, catalog, table, snaps):
+        conn = catalog.connection
+        conn.execute("CREATE TABLE IF NOT EXISTS lake.main.noise (x BIGINT)")
+        # Noise commits BETWEEN events reads.
+        conn.execute("INSERT INTO lake.main.noise VALUES (1), (2)")
+        conn.execute("INSERT INTO lake.main.noise VALUES (3)")
+        lo, hi = snaps[1], snaps[3]
+        assert _feed(reader, catalog.connection, table, lo, hi) == _insertions(table, lo, hi)
+        # A range of pure noise for the events table: empty on both paths.
+        noise_head = catalog.load_table("main.noise").current_snapshot().snapshot_id
+        assert _feed(reader, catalog.connection, table, snaps[-1], noise_head) == _insertions(
+            table, snaps[-1], noise_head
+        )
+
+
+class TestTypeFidelity:
+    """Type/values matrix through BOTH the parquet and inline read paths —
+    the inline path converts PG→psycopg→Arrow and is the riskier one."""
+
+    TYPES_DDL = (
+        "id BIGINT, s VARCHAR, f DOUBLE, b BOOLEAN, ts TIMESTAMP, "
+        "tstz TIMESTAMPTZ, d DATE, dec DECIMAL(10,2), i INTEGER"
+    )
+    ROWS = [
+        (1, "plain", 1.5, True, "2026-01-01 10:00:00", "2026-01-01 10:00:00+00", "2026-01-01", 1.25, 7),
+        (
+            2,
+            "unicode-ü-emoji-🦆",
+            -0.0,
+            False,
+            "2026-06-30 23:59:59",
+            "2026-06-30 23:59:59+00",
+            "2026-06-30",
+            -99.99,
+            -3,
+        ),
+        (3, "quote'inside", 3.25, None, None, None, None, None, None),
+        (4, 'double"quote', 4.5, True, "2026-08-15 00:00:00", "2026-08-15 00:00:00+00", "2026-08-15", 0.01, 0),
+    ]
+
+    def _build(self, catalog, table_name, inlining: bool):
+        conn = catalog.connection
+        conn.execute(f"SET ducklake_default_data_inlining_row_limit = {100 if inlining else 0}")
+        try:
+            conn.execute(f"CREATE TABLE lake.main.{table_name} ({self.TYPES_DDL})")
+            for r in self.ROWS:
+                esc_s = r[1].replace("'", "''")
+                vals = (
+                    f"({r[0]}, '{esc_s}', {r[2]}, "
+                    + ("NULL" if r[3] is None else str(r[3]))
+                    + ", "
+                    + (f"'{r[4]}'" if r[4] else "NULL")
+                    + ", "
+                    + (f"'{r[5]}'::TIMESTAMPTZ" if r[5] else "NULL")
+                    + ", "
+                    + (f"'{r[6]}'::DATE" if r[6] else "NULL")
+                    + ", "
+                    + (f"{r[7]}::DECIMAL(10,2)" if r[7] is not None else "NULL")
+                    + f", {r[8] if r[8] is not None else 'NULL'})"
+                )
+                conn.execute(f"INSERT INTO lake.main.{table_name} VALUES {vals}")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        return catalog.load_table(f"main.{table_name}")
+
+    @pytest.mark.parametrize("inlining", [True, False], ids=["inline", "parquet"])
+    def test_type_fidelity(self, reader, catalog, inlining):
+        name = "types_inline" if inlining else "types_parquet"
+        tbl = self._build(catalog, name, inlining)
+        head = tbl.current_snapshot().snapshot_id
+        got = _feed(reader, catalog.connection, tbl, 0, head)
+        want = _insertions(tbl, 0, head)
+        assert got == want
+        # Non-vacuous: every fixture row present.
+        assert sum(got.values()) == len(self.ROWS)
+
+
+class TestSchemaEvolution:
+    """Pinned projection (startup schema) over evolving source files; a
+    rename fails LOUDLY (no mapping_id support) — never silently NULL."""
+
+    def test_add_column_with_pinned_projection(self, reader, catalog):
+        conn = catalog.connection
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute("CREATE TABLE lake.main.evol (team_id BIGINT, event VARCHAR, value BIGINT)")
+            created = _head_snapshot(catalog)
+            conn.execute("INSERT INTO lake.main.evol VALUES (2, 'before', 1)")
+            conn.execute("ALTER TABLE lake.main.evol ADD COLUMN extra VARCHAR")
+            conn.execute("INSERT INTO lake.main.evol VALUES (2, 'after', 2, 'yes'), (7, 'after7', 3, 'yes')")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        tbl = catalog.load_table("main.evol")
+        head = tbl.current_snapshot().snapshot_id
+        # Startup-pinned projection (the production shape): reads fine.
+        pinned = ("team_id", "event", "value")
+        got = reader.read(tbl, catalog.connection, created, head, columns=pinned)
+        assert _rows(got) == _rows(
+            tbl.table_insertions(start_snapshot=created + 1, end_snapshot=head, columns=pinned).to_arrow()
+        )
+        assert sum(_rows(got).values()) == 3
+
+    def test_rename_fails_loudly(self, reader, catalog):
+        conn = catalog.connection
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute("CREATE TABLE lake.main.renamed (team_id BIGINT, event VARCHAR)")
+            renamed_created = _head_snapshot(catalog)
+            conn.execute("INSERT INTO lake.main.renamed VALUES (2, 'x')")
+            conn.execute("ALTER TABLE lake.main.renamed RENAME COLUMN event TO event_renamed")
+            conn.execute("INSERT INTO lake.main.renamed VALUES (2, 'y')")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        tbl = catalog.load_table("main.renamed")
+        head = tbl.current_snapshot().snapshot_id
+        # The extension maps old files' columns by field id; the feed does
+        # not (yet). Pin the loud failure — never silent NULLs.
+        import duckdb
+        import psycopg
+
+        with pytest.raises((duckdb.Error, psycopg.Error)):
+            reader.read(tbl, catalog.connection, renamed_created, head)
+
+
+class TestAddDataFiles:
+    def test_registered_external_file_is_delivered(self, reader, catalog, tmp_path):
+        conn = catalog.connection
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute("CREATE TABLE lake.main.ext (team_id BIGINT, event VARCHAR, value BIGINT)")
+            conn.execute("INSERT INTO lake.main.ext VALUES (2, 'native', 1)")
+            tbl = catalog.load_table("main.ext")
+            before = tbl.current_snapshot().snapshot_id
+
+            import pyarrow.parquet as pq
+
+            ext_path = str(tmp_path / "external.parquet")
+            pq.write_table(
+                pa.table({"team_id": [2, 7], "event": ["imported", "imported7"], "value": [10, 11]}),
+                ext_path,
+            )
+            tbl.add_files(ext_path)
+            head = tbl.current_snapshot().snapshot_id
+            assert head > before
+            got = _feed(reader, catalog.connection, tbl, before, head)
+            want = _insertions(tbl, before, head)
+            assert got == want
+            assert (2, "imported", 10) in got
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+
+
+class TestEncryptionRefusal:
+    def test_encrypted_catalog_refused_loudly(self, pg_dsn, tmp_path_factory):
+        enc_db = _fresh_database(pg_dsn, "feed_enc_db")
+        cat = _new_catalog(pg_dsn, tmp_path_factory, "enclake", enc_db, encrypted=True)
+        try:
+            cat.connection.execute("CREATE TABLE enclake.main.t (x BIGINT)")
+            r = FeedReader(postgres_uri=enc_db, catalog_name="enclake", data_path=cat._data_path)
+            with pytest.raises(FeedError, match="encrypted"):
+                r.verify_catalog()
+        finally:
+            cat.close()
+
+
+class TestMissingFileDrill:
+    """Plan/execute skew: a merge+cleanup committing between the catalog
+    plan and the parquet GET. The feed must re-plan once and recover; a file
+    missing WITHOUT a catalog change must propagate loudly after one
+    re-plan."""
+
+    def _files_table(self, catalog, name):
+        conn = catalog.connection
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute(f"CREATE TABLE lake.main.{name} (team_id BIGINT, event VARCHAR, value BIGINT)")
+            created = _head_snapshot(catalog)
+            for i in range(4):
+                _insert(catalog, [(2, f"d{i}", i)], f"main.{name}")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        return catalog.load_table(f"main.{name}"), created
+
+    def test_merge_skew_recovers(self, pg_dsn, reader, catalog):
+        tbl, fresh_created = self._files_table(catalog, "drill_recover")
+        fresh = _new_reader(catalog, pg_dsn)
+        try:
+            orig_plan = fresh._plan
+            state = {"armed": True}
+
+            def stale_plan(*args, **kwargs):
+                plan = orig_plan(*args, **kwargs)
+                if state["armed"]:
+                    state["armed"] = False
+                    # The merge commits (deletes the listed source rows) and
+                    # cleanup deletes the physical files — between plan & GET.
+                    catalog.connection.execute("CALL ducklake_merge_adjacent_files('lake')")
+                    catalog.connection.execute(
+                        "CALL ducklake_cleanup_old_files('lake', older_than := '2100-01-01 00:00:00')"
+                    )
+                return plan
+
+            fresh._plan = stale_plan
+            head = tbl.current_snapshot().snapshot_id
+            created = fresh_created
+            got = fresh.read(tbl, catalog.connection, created, head)
+            want = _insertions(tbl, created, head)
+            assert _rows(got) == want
+        finally:
+            fresh.close()
+
+    def test_untracked_missing_file_propagates(self, pg_dsn, reader, catalog):
+        import duckdb
+
+        tbl, fresh_created = self._files_table(catalog, "drill_propagate")
+        fresh = _new_reader(catalog, pg_dsn)
+        try:
+            head = tbl.current_snapshot().snapshot_id
+            file_rows, _inline, path_info = fresh._plan(
+                tbl, "main", "drill_propagate", fresh_created, head, ("team_id", "event", "value"), None
+            )
+            # Delete the physical file WITHOUT a catalog change: the re-plan
+            # still lists it, the second GET must fail, and the error
+            # propagates (no silent skip).
+            victim = file_rows[0]
+            path = fresh._resolve_path(victim[5], victim[6], *path_info)
+            import os
+
+            os.remove(path)
+            with pytest.raises(duckdb.IOException):
+                fresh.read(tbl, catalog.connection, fresh_created, head)
+        finally:
+            fresh.close()
+            # Don't leave the dangling catalog row for other tests' merges.
+            catalog.connection.execute("DROP TABLE IF EXISTS lake.main.drill_propagate")
+
+
+class TestTorture:
+    """Deterministic-seed interleave of plain inserts, inline commits,
+    flushes, merges, and foreign-table noise; then the full O(n²) range
+    matrix + filter matrix + adjacent-range partition exactness."""
+
+    def test_torture_parity(self, pg_dsn, reader, catalog):
+        import random
+
+        rng = random.Random(20260815)
+        conn = catalog.connection
+        conn.execute("CREATE TABLE IF NOT EXISTS lake.main.torture_noise (x BIGINT)")
+        conn.execute("CREATE TABLE lake.main.torture (team_id BIGINT, event VARCHAR, value BIGINT)")
+        created = _head_snapshot(catalog)
+        tbl = catalog.load_table("main.torture")
+        teams = [2, 7, 50689, 23104, 81505]
+        n = 0
+        for round_ in range(30):
+            inlining = rng.random() < 0.5
+            conn.execute(f"SET ducklake_default_data_inlining_row_limit = {100 if inlining else 0}")
+            try:
+                for _ in range(rng.randint(0, 3)):
+                    rows = [(rng.choice(teams), f"r{round_}_{n + k}", n + k) for k in range(rng.randint(1, 4))]
+                    _insert(catalog, rows, "main.torture")
+                    n += len(rows)
+                conn.execute("INSERT INTO lake.main.torture_noise VALUES (1)")
+                if round_ % 5 == 4:
+                    conn.execute(
+                        "CALL ducklake_flush_inlined_data('lake', schema_name := 'main', table_name := 'torture')"
+                    )
+                if round_ % 7 == 6:
+                    conn.execute("CALL ducklake_merge_adjacent_files('lake')")
+            finally:
+                conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        conn.execute("CALL ducklake_flush_inlined_data('lake', schema_name := 'main', table_name := 'torture')")
+        conn.execute("CALL ducklake_merge_adjacent_files('lake')")
+
+        head = tbl.current_snapshot().snapshot_id
+        assert head - created > 30  # the torture actually committed
+
+        whole = _feed(reader, catalog.connection, tbl, created, head)
+        assert sum(whole.values()) == n
+        assert whole == _insertions(tbl, created, head)
+
+        for lo in range(created, head - 1, 3):
+            for hi in range(lo + 1, head + 1, 3):
+                assert _feed(reader, catalog.connection, tbl, lo, hi) == _insertions(tbl, lo, hi), f"({lo}, {hi}]"
+
+        for cut in range(created + 1, head):
+            left = _feed(reader, catalog.connection, tbl, created, cut)
+            right = _feed(reader, catalog.connection, tbl, cut, head)
+            assert left + right == whole, f"partition broken at {cut}"
+
+        for team in teams:
+            filt = f"team_id IN ({team})"
+            assert _feed(reader, catalog.connection, tbl, created, head, filt) == _insertions(tbl, created, head, filt)
+
+
+class TestSortedTable:
+    """Sorted tables flush inline rows in SORT order (file position ≠ rowid
+    order) — the feed never does rowid arithmetic, so parity must hold."""
+
+    def test_sorted_table_parity(self, pg_dsn, reader, catalog):
+        conn = catalog.connection
+        conn.execute("CREATE TABLE lake.main.sorted (team_id BIGINT, event VARCHAR, value BIGINT)")
+        conn.execute("ALTER TABLE lake.main.sorted SET SORTED BY (value DESC)")
+        created = _head_snapshot(catalog)
+        tbl = catalog.load_table("main.sorted")
+        for i in range(4):
+            _insert(catalog, [(2, f"s{i}", 100 - i), (7, f"t{i}", i)], "main.sorted")
+        # Flush (sorted, physical snapshot/rowid columns) then merge.
+        conn.execute("CALL ducklake_flush_inlined_data('lake', schema_name := 'main', table_name := 'sorted')")
+        conn.execute("CALL ducklake_merge_adjacent_files('lake')")
+        head = tbl.current_snapshot().snapshot_id
+        assert _feed(reader, catalog.connection, tbl, created, head) == _insertions(tbl, created, head)
+        for lo in range(created, head - 1):
+            for hi in range(lo + 1, head + 1):
+                assert _feed(reader, catalog.connection, tbl, lo, hi) == _insertions(tbl, lo, hi), f"({lo}, {hi}]"

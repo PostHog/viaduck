@@ -470,7 +470,7 @@ class FeedReader:
         conversion happens in _inline_to_arrow.
         """
         registry = conn.execute(
-            f'SELECT schema_version FROM "{self._meta_schema}".ducklake_inlined_data_tables WHERE table_id = %s',
+            f'SELECT table_name FROM "{self._meta_schema}".ducklake_inlined_data_tables WHERE table_id = %s',
             (table_id,),
         ).fetchall()
         rows: list[tuple] = []
@@ -483,8 +483,7 @@ class FeedReader:
         # stop. (Caught by the parity suite: unfiltered inline rows leak
         # other tenants' data into the read.)
         filter_sql = f" AND ({filter_expr})" if filter_expr else ""
-        for (sv,) in registry:
-            store = f"ducklake_inlined_data_{table_id}_{sv}"
+        for (store,) in registry:
             rows.extend(
                 conn.execute(
                     f'SELECT {data_cols} FROM "{self._meta_schema}"."{store}" '
@@ -549,7 +548,33 @@ def _empty_table(table: Table, columns: tuple[str, ...] | None) -> pa.Table:
 
 
 def _inline_to_arrow(table: Table, columns: tuple[str, ...], rows: list[tuple]) -> pa.Table:
-    """Inline PG rows → Arrow, typed per the (projected) source schema."""
+    """Inline PG rows → Arrow, typed per the (projected) source schema.
+
+    The inline store's PG column types do NOT match the source types
+    (verified on a live catalog): VARCHAR lands in `bytea` (psycopg hands
+    back bytes), TIMESTAMP/TIMESTAMPTZ/DATE land in `varchar` (str), the
+    numerics are native. Coerce per target arrow type; anything unexpected
+    raises here (fail loud) rather than drifting.
+    """
+    import datetime as _dt
+
+    def coerce(value, pa_type):
+        if value is None:
+            return None
+        if isinstance(value, (bytes, memoryview)) and (
+            pa.types.is_string(pa_type) or pa.types.is_large_string(pa_type)
+        ):
+            return bytes(value).decode("utf-8")
+        if isinstance(value, str):
+            if pa.types.is_timestamp(pa_type):
+                return _dt.datetime.fromisoformat(value)
+            if pa.types.is_date32(pa_type) or pa.types.is_date64(pa_type):
+                return _dt.date.fromisoformat(value)
+            if pa.types.is_time32(pa_type) or pa.types.is_time64(pa_type):
+                return _dt.time.fromisoformat(value)
+        return value
+
     schema = table.schema.as_arrow()
     schema = pa.schema([schema.field(c) for c in columns])
-    return pa.Table.from_pylist([dict(zip(columns, r, strict=True)) for r in rows], schema=schema)
+    arrays = [pa.array([coerce(r[i], field.type) for r in rows], type=field.type) for i, field in enumerate(schema)]
+    return pa.Table.from_arrays(arrays, schema=schema)

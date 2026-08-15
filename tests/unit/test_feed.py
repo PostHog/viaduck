@@ -175,7 +175,7 @@ class TestRead:
     def test_inline_union_across_schema_versions(self):
         reader, duck, pg = self._read_setup(
             file_rows=[],
-            inline_registry=[(1,), (2,)],
+            inline_registry=[("ducklake_inlined_data_16_1",), ("ducklake_inlined_data_16_2",)],
             inline_rows=[("2", "a"), ("2", "b")],
         )
         out = reader.read(_make_table(), duck, 100, 200)
