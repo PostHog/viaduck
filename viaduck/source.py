@@ -227,10 +227,18 @@ def safe_catalog(name: str, uri: str, *, data_path: str, properties: dict[str, s
 
     pyducklake applies `properties` as bare SETs before ATTACH; extension-
     owned keys are stripped from that loop and applied post-attach with
-    verification (see _EXTENSION_SETTING_PREFIX rationale above). TimeZone
-    is then pinned to UTC explicitly: deterministic timestamps regardless of
-    container locale, and it heals the slot even if a mismatch corrupted it
-    through some path the verifier didn't see.
+    verification (see _EXTENSION_SETTING_PREFIX rationale above).
+
+    Deliberately NO `SET TimeZone` pin here. The registry aliasing is
+    symmetric: on the fork engine `SET TimeZone = 'UTC'` writes the STRING
+    'UTC' into the extension's ducklake_max_retry_count (UINT64) slot, and
+    every subsequent commit died with "Could not convert string 'UTC' to
+    UINT64" — a fleet-wide zero-flush outage (2026-08-15 00:44-01:1xZ,
+    the original version of this function). With the corrupting ducklake_*
+    SETs skipped by the verifier, fresh connections already sit at the
+    engine default (Etc/UTC) and TIMESTAMPTZ conversion is healthy; any
+    write into ANY setting slot on a mismatched registry is a potential
+    poison and must not happen outside the verified path.
     """
     from pyducklake import Catalog
 
@@ -238,7 +246,6 @@ def safe_catalog(name: str, uri: str, *, data_path: str, properties: dict[str, s
     catalog = Catalog(name, uri, data_path=data_path, properties=safe_props)
     try:
         apply_extension_settings_verified(catalog.connection, ext_settings, context=name)
-        catalog.connection.execute("SET TimeZone = 'UTC'")
     except Exception:
         catalog.close()
         raise
