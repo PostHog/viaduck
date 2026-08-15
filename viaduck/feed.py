@@ -66,6 +66,21 @@ SUPPORTED_METADATA_VERSIONS = frozenset({"1.0"})
 # WRITE_ROW_ID_AND_SNAPSHOT_ID). Only read under partial_max NOT NULL.
 _PHYSICAL_SNAPSHOT_COL = "_ducklake_internal_snapshot_id"
 
+# Alias for the injected attribution column in the straddle-filter subquery.
+# A source column with this exact name would collide — read() refuses loudly.
+_SNAP_ALIAS = "__viaduck_snap"
+
+
+def _is_missing_file_error(exc: Exception) -> bool:
+    """True when a parquet read failed because a listed file vanished —
+    the plan/execute-skew race (duckdb raises IOException with the path).
+    Matching on the message is brittle across duckdb builds, so this checks
+    the exception type and the message shape together."""
+    return type(exc).__name__ == "IOException" and (
+        "No files found that match" in str(exc) or "NoSuchKey" in str(exc) or "404" in str(exc)
+    )
+
+
 # One SELECT-list addition would not hurt, but the obligation under
 # encrypted=true is key-grouped parquet reads, which this module does not
 # implement — refuse the catalog instead of half-supporting it.
@@ -98,8 +113,12 @@ class FeedReader:
         self._data_path = data_path
         self._conn: psycopg.Connection | None = None
         self._meta_schema: str | None = None
+        # table_id/path caches: a DROP+CREATE of the source table changes its
+        # table_id, but that also invalidates every cursor — the process
+        # restart that requires (mirrors source.py's cache contract) clears
+        # these too.
         self._table_id_cache: dict[tuple[str, str], int] = {}
-        self._path_cache: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+        self._path_cache: dict[tuple[str, str], tuple[tuple[str | None, bool], tuple[str | None, bool]]] = {}
         self._verified = False
 
     # ------------------------------------------------------------------ #
@@ -110,7 +129,15 @@ class FeedReader:
         if self._conn is None or self._conn.closed:
             # autocommit=True: verification queries are standalone; each read
             # wraps its own explicit REPEATABLE READ transaction on top.
-            self._conn = psycopg.connect(self._pg_uri, autocommit=True)
+            # Timeouts mirror state.py: a black-holed PG (failover, SG drop)
+            # must trip the fatal path, not hang the poll thread on a socket
+            # read forever.
+            self._conn = psycopg.connect(
+                self._pg_uri,
+                autocommit=True,
+                connect_timeout=10,
+                options="-c statement_timeout=30000",
+            )
         return self._conn
 
     def close(self) -> None:
@@ -244,8 +271,6 @@ class FeedReader:
         `conn` is the source catalog's DuckDB connection (carries the S3
         credentials); used for parquet scans only.
         """
-        import pyarrow as pa
-
         from viaduck import metrics
 
         self.verify_catalog()
@@ -258,13 +283,97 @@ class FeedReader:
         data_columns = columns if columns is not None else tuple(f.name for f in table.schema.fields)
         namespace, table_name = table._identifier[0], table._identifier[1]
         t0 = time.monotonic()
+        file_rows, inline_rows, path_info = self._plan(
+            table, namespace, table_name, after_snapshot, end_snapshot, data_columns, filter_expr
+        )
+
+        if not file_rows and not inline_rows:
+            return _empty_table(table, columns)
+
+        def scan(rows) -> pa.Table | None:
+            return self._scan_files(conn, rows, path_info, after_snapshot, end_snapshot, data_columns, filter_expr)
+
+        try:
+            result = scan(file_rows)
+        except Exception as exc:
+            if not _is_missing_file_error(exc):
+                raise
+            # Plan/execute skew (proposal §3): a merge/expire committed
+            # between the catalog read and the S3 GET, and a listed file is
+            # gone. Re-plan once against a fresh catalog snapshot (the merged
+            # replacement covers the rows; the two-sided filter keeps the
+            # range exact), then fail loudly if it still doesn't hold.
+            log.warning(
+                "Feed read (%d, %d] hit a vanished file (%s); re-planning once",
+                after_snapshot,
+                end_snapshot,
+                type(exc).__name__,
+            )
+            metrics.cdc_feed_replans_total.inc()
+            file_rows, inline_rows, path_info = self._plan(
+                table, namespace, table_name, after_snapshot, end_snapshot, data_columns, filter_expr
+            )
+            result = scan(file_rows)
+
+        if inline_rows:
+            inline_table = _inline_to_arrow(table, data_columns, inline_rows)
+            result = (
+                inline_table if result is None else pa.concat_tables([result, inline_table], promote_options="default")
+            )
+            metrics.cdc_feed_inlined_rows_total.inc(len(inline_rows))
+
+        if result is None:
+            # The re-plan found the whole range compacted/emptied out from
+            # under us — legal (all-inline ranges get flushed; files can
+            # vanish between plan and GET). Return the empty projection.
+            return _empty_table(table, columns)
+
+        duration = time.monotonic() - t0
+        metrics.cdc_read_seconds.observe(duration)
+        metrics.cdc_rows_read_total.inc(result.num_rows)
+        log.debug(
+            "Feed read: snapshots (%d, %d], %d rows in %.3fs",
+            after_snapshot,
+            end_snapshot,
+            result.num_rows,
+            duration,
+        )
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Internals
+    # ------------------------------------------------------------------ #
+
+    def _plan(
+        self,
+        table: Table,
+        namespace: str,
+        table_name: str,
+        after_snapshot: int,
+        end_snapshot: int,
+        data_columns: tuple[str, ...],
+        filter_expr: str | None,
+    ) -> tuple[list[tuple], list[tuple], tuple[tuple[str | None, bool], tuple[str | None, bool]]]:
+        """(file rows, inline rows, (table_path, schema_path)) for the
+        range, from ONE consistent
+        catalog snapshot (REPEATABLE READ): an inline→parquet flush
+        committing between the file query and the inline queries could
+        otherwise double-sight a row (both shapes visible) or strand it
+        (neither visible). The parquet reads happen OUTSIDE this txn —
+        holding a snapshot across multi-second S3 GETs would pin megaduck's
+        vacuum horizon; the accepted cost is the plan/execute skew (a file
+        deleted between plan and GET), handled by the re-plan in read().
+        NOTE: the SET TRANSACTION must be the first statement inside the
+        transaction() block or PG silently keeps READ COMMITTED.
+        """
+        from viaduck import metrics
+
+        t0 = time.monotonic()
         pg = self._pg()
-        # One consistent snapshot of the catalog per read (see module
-        # docstring): file list + inline registry + inline rows.
         with pg.transaction():
             pg.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             tid = self._table_id(pg, namespace, table_name)
-            table_path, schema_path = self._data_path_for(pg, namespace, table_name)
+            path_info = self._data_path_for(pg, namespace, table_name)
             lo1 = after_snapshot + 1
             file_rows = pg.execute(
                 f"SELECT data_file_id, begin_snapshot, partial_max, row_id_start, record_count, "
@@ -276,68 +385,74 @@ class FeedReader:
             ).fetchall()
             inline_rows = self._read_inline(pg, tid, after_snapshot, end_snapshot, data_columns, filter_expr)
         metrics.cdc_feed_query_seconds.labels(surface="catalog").observe(time.monotonic() - t0)
+        return file_rows, inline_rows, path_info
 
-        if not file_rows and not inline_rows:
-            return _empty_table(table, columns)
+    def _scan_files(
+        self,
+        conn,
+        file_rows: list[tuple],
+        path_info: tuple[tuple[str | None, bool], tuple[str | None, bool]],
+        after_snapshot: int,
+        end_snapshot: int,
+        data_columns: tuple[str, ...],
+        filter_expr: str | None,
+    ) -> pa.Table | None:
+        """Parquet data plane for one plan. None when the plan has no files.
 
+        The two-sided snapshot filter is applied to a partial_max file only
+        when the extension would apply it (verified against
+        SetSnapshotFilter call sites): low side when the file's
+        begin_snapshot predates the range, high side when partial_max
+        exceeds it. A partial file fully inside the window scans
+        unfiltered — the filter forces a physical-column materialization
+        per row, and on megaduck's compactor cadence that difference is the
+        hot path.
+        """
+        from viaduck import metrics
+
+        if not file_rows:
+            return None
+        table_path, schema_path = path_info
+        lo1 = after_snapshot + 1
         plain_paths: list[str] = []
-        partial_paths: list[str] = []
-        total_files = 0
-        for _fid, _begin, partial_max, _rid_start, _rc, path, path_is_relative, _size in file_rows:
+        partial_unfiltered: list[str] = []
+        partial_filtered: list[str] = []
+        for _fid, begin, partial_max, _rid_start, _rc, path, path_is_relative, _size in file_rows:
             resolved = self._resolve_path(path, path_is_relative, table_path, schema_path)
-            (partial_paths if partial_max is not None else plain_paths).append(resolved)
-            total_files += 1
-        metrics.cdc_feed_files_total.inc(total_files)
+            if partial_max is None:
+                plain_paths.append(resolved)
+            elif begin < lo1 or partial_max > end_snapshot:
+                partial_filtered.append(resolved)
+            else:
+                partial_unfiltered.append(resolved)
+        metrics.cdc_feed_files_total.inc(len(file_rows))
+        if partial_filtered and _SNAP_ALIAS in data_columns:
+            raise FeedError(f"Source column named {_SNAP_ALIAS!r} collides with the feed's internal alias; rename it")
 
         proj_sql = _projection_sql(data_columns)
         parts: list[pa.Table] = []
 
         read_t0 = time.monotonic()
-        if plain_paths:
-            sql = f"SELECT {proj_sql} FROM parquet_scan({_path_list_sql(plain_paths)})"
-            if filter_expr:
-                sql += f" WHERE {filter_expr}"
-            parts.append(conn.execute(sql).to_arrow_table())
-        if partial_paths:
-            # Two-sided per-row snapshot filter on the physical attribution
-            # column (see module docstring): rows <= after_snapshot were
-            # delivered from the deleted merge sources; rows > end_snapshot
-            # belong to a later read.
-            paths_sql = _path_list_sql(partial_paths)
+        for paths in (plain_paths, partial_unfiltered):
+            if paths:
+                sql = f"SELECT {proj_sql} FROM parquet_scan({_path_list_sql(paths)})"
+                if filter_expr:
+                    sql += f" WHERE {filter_expr}"
+                parts.append(conn.execute(sql).to_arrow_table())
+        if partial_filtered:
+            paths_sql = _path_list_sql(partial_filtered)
             sql = (
                 f"SELECT {proj_sql} FROM ("
-                f"SELECT *, {_PHYSICAL_SNAPSHOT_COL} AS __viaduck_snap FROM parquet_scan({paths_sql})) "
-                f"WHERE __viaduck_snap > {int(after_snapshot)} AND __viaduck_snap <= {int(end_snapshot)}"
+                f"SELECT *, {_PHYSICAL_SNAPSHOT_COL} AS {_SNAP_ALIAS} FROM parquet_scan({paths_sql})) "
+                f"WHERE {_SNAP_ALIAS} > {int(after_snapshot)} AND {_SNAP_ALIAS} <= {int(end_snapshot)}"
             )
             if filter_expr:
                 sql += f" AND ({filter_expr})"
             parts.append(conn.execute(sql).to_arrow_table())
         metrics.cdc_feed_query_seconds.labels(surface="parquet").observe(time.monotonic() - read_t0)
-
-        if inline_rows:
-            parts.append(_inline_to_arrow(table, data_columns, inline_rows))
-            metrics.cdc_feed_inlined_rows_total.inc(len(inline_rows))
-
-        result = parts[0] if len(parts) == 1 else pa.concat_tables(parts, promote_options="default")
-
-        duration = time.monotonic() - t0
-        metrics.cdc_read_seconds.observe(duration)
-        metrics.cdc_rows_read_total.inc(result.num_rows)
-        log.debug(
-            "Feed read: snapshots (%d, %d], %d files (%d partial), %d inline rows, %d rows in %.3fs",
-            after_snapshot,
-            end_snapshot,
-            total_files,
-            len(partial_paths),
-            len(inline_rows),
-            result.num_rows,
-            duration,
-        )
-        return result
-
-    # ------------------------------------------------------------------ #
-    # Internals
-    # ------------------------------------------------------------------ #
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else pa.concat_tables(parts, promote_options="default")
 
     def _read_inline(
         self,
@@ -413,11 +528,11 @@ class FeedReader:
 
 def _projection_sql(columns: tuple[str, ...] | None) -> str:
     """Explicit projection (see read_cdc: pins the read to the startup
-    schema). Identifiers are double-quoted; names embedding quotes never
-    reach here (replicated_column_names returns None for them)."""
+    schema). Identifiers are double-quoted with embedded quotes escaped —
+    same convention as _read_inline's column list."""
     if columns is None:
         return "*"
-    return ", ".join(f'"{c}"' for c in columns)
+    return ", ".join(f'"{c.replace(chr(34), chr(34) * 2)}"' for c in columns)
 
 
 def _path_list_sql(paths: list[str]) -> str:

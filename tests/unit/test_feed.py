@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pyarrow as pa
 import pytest
 
-from viaduck import metrics
+from viaduck import feed, metrics
 from viaduck.feed import FeedError, FeedReader
 
 
@@ -192,6 +192,84 @@ class TestRead:
         assert out.num_rows == 0
         assert out.column_names == ["team_id", "event"]
         duck.execute.assert_not_called()
+
+    def test_conditional_straddle_filter(self):
+        """Extension parity: a partial_max file fully inside the window scans
+        UNFILTERED (the per-row snapshot filter costs a physical-column
+        materialization per row); only a true straddle (begin <= lo or
+        partial_max > hi) gets it."""
+        files = [
+            (1, 101, 150, 0, 10, "contained.parquet", False, 100),  # inside (100, 200]
+            (2, 90, 150, 0, 10, "low_straddle.parquet", False, 100),  # begin <= lo
+            (3, 150, 250, 0, 10, "high_straddle.parquet", False, 100),  # partial_max > hi
+        ]
+        reader, duck, pg = self._read_setup(file_rows=files)
+        reader.read(_make_table(), duck, 100, 200)
+        sqls = [c.args[0] for c in duck.execute.call_args_list]
+        contained = next(s for s in sqls if "contained.parquet" in s and "__viaduck_snap" not in s)
+        filtered = next(s for s in sqls if "__viaduck_snap" in s)
+        assert contained
+        assert "low_straddle.parquet" in filtered and "high_straddle.parquet" in filtered
+        assert "contained.parquet" not in filtered
+
+    def test_replan_once_on_vanished_file(self):
+        reader, duck, pg = self._read_setup(file_rows=[(1, 101, None, 0, 10, "a.parquet", False, 100)])
+        import duckdb
+
+        calls = {"n": 0}
+
+        def flaky(sql):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise duckdb.IOException('No files found that match the pattern "a.parquet"')
+            m = MagicMock()
+            m.to_arrow_table.return_value = pa.table({"team_id": ["2"], "event": ["e"]})
+            return m
+
+        duck.execute.side_effect = flaky
+        out = reader.read(_make_table(), duck, 100, 200)
+        assert out.num_rows == 1
+        # The catalog was queried twice (original plan + one re-plan).
+        file_queries = [c for c in pg.execute.call_args_list if "ducklake_data_file" in str(c)]
+        assert len(file_queries) == 2
+
+    def test_replan_failure_propagates(self):
+        reader, duck, pg = self._read_setup(file_rows=[(1, 101, None, 0, 10, "a.parquet", False, 100)])
+        import duckdb
+
+        duck.execute.side_effect = duckdb.IOException('No files found that match the pattern "a.parquet"')
+        with pytest.raises(duckdb.IOException):
+            reader.read(_make_table(), duck, 100, 200)
+
+    def test_snap_alias_collision_refused(self):
+        reader, duck, pg = self._read_setup(
+            file_rows=[(1, 90, 150, 0, 10, "m.parquet", False, 100)]  # low straddle → filtered path
+        )
+        table = _make_table(columns=("team_id", "__viaduck_snap"))
+        with pytest.raises(FeedError, match="collides"):
+            reader.read(table, duck, 100, 200)
+
+
+class TestConfigGate:
+    def test_cdc_reader_default(self):
+        from viaduck.config import SourceConfig
+
+        cfg = SourceConfig(name="s", postgres_uri_env="X", data_path="s3://b/", table="t")
+        assert cfg.cdc_reader == "ducklake"
+
+    def test_cdc_reader_invalid_refused(self):
+        from viaduck.config import ConfigError, SourceConfig
+
+        with pytest.raises(ConfigError, match="cdc_reader"):
+            SourceConfig(name="s", postgres_uri_env="X", data_path="s3://b/", table="t", cdc_reader="bogus")
+
+
+class TestProjectionSql:
+    def test_quotes_escaped(self):
+        assert feed._projection_sql(('we"ird', "plain")) == '"we""ird", "plain"'
+
+    def test_none_is_star(self):
+        assert feed._projection_sql(None) == "*"
 
 
 class TestPathResolution:

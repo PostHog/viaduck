@@ -811,6 +811,68 @@ def test_poll_cycle_routes_and_buffers():
     assert delivery.maybe_flush.call_count == 2  # once per chunk + once at end of cycle
 
 
+def test_poll_cycle_feed_reader_dispatch():
+    """cdc_reader=direct: the poll loop reads via the feed, never read_cdc."""
+    delivery = _make_delivery({"dest-1": 5})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    arrow_data = pa.table({"company": ["quacksworth"], "value": [10]})
+    router.build_filter_expr.return_value = "company IN ('quacksworth')"
+    router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
+
+    feed_reader = MagicMock()
+    feed_reader.read.return_value = arrow_data
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
+        patch("viaduck.main.source.read_cdc") as ext_read,
+        patch("viaduck.main.source.next_snapshot_touching_table", side_effect=lambda _t, start, _u: start + 1),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+            source_columns=None,
+            feed_reader=feed_reader,
+        )
+
+    ext_read.assert_not_called()
+    assert feed_reader.read.call_count == 1
+    # (table, conn, after, end, *, filter_expr, columns)
+    args = feed_reader.read.call_args
+    assert args.args[2] == 5 and args.args[3] == 10
+    delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
+
+
+def test_poll_cycle_feed_reader_refused_in_full_cdc():
+    """The full_cdc + feed combination is refused loudly (startup config
+    normally prevents it; the guard keeps a future caller honest)."""
+    from viaduck.config import ConfigError
+
+    delivery = _make_delivery({"dest-1": 5})
+    with pytest.raises(ConfigError, match="append_only"):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            MagicMock(),
+            _make_cfg([("dest-1", "a")]),
+            ["dest-1"],
+            {"a": "dest-1"},
+            key_columns=["id"],
+            mode="full_cdc",
+            source_columns=None,
+            feed_reader=MagicMock(),
+        )
+
+
 def test_poll_cycle_empty_changeset_advances_positions():
     """An empty CDC range advances in-memory positions (no PG write)."""
     delivery = _make_delivery({"dest-1": 5, "dest-2": 5})

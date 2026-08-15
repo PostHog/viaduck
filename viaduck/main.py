@@ -1295,6 +1295,11 @@ def _poll_cycle(
     # (not full_cdc) through the call signature avoids reconstructing the
     # original config value from a derived bool later (status payload).
     full_cdc = mode == "full_cdc"
+    if full_cdc and feed_reader is not None:
+        # Startup refuses this combination (run() raises ConfigError); guard
+        # here too so a future caller can't silently get changefeed reads
+        # while a feed reader exists.
+        raise ConfigError("feed_reader requires append_only mode; full_cdc has no feed implementation")
     # Lifecycle gating: only ACTIVE destinations read; None (tests, and any
     # future caller without lifecycle) means everything assigned reads.
     if read_ids is None:

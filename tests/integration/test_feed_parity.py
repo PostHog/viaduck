@@ -12,6 +12,8 @@ or fall here; unit tests in tests/unit/test_feed.py pin only SQL shape.
 
 from __future__ import annotations
 
+import collections
+
 import pyarrow as pa
 import pytest
 from pyducklake import Catalog
@@ -58,8 +60,10 @@ def _insert(catalog: Catalog, rows: list[tuple[int, str, int]], table: str = "ma
     catalog.connection.execute(f"INSERT INTO lake.{table} VALUES {vals}")
 
 
-def _rows(tbl: pa.Table) -> set[tuple]:
-    return {tuple(row[c] for c in tbl.column_names) for row in tbl.to_pylist()}
+def _rows(tbl: pa.Table) -> collections.Counter:
+    """MULTISET of row tuples — parity is a claim about counts too; a plain
+    set would let the feed double-deliver a row within one range unnoticed."""
+    return collections.Counter(tuple(row[c] for c in tbl.column_names) for row in tbl.to_pylist())
 
 
 def _insertions(table, lo: int, hi: int, filter_expr=None) -> set[tuple]:
@@ -75,31 +79,35 @@ def _feed(reader: FeedReader, conn, table, lo: int, hi: int, filter_expr=None) -
     return _rows(reader.read(table, conn, lo, hi, filter_expr=filter_expr))
 
 
+_EVENT_SNAPS: list[int] = []
+
+
 @pytest.fixture(scope="module")
 def table(catalog):
     conn = catalog.connection
     conn.execute("CREATE SCHEMA IF NOT EXISTS lake.main")
     conn.execute("CREATE TABLE lake.main.events (team_id BIGINT, event VARCHAR, value BIGINT)")
     tbl = catalog.load_table("main.events")
-    # Snapshots 1..5 of plain ingest files.
-    _insert(catalog, [(2, "a", 1), (7, "b", 2)])
-    _insert(catalog, [(2, "c", 3)])
-    _insert(catalog, [(50689, "d", 4), (2, "e", 5)])
-    _insert(catalog, [(7, "f", 6)])
-    _insert(catalog, [(2, "g", 7), (7, "h", 8), (50689, "i", 9)])
+    _EVENT_SNAPS.clear()
+    for rows in [
+        [(2, "a", 1), (7, "b", 2)],
+        [(2, "c", 3)],
+        [(50689, "d", 4), (2, "e", 5)],
+        [(7, "f", 6)],
+        [(2, "g", 7), (7, "h", 8), (50689, "i", 9)],
+    ]:
+        _insert(catalog, rows)
+        # Captured at insert time, so later test classes committing into the
+        # shared catalog cannot shift these (qe: fixture-order trap).
+        _EVENT_SNAPS.append(tbl.current_snapshot().snapshot_id)
     return tbl
 
 
 @pytest.fixture(scope="module")
-def snaps(catalog, table):
-    """Snapshot ids of the five inserts into `table` (CREATE TABLE itself is
-    a snapshot, so insert k is NOT snapshot k)."""
-    # The table fixture committed 5 inserts; their snapshot ids are the 5
-    # most recent in the catalog. Ordered ascending.
-    rows = catalog.connection.execute(
-        'SELECT snapshot_id FROM "__ducklake_metadata_lake".ducklake_snapshot ORDER BY snapshot_id'
-    ).fetchall()
-    return [int(r[0]) for r in rows][-5:]
+def snaps(table):
+    """Snapshot ids of the five inserts into `table` (CREATE TABLE itself
+    is a snapshot, so insert k is NOT snapshot k)."""
+    return list(_EVENT_SNAPS)
 
 
 class TestPlainParity:
@@ -173,8 +181,7 @@ class TestMergeStraddle:
         for cut in range(created + 1, head):
             left = _feed(reader, catalog.connection, tbl, created, cut)
             right = _feed(reader, catalog.connection, tbl, cut, head)
-            assert not (left & right), f"duplicate delivery across cut at {cut}"
-            assert left | right == whole, f"coverage gap across cut at {cut}"
+            assert left + right == whole, f"partition broken across cut at {cut}"
 
 
 class TestInline:
@@ -220,6 +227,20 @@ class TestInline:
         assert got == want
         assert (2, "i1", 1) in got  # actually reached us (registry non-empty path)
 
+    def test_inline_rows_filtered(self, inline_catalog):
+        """The routing filter applies to inline rows — an unfiltered inline
+        read is a cross-tenant data leak, not a perf bug."""
+        cat, tbl, dsn = inline_catalog
+        head = tbl.current_snapshot().snapshot_id
+        r = FeedReader(postgres_uri=dsn, catalog_name="laked", data_path=cat._data_path)
+        try:
+            got = _feed(r, cat.connection, tbl, 0, head, "team_id IN (2)")
+            want = _insertions(tbl, 0, head, "team_id IN (2)")
+        finally:
+            r.close()
+        assert got == want
+        assert (2, "i1", 1) in got and (7, "i2", 2) not in got
+
     def test_flush_to_parquet_no_redelivery(self, inline_catalog):
         cat, tbl, dsn = inline_catalog
         r = FeedReader(postgres_uri=dsn, catalog_name="laked", data_path=cat._data_path)
@@ -234,9 +255,10 @@ class TestInline:
             post = _feed(r, cat.connection, tbl, 0, head_after)
             assert post == pre
             # …and the range covering only the flush snapshot is empty of
-            # those rows (they keep their original begin_snapshot).
-            if head_after > head_before:
-                assert _feed(r, cat.connection, tbl, head_before, head_after) == set()
+            # those rows (they keep their original begin_snapshot). The flush
+            # MUST have committed — a no-op flush must not pass this test.
+            assert head_after > head_before, "flush produced no snapshot; test is vacuous"
+            assert _feed(r, cat.connection, tbl, head_before, head_after) == collections.Counter()
         finally:
             r.close()
 
