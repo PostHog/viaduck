@@ -69,8 +69,8 @@
 (* now proves all invariants with no crash conditioning at all.            *)
 (*                                                                         *)
 (* MODEL SIZE: with Keys={1,2}, Dests={d1,d2}, MaxOps=4, BufferCap=3, TLC  *)
-(* checks all 7 invariants over 85,012,333 distinct states (1.18B          *)
-(* generated) in ~18 minutes. The pre-lifecycle model was 19,886,377       *)
+(* checks all 8 invariants over 132,190,573 distinct states (~1.9B          *)
+(* generated) in ~36 minutes. The pre-lifecycle model was 19,886,377       *)
 (* distinct states — the growth is PauseDest's discard/rewind firing at    *)
 (* any point, incl. under an in-flight flush. Removing FlushCommit's       *)
 (* position-restore max() yields a 6-step BufferPositionBound              *)
@@ -91,7 +91,7 @@
 (* only. `key` and `rv` pass through identity. Applied inside              *)
 (* Phase3Apply's row construction and SeedDestination's row construction   *)
 (* (both are the only places dstRows is populated from source data). Under *)
-(* this abstraction all 7 invariants continue to hold in the same form:    *)
+(* this abstraction all 8 invariants continue to hold in the same form:    *)
 (*   - EventualConsistency compares dstRows against ValProj-transformed    *)
 (*     source rows — the destination shape is the target's shape.          *)
 (*   - PartitionCorrectness holds trivially: rv is preserved.              *)
@@ -119,6 +119,14 @@ CONSTANTS
     Instances,      \* e.g. {"i1"}
     DestOwner,      \* function: dest -> instance
     MaxOps,         \* bound on source operations
+    AppendOnly,     \* TRUE: the source is insert-only (routing.mode):
+                    \* no SrcDelete/SrcUpdate; appends may repeat keys
+                    \* (event streams). Straddle slices (entries with
+                    \* hi > cov) are generated ONLY in this mode — TLC's
+                    \* counterexample: migrating an insert past an
+                    \* intervening delete gets it overtaken (the delete
+                    \* applies by key, regardless of the pair's rowids).
+                    \* full_cdc slicing must stay snapshot-contiguous.
     BufferCap,      \* per-destination queue bound: BufferRead(d, _) is
                     \* enabled only while |buffered[d]| + |inflight[d]| <
                     \* BufferCap. Models the implementation's
@@ -132,7 +140,7 @@ CONSTANTS
                     \* identity (enforced at build() time by
                     \* schema_projection.py's B2 + B3 guards). Any total
                     \* function is admissible; TLC enumerates identity,
-                    \* constant, and swap variants and checks all seven
+                    \* constant, and swap variants and checks all eight
                     \* invariants hold uniformly.
 
 VARIABLES
@@ -143,7 +151,10 @@ VARIABLES
     dstRows,        \* function: dest -> set of [key, rv, val]
     cursors,        \* function: dest -> last PERSISTED snapshot id (flushed-through)
     buffered,       \* function: dest -> SEQUENCE of pending flush entries
-                    \* [rows |-> set of Phase-1-resolved records, cov |-> Nat]
+                    \* [rows |-> set, cov |-> Nat, hi |-> Nat] — cov is the
+                    \* coverage watermark a prefix flush may persist; hi is
+                    \* the entry's own max snapshot (>= ... <= cov allowed:
+                    \* straddle slices), used by DropCoveredPrefix.
                     \* (M3: slice-cursor chain — FlushStart commits a prefix and
                     \* the cursor advances only to the prefix's coverage watermark;
                     \* see EntryCoverageInvariant). Row order inside an entry is
@@ -216,6 +227,23 @@ SrcUpdate(key, newVal) ==
                  val |-> newVal, snap |-> srcSnap + 1, rowid |-> old.rowid]}
           /\ opCount' = opCount + 1
     /\ UNCHANGED <<nextRowid, dstRows, cursors>>
+    /\ UNCHANGED memVars
+
+\* Append-only source op (AppendOnly configs): an event append — the same
+\* key may append repeatedly (a NEW row each time, fresh rowid). This is
+\* the events_nrt shape: no deletes, no updates, duplicates are just rows.
+SrcAppend(key, rv, val) ==
+    /\ AppendOnly
+    /\ opCount < MaxOps
+    /\ rv \in RoutingValues
+    /\ srcSnap' = srcSnap + 1
+    /\ srcRows' = srcRows \cup {[key |-> key, rv |-> rv, val |-> val, rowid |-> nextRowid]}
+    /\ cdcLog' = cdcLog \cup {[type |-> "insert", key |-> key, rv |-> rv,
+                                val |-> val, snap |-> srcSnap + 1,
+                                rowid |-> nextRowid]}
+    /\ nextRowid' = nextRowid + 1
+    /\ opCount' = opCount + 1
+    /\ UNCHANGED <<dstRows, cursors>>
     /\ UNCHANGED memVars
 
 (***************************************************************************)
@@ -319,11 +347,17 @@ Phase3Apply(d, resolved) ==
         \* applying ValProj to the val slot; key and rv are preserved
         \* (schema_projection B2/B3 guards).
         rowsToUpsert == {[key |-> Winner(k).key, rv |-> Winner(k).rv,
-                          val |-> ValProj[d, Winner(k).val]] : k \in upsertKeys}
+                           val |-> ValProj[d, Winner(k).val]] : k \in upsertKeys}
+        \* append_only (modeled since M3's AppendOnly config): plain appends
+        \* — no Winner(k) dedup, no deletes. Duplicate keys are legal rows
+        \* (event streams); deduping them was an EventualConsistency
+        \* counterexample (two appends of one key collapse to one dest row).
+        appendRows == {[key |-> c.key, rv |-> c.rv, val |-> ValProj[d, c.val]] :
+                        c \in upsertChanges}
         afterDelete == {r \in dstRows[d] : r.key \notin keysToDelete}
         afterUpsert == {r \in afterDelete : r.key \notin upsertKeys}
                         \cup rowsToUpsert
-    IN afterUpsert
+    IN IF AppendOnly THEN dstRows[d] \cup appendRows ELSE afterUpsert
 
 \* Buffer a CDC read: accumulate Phase-1-resolved changes, advance the
 \* in-memory read position. Permitted while a flush for the same
@@ -396,6 +430,30 @@ BufferRead(d, i) ==
                                          hi |-> MaxSnap(e1)]),
                                         [rows |-> e2, cov |-> srcSnap,
                                          hi |-> MaxSnap(e2)])]
+                    \* Straddle slices (append_only shape: a merged file's
+                    \* rows arrive in file order, not snapshot order): an
+                    \* early slice may carry rows ABOVE its cov (hi > cov).
+                    \* Migration is insert/update_postimage-only — never a
+                    \* delete — so conflicting pairs keep snapshot order
+                    \* (the delete still flushes later). This branch exists
+                    \* so TLC generates hi > cov entries: without it the
+                    \* DropCoveredPrefix hi-keying is unwitnessed.
+                    \/ /\ AppendOnly
+                       /\ \E t \in {c.snap : c \in changes} :
+                         LET base1 == {c \in changes : c.snap <= t}
+                             base2 == {c \in changes : c.snap > t}
+                             migratable == {c \in base2 : c.type \in {"insert", "update_postimage"}}
+                         IN  \E mig \in SUBSET migratable :
+                               LET e1 == base1 \cup mig
+                                   e2 == base2 \ mig
+                               IN  /\ e1 /= {} /\ e2 /= {} /\ mig /= {}
+                                   /\ MinSnap(e2) - 1 < MaxSnap(e1)  \* enforce the straddle
+                                   /\ buffered' = [buffered EXCEPT ![d] =
+                                        Append(Append(@,
+                                            [rows |-> e1, cov |-> MinSnap(e2) - 1,
+                                             hi |-> MaxSnap(e1)]),
+                                            [rows |-> e2, cov |-> srcSnap,
+                                             hi |-> MaxSnap(e2)])]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = srcSnap]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
                    flushing, inflight, inflightThrough, opCount>>
@@ -721,12 +779,14 @@ Init ==
     /\ opCount = 0
 
 Next ==
-    \/ \E key \in Keys, rv \in RoutingValues, val \in 1..3 :
+    \/ ~AppendOnly /\ \E key \in Keys, rv \in RoutingValues, val \in 1..3 :
          SrcInsert(key, rv, val)
-    \/ \E key \in Keys :
+    \/ ~AppendOnly /\ \E key \in Keys :
          SrcDelete(key)
-    \/ \E key \in Keys, val \in 1..3 :
+    \/ ~AppendOnly /\ \E key \in Keys, val \in 1..3 :
          SrcUpdate(key, val)
+    \/ \E key \in Keys, rv \in RoutingValues, val \in 1..3 :
+         SrcAppend(key, rv, val)
     \/ \E d \in Dests, i \in Instances :
          BufferRead(d, i)
     \/ \E d \in Dests, i \in Instances :
