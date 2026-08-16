@@ -861,6 +861,49 @@ class DeliveryManager:
                 if self._position[dest_id] < through:
                     self._position[dest_id] = through
                     self._epoch[dest_id] += 1
+                # Pair-split phantom fix (TLA witness in tla/Viaduck.tla:
+                # BufferRead, FlushStart, PauseDest, BufferRead, FlushCommit,
+                # FlushStart, CrashDuringFlush): the rewind above plus a
+                # racing zombie commit can leave REPLAYED entries in the
+                # buffer whose ranges this commit already covered. A later
+                # sliced flush can split a re-buffered conflicting pair
+                # (insert in one slice, its delete in a later slice) across
+                # a crash boundary: the insert commits, the delete's slice
+                # is dropped, and the cursor — already past it — never
+                # re-reads it: a permanent phantom row. Drop the covered
+                # prefix of the live buffer now: entries with
+                # through <= this commit's through are redundant replays by
+                # construction (the commit covered their range), and
+                # dropping them is the pause's controlled-crash semantics
+                # completed late. (For today's chunk-contiguous entries,
+                # through is both the coverage watermark and the content
+                # hi bound, so entry-through <= commit-through <=> covered.)
+                buf = self._buffers[dest_id]
+                if buf.entries:
+                    drop = 0
+                    for _tbl, entry_through in buf.entries:
+                        if entry_through > through:
+                            break
+                        drop += 1
+                    if drop:
+                        dropped_rows = sum(t.num_rows for t, _ in buf.entries[:drop])
+                        buf.entries = buf.entries[drop:]
+                        buf.rows -= dropped_rows
+                        buf.bytes = sum(t.nbytes for t, _ in buf.entries)
+                        if not buf.entries:
+                            buf.first_buffered_at = None
+                            buf.sliced_remainder = False
+                        metrics.delivery_buffer_rows.labels(destination=dest_id).set(buf.rows)
+                        metrics.delivery_buffer_bytes.labels(destination=dest_id).set(buf.bytes)
+                        metrics.delivery_covered_replays_dropped_total.labels(destination=dest_id).inc(drop)
+                        log.info(
+                            "Dropped %d covered replay entries (%d rows) for %s after flush through %d "
+                            "(pause/zombie race — the commit covered their ranges)",
+                            drop,
+                            dropped_rows,
+                            dest_id,
+                            through,
+                        )
                 self._rows_replicated[dest_id] = cumulative
                 # Clear the error only when this flush is at/ahead of the
                 # cursor. A zombie flush (through < flushed — a retention

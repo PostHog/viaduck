@@ -372,6 +372,14 @@ _delivery_buffers_dropped_total = Counter(
     "Buffers discarded after a failed flush (range will be re-read)",
     ["pipeline", "destination"],
 )
+# Pair-split phantom fix: entries dropped at flush-commit because the
+# commit already covered their range (pause/zombie replay leftovers).
+# Nonzero is the visible trace of that race having fired.
+_delivery_covered_replays_dropped_total = Counter(
+    "viaduck_delivery_covered_replays_dropped_total",
+    "Buffered replay entries dropped at flush commit (already covered by it)",
+    ["pipeline", "destination"],
+)
 
 # Partition-spec outcomes from `_ensure_partition_spec` (destination.py).
 # Operators need to verify across N destinations after a deploy that
@@ -463,6 +471,7 @@ delivery_buffer_total_bytes = _delivery_buffer_total_bytes
 delivery_flushes_total = _delivery_flushes_total
 delivery_flush_seconds = _delivery_flush_seconds
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
+delivery_covered_replays_dropped_total = _delivery_covered_replays_dropped_total
 delivery_reads_paused = _delivery_reads_paused
 delivery_circuit_open = _delivery_circuit_open
 delivery_circuit_opens_total = _delivery_circuit_opens_total
@@ -520,6 +529,7 @@ def init(pipeline: str):
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
+    global delivery_covered_replays_dropped_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
     global delivery_circuit_open, delivery_circuit_opens_total, delivery_flush_deadlines_total
     global poll_cycle_timeboxed_total
@@ -540,6 +550,7 @@ def init(pipeline: str):
     delivery_flushes_total = _AutoPipelineLabels(_delivery_flushes_total, pipeline)
     delivery_flush_seconds = _AutoPipelineLabels(_delivery_flush_seconds, pipeline)
     delivery_buffers_dropped_total = _AutoPipelineLabels(_delivery_buffers_dropped_total, pipeline)
+    delivery_covered_replays_dropped_total = _AutoPipelineLabels(_delivery_covered_replays_dropped_total, pipeline)
     delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
     delivery_circuit_open = _AutoPipelineLabels(_delivery_circuit_open, pipeline)
     delivery_circuit_opens_total = _AutoPipelineLabels(_delivery_circuit_opens_total, pipeline)
