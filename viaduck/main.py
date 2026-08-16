@@ -85,16 +85,6 @@ def _validate_feed_mode(cfg) -> None:
         )
 
 
-# Per-cycle read budget per cursor group. Bounds how many CDC chunks one
-# group may read before the poll cycle moves to the next group — the fairness
-# valve that keeps a deeply-lagging (or flush-failing, position-resetting)
-# destination from monopolizing the poll thread while healthy peers starve.
-# 4 chunks × cdc_chunk_snapshots=50 = 200 snapshots per group per cycle,
-# ~7× the source's per-cycle arrival rate — groups drain lag while every
-# other group still gets a turn each cycle.
-_MAX_CHUNKS_PER_GROUP_PER_CYCLE = 4
-
-
 def _start_progress_heartbeat(
     label: str,
     interval_s: float = 30.0,
@@ -256,22 +246,6 @@ def _fmt_bytes(n: float) -> str:
             return f"{n:.2f} {unit}" if unit != "B" else f"{int(n)} B"
         n /= 1024
     return f"{n:.2f} PiB"
-
-
-def _group_by_cursor(
-    cursors: dict[str, int],
-    all_dest_ids: list[str],
-) -> dict[int, list[str]]:
-    """Group destination IDs by their last_snapshot_id.
-
-    Returns a dict mapping snapshot_id -> [destination_ids at that snapshot].
-    Destinations not in cursors are treated as snapshot_id=0.
-    """
-    groups: dict[int, list[str]] = {}
-    for did in all_dest_ids:
-        snap = cursors.get(did, 0)
-        groups.setdefault(snap, []).append(did)
-    return groups
 
 
 def _resolve_preimages(batch: pa.Table, routing_field: str, key_columns: list[str]) -> pa.Table:
@@ -752,6 +726,12 @@ def run(cfg: config.ViaduckConfig) -> None:
         feed_reader.verify_catalog()
         log.info("Direct-SQL feed reader enabled for source %s", cfg.source.name)
 
+    # Read pool: the feed's parallel data plane. Legacy extension mode stays
+    # serial on the source connection (the extension path is one query slot).
+    read_pool = None
+    if feed_reader is not None:
+        read_pool = _ReadPool(cfg.source.resolved_properties(), cfg.poll.read_workers)
+
     # Initialize state and destinations. Cursor state lives on plain
     # Postgres (NOT a DuckLake table): a cursor advance must not create
     # catalog snapshots, or idle destinations generate CDC work forever.
@@ -1025,12 +1005,6 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     shutdown = False
 
-    # Cursor-group iteration offset, carried across cycles: with the cycle
-    # time budget (poll.cycle_time_budget_seconds), groups not reached this
-    # cycle resume first next cycle instead of the most-lagging group
-    # always getting first-turn service. See _poll_cycle.
-    cycle_rotation: dict = {"offset": 0}
-
     recycle_watermark_gib = resolve_recycle_watermark(cfg.memory)
     loop_started_at = time.monotonic()
     recycling = False
@@ -1097,8 +1071,8 @@ def run(cfg: config.ViaduckConfig) -> None:
                 read_ids=read_ids,
                 lifecycle_states=tracker.states(),
                 dest_configs=reg_snap.configs,
-                rotation=cycle_rotation,
                 feed_reader=feed_reader,
+                read_pool=read_pool,
             )
         except Exception:
             log.exception("Fatal error in poll cycle")
@@ -1151,6 +1125,11 @@ def run(cfg: config.ViaduckConfig) -> None:
             feed_reader.close()
         except Exception:
             log.warning("Feed reader close failed", exc_info=True)
+    if read_pool is not None:
+        try:
+            read_pool.close()
+        except Exception:
+            log.warning("Read pool close failed", exc_info=True)
     try:
         src_catalog.close()
     except Exception:
@@ -1278,6 +1257,231 @@ def _clamp_expired_cursors(delivery, dest_ids, earliest_snapshot) -> set[str]:
     return still_expired
 
 
+class _InlineFuture:
+    """Synchronous stand-in for a pool future when no read pool exists
+    (tests): result() runs the thunk LAZILY, so per-unit failure
+    containment in the apply loop works identically to the pool path."""
+
+    def __init__(self, thunk):
+        self._thunk = thunk
+
+    def result(self):
+        return self._thunk()
+
+
+class _ReadPool:
+    """N bare DuckDB connections behind a small executor (the feed's
+    parallel data plane, proposal §6.3). A DuckDB connection has ONE query
+    slot, so unit reads check out a connection for their duration. Feed
+    planning (psycopg) stays on the poll thread — _plan_read never runs
+    here."""
+
+    def __init__(self, props: dict[str, str], workers: int):
+        import queue
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="read")
+        self._conns: queue.Queue = queue.Queue()
+        for i in range(workers):
+            self._conns.put(source.open_read_connection(props, name=f"read-{i}"))
+
+    def submit(self, fn, **kwargs):
+        def run():
+            conn = self._conns.get()
+            try:
+                return fn(read_conn=conn, **kwargs)
+            finally:
+                self._conns.put(conn)
+
+        return self._executor.submit(run)
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        while True:
+            try:
+                self._conns.get_nowait().close()
+            except Exception:
+                return
+
+
+def _position_clusters(positions: dict[str, int], read_ids, span_cap: int) -> list[tuple[int, list[str]]]:
+    """Cluster ACTIVE destinations into read units: [(cluster_lo, members)],
+    ascending by lo. span_cap > 0 (the feed's per-row snapshot attribution)
+    merges positions within one budget span — the shared read is masked per
+    destination by its own position. span_cap = 0 (legacy extension reads
+    carry no per-row snapshot) falls back to exact-position groups only.
+    """
+    by_pos: dict[int, list[str]] = {}
+    for d in read_ids:
+        if d in positions:
+            by_pos.setdefault(positions[d], []).append(d)
+    clusters: list[tuple[int, list[str]]] = []
+    cur_lo: int | None = None
+    cur_members: list[str] = []
+    for p in sorted(by_pos):
+        if cur_lo is not None and (span_cap <= 0 or p - cur_lo > span_cap):
+            clusters.append((cur_lo, cur_members))
+            cur_lo, cur_members = None, []
+        if cur_lo is None:
+            cur_lo, cur_members = p, []
+        cur_members.extend(by_pos[p])
+    if cur_lo is not None:
+        clusters.append((cur_lo, cur_members))
+    return clusters
+
+
+def _read_unit(
+    *,
+    src_table,
+    read_conn,
+    feed_reader,
+    planned,
+    lo: int,
+    hi: int,
+    members,
+    router,
+    dest_configs,
+    full_cdc: bool,
+    source_columns,
+) -> tuple[pa.Table, int]:
+    """Read one unit (lo, hi] for the cluster's union filter. Runs on a
+    read-pool thread: pure I/O, no shared state, no buffer writes (the poll
+    thread applies results). Feed reads are pre-planned on the poll thread
+    (`planned`) — the FeedReader's psycopg connection is single-threaded;
+    the pool never plans. The legacy extension path reads the span-bounded
+    range it is given (its chunk equivalent) since it has no per-row
+    attribution to slice on.
+    """
+    if planned is not None:
+        rows = feed.execute_read(read_conn, planned)
+        if rows is None:
+            # A re-planned unit can come back empty (flushed/compacted
+            # away between plan and execute) — the empty path advances
+            # positions in _apply_unit.
+            rows = pa.table({})
+        log.info("CDC unit →%d: %d rows (feed)", hi, rows.num_rows)
+        return rows, hi
+    routing_values = [dest_configs[d].routing_value for d in members]
+    filter_expr = router.build_filter_expr(routing_values)
+    if full_cdc:
+        rows = source.read_cdc_changes(
+            src_table, after_snapshot=lo, end_snapshot=hi, filter_expr=filter_expr, columns=source_columns
+        )
+    else:
+        rows = source.read_cdc(
+            src_table, after_snapshot=lo, end_snapshot=hi, filter_expr=filter_expr, columns=source_columns
+        )
+    log.info("CDC unit %d→%d: %d rows (extension)", lo, hi, rows.num_rows)
+    return rows, hi
+
+
+def _slice_batch(batch: pa.Table, snaps: list[int], lo: int, hi: int, max_rows: int) -> list[tuple[pa.Table, int, int]]:
+    """Slice a routed per-destination batch into <= max_rows buffer entries
+    with the slice-cursor rule (tla/Viaduck.tla; proposal §6.2):
+    cov_k = max(lo, min(snapshot over slices > k) - 1), cov_last = hi, and
+    entry hi_k = the slice's own max snapshot. The durable cursor never
+    passes undelivered rows: no row with snapshot <= cov_k exists in a
+    later slice. append_only only (any row order is safe — no conflicting
+    pairs; full_cdc units are never sliced, preserving snapshot order).
+    """
+    if batch.num_rows <= max_rows:
+        return [(batch, hi, hi)]
+    slices = []
+    offset = 0
+    while offset < batch.num_rows:
+        slices.append(batch.slice(offset, max_rows))
+        offset += max_rows
+    out = []
+    running = lo
+    for k, sl in enumerate(slices):
+        later = snaps[(k + 1) * max_rows :]  # snaps of slices after k
+        cov = max(running, (min(later) - 1) if later else hi)
+        cov = hi if k == len(slices) - 1 else cov
+        out.append((sl, cov, max(snaps[k * max_rows : (k + 1) * max_rows])))
+        running = cov
+    return out
+
+
+def _apply_unit(
+    delivery,
+    rows: pa.Table,
+    hi: int,
+    *,
+    members,
+    positions,
+    epochs,
+    router,
+    rv_to_dest,
+    full_cdc: bool,
+    key_columns,
+    unit_cfg,
+    src_table,
+    routing_field,
+    dest_configs,
+) -> None:
+    """Apply one completed read unit on the POLL THREAD: Phase 1 (full_cdc),
+    route, mask per destination by its own position (cluster fan-in), slice
+    (append_only feed reads carry per-row snapshots), buffer with the
+    per-entry cov chain. Members with no routed rows just advance their
+    read position. A flush failure landing mid-apply rewinds the
+    destination and bumps its epoch — the stale remainder is discarded by
+    the epoch guard in buffer()/advance_position().
+    """
+    routing_values = [dest_configs[d].routing_value for d in members]
+    if rows.num_rows == 0:
+        for d in members:
+            delivery.advance_position(d, hi, epoch=epochs[d])
+        return
+
+    if full_cdc:
+        rows = _resolve_preimages(rows, routing_field, key_columns)
+        # The extension's meta columns ride into the batch; slicing is
+        # skipped for full_cdc (pair-order contract) — whole-unit entries.
+        routed, unrouted = router.split_and_count(rows, routing_values)
+        if unrouted > 0:
+            metrics.unrouted_rows_total.inc(unrouted)
+        routed_ids = set()
+        for rv, batch in routed.items():
+            dest_id = rv_to_dest[rv]
+            routed_ids.add(dest_id)
+            if batch.num_rows > 0:
+                delivery.buffer(dest_id, batch, hi, epoch=epochs[dest_id])
+        for d in members:
+            if d not in routed_ids:
+                delivery.advance_position(d, hi, epoch=epochs[d])
+        return
+
+    # append_only: mask per destination by its own position, then slice.
+    routed, unrouted = router.split_and_count(rows, routing_values)
+    if unrouted > 0:
+        metrics.unrouted_rows_total.inc(unrouted)
+    routed_ids = set()
+    for rv, batch in routed.items():
+        dest_id = rv_to_dest[rv]
+        routed_ids.add(dest_id)
+        if batch.num_rows == 0:
+            continue
+        has_snaps = feed.SNAP_COL in batch.column_names
+        if has_snaps:
+            # Cluster fan-in: drop rows this member already has (its
+            # position is past the cluster min). Vectorized.
+            pos = positions[dest_id]
+            batch = batch.filter(pc.greater(batch.column(feed.SNAP_COL), pa.scalar(pos)))
+            if batch.num_rows == 0:
+                continue
+            snaps = batch.column(feed.SNAP_COL).to_pylist()
+            clean = batch.drop([feed.SNAP_COL])
+            for sub, cov, sub_hi in _slice_batch(clean, snaps, pos, hi, unit_cfg.read_unit_max_rows):
+                delivery.buffer(dest_id, sub, cov, epoch=epochs[dest_id], hi=sub_hi)
+        else:
+            # Legacy extension read: no per-row attribution — whole-unit
+            # entry (chunk-equivalent semantics).
+            delivery.buffer(dest_id, batch, hi, epoch=epochs[dest_id])
+    for d in members:
+        if d not in routed_ids:
+            delivery.advance_position(d, hi, epoch=epochs[d])
+
+
 def _poll_cycle(
     src_table,
     delivery,
@@ -1296,8 +1500,8 @@ def _poll_cycle(
     read_ids=None,
     lifecycle_states=None,
     dest_configs=None,
-    rotation=None,
     feed_reader=None,
+    read_pool=None,
 ):
     # Local boolean so the existing branch sites stay terse. Threading mode
     # (not full_cdc) through the call signature avoids reconstructing the
@@ -1327,22 +1531,15 @@ def _poll_cycle(
     this thread only reads, routes (Phase 1 included), and buffers. See
     viaduck/delivery.py and tla/Viaduck.tla (BufferRead / FlushStart).
 
-    `rotation`: optional mutable dict (owned by the run loop) carrying the
-    cursor-group iteration offset across cycles. Groups are processed in
-    ascending-cursor order, rotated by this offset; when the cycle time
-    budget (poll.cycle_time_budget_seconds) trips, remaining groups defer
-    to the next cycle, which resumes near the rotation offset (approximate
-    under group merge/split) rather than restarting at the most-lagging
-    group every time. Without the rotation, K lagging groups each get
-    first-turn service ahead of healthy groups on EVERY cycle — the
-    cursor-scatter wedge of 2026-07-31 (100s cycles on a 5s interval).
+    `read_pool`: the parallel unit-read executor (None in tests — reads
+    run inline on the poll thread).
     """
     metrics.polls_total.inc()
     health.record_poll()
 
     cycle_t0 = time.monotonic()
     cycle_rows_read = 0
-    cycle_groups_processed = 0
+    cycle_units = 0
 
     # One combined MIN/MAX statement: the postgres scanner does no aggregate
     # pushdown, so separate earliest/current queries would each pull the
@@ -1373,282 +1570,136 @@ def _poll_cycle(
             # draining destinations keep flushing what they have, paused/
             # retired are fully inert (assigned_ids still drives the lag/
             # status exports below so a draining destination stays visible).
-            groups = _group_by_cursor(positions, read_ids)
-
-            # Iterate lowest cursor first — the most-lagging group gets the
-            # first turn each cycle — but cap the chunks each group may read
-            # per cycle so a deeply-lagging group cannot monopolize the poll
-            # thread. Both halves are load-bearing:
-            #   - Insertion-order iteration (pre-sort) starved a lagging
-            #     destination whose config index was after a caught-up peer:
-            #     the peer's read filled the buffer and the lagging group's
-            #     first watermark check bounced it out with zero reads.
-            #   - Sorted-but-uncapped iteration (the first fix) starved the
-            #     HEALTHY destination instead: the lagging group's chunk loop
-            #     ran to head — or forever, when its flushes kept failing and
-            #     the position kept resetting — so the caught-up group never
-            #     got a read. Observed on team-50689: team-2's cursor frozen for
-            #     1.5h while team-50689 relitigated the same range.
-            # The cap turns strict priority into a round-robin with a
-            # lagging-first bias: every group makes progress every cycle.
             #
-            # Cycle time budget + rotation (poll.cycle_time_budget_seconds):
-            # the chunk cap bounds work PER GROUP, not the cycle — K lagging
-            # groups still stretch the cycle past the poll interval, slowing
-            # flush evaluation and lifecycle application for everyone (the
-            # 2026-07-31 cursor-scatter wedge: 100s cycles on a 5s interval).
-            # The budget stops group reads once the cycle is ~80% spent;
-            # deferred groups resume near the rotation offset next cycle
-            # (approximate under group merge/split — the offset is an index
-            # into a re-sorted, re-sized list, but a skipped group's frozen
-            # position sinks it toward sorted-index 0, self-correcting).
-            # Real bound per cycle is budget + one group's chunk quota: the
-            # budget is only checked BETWEEN groups. Floor: the check is
-            # skipped until one group with work has read, so a slow
-            # snapshot_bounds or retention clamp that eats the whole budget
-            # can never produce a zero-progress cycle.
-            cycle_budget_s = cfg.poll.cycle_time_budget_seconds
-            if cycle_budget_s == 0:
-                cycle_budget_s = 0.8 * cfg.poll.interval_seconds
-            ordered_groups = sorted(groups.items())
-            rot_off = 0
-            if rotation is not None and ordered_groups:
-                rot_off = rotation.get("offset", 0) % len(ordered_groups)
-                ordered_groups = ordered_groups[rot_off:] + ordered_groups[:rot_off]
-            groups_completed = 0
-            groups_read = 0
-            timeboxed = False
-            for start_snap, dest_ids in ordered_groups:
-                if start_snap >= current_id:
-                    groups_completed += 1
-                    continue  # already read through the current snapshot
-                if cycle_budget_s > 0 and groups_read > 0 and (time.monotonic() - cycle_t0) >= cycle_budget_s:
-                    timeboxed = True
-                    break
-
-                # Read CDC in snapshot chunks to bound memory use.
-                # Each chunk is read, routed, and buffered before the next is fetched.
-                chunk_size = cfg.poll.cdc_chunk_snapshots
-                chunk_start = start_snap
-                routing_error = False
-                chunks_this_group = 0
-                group_read_anything = False
-                while chunk_start < current_id and chunks_this_group < _MAX_CHUNKS_PER_GROUP_PER_CYCLE:
-                    chunks_this_group += 1
-                    # Per-destination backpressure, recomputed every chunk:
-                    # only members with queue headroom participate in this
-                    # chunk's read — the filter excludes an at-cap member's
-                    # rows and its position stays frozen, so it splits into
-                    # its own cursor group next cycle and is skipped until
-                    # a flush drains it. A destination that crosses its cap
-                    # mid-cycle therefore overshoots by AT MOST ONE chunk.
-                    # Both principal-SWE reviews flagged the earlier
-                    # group-level all() gate here: an at-cap member kept
-                    # receiving its split slice on a healthy groupmate's
-                    # headroom, unbounded for as long as the member's flush
-                    # was slow or hung — with the global watermark gone,
-                    # that was an OOM path, not just an overshoot.
-                    readable = [d for d in dest_ids if not delivery.should_pause_reads_for(d)]
-                    if not readable:
-                        log.debug("Pausing reads for group at %d: all destinations at buffer cap", start_snap)
-                        break
-                    routing_values = [dest_configs[d].routing_value for d in readable]
-                    filter_expr = router.build_filter_expr(routing_values)
-                    group_read_anything = True
-
-                    # Skip-scan: snapshot ids are global to the source
-                    # catalog, so spans minted by OTHER tables' commits
-                    # (measured 88% of megaduck churn) contain nothing for
-                    # this table yet cost a full catalog-planning round-trip
-                    # to read as an empty chunk. One indexed probe of
-                    # ducklake_snapshot_changes finds the next snapshot that
-                    # touched the CDC table; everything before it advances
-                    # cursor-only. Probe failure falls back to the plain
-                    # sequential read — skip-scan is an optimization, never
-                    # a correctness gate.
-                    try:
-                        next_touch = source.next_snapshot_touching_table(src_table, chunk_start, current_id)
-                    except Exception:
-                        log.warning(
-                            "Skip-scan probe failed for group at %d; reading sequentially", start_snap, exc_info=True
-                        )
-                        next_touch = chunk_start + 1
-                    if next_touch is None:
-                        for did in readable:
-                            delivery.advance_position(did, current_id, epoch=epochs[did])
-                        metrics.cdc_snapshots_skipped_total.inc(current_id - chunk_start)
-                        log.info(
-                            "CDC skip-scan: no source-table changes in (%d, %d], fast-forwarded %d snapshots",
-                            chunk_start,
-                            current_id,
-                            current_id - chunk_start,
-                        )
-                        delivery.maybe_flush()
-                        chunk_start = current_id
-                        continue
-                    if next_touch - 1 > chunk_start:
-                        skipped = next_touch - 1 - chunk_start
-                        for did in readable:
-                            delivery.advance_position(did, next_touch - 1, epoch=epochs[did])
-                        metrics.cdc_snapshots_skipped_total.inc(skipped)
-                        log.debug(
-                            "CDC skip-scan: fast-forwarded %d snapshots to %d (next source-table change)",
-                            skipped,
-                            next_touch - 1,
-                        )
-                        chunk_start = next_touch - 1
-
-                    chunk_end = min(chunk_start + chunk_size, current_id)
-                    snap_range = f"{chunk_start}→{chunk_end}"
-                    chunk_t0 = time.monotonic()
-                    state = {"rows": 0}
-                    _hb = _start_progress_heartbeat(
-                        label=f"CDC read {snap_range}",
-                        pre_progress_label="reading",
-                        state=state,
+            # Read loop (log-consumer-proposal.md §6.3): destinations whose
+            # positions fit one read-unit span share ONE read (cluster
+            # fan-in, masked per destination by its own position); clusters
+            # read in parallel on the read pool and their results are
+            # applied HERE, on the poll thread, as each completes (buffer-
+            # writer discipline unchanged). The retired scheduler — cursor
+            # groups, rotation, cycle time budget, per-group chunk cap,
+            # skip-scan — redistributed a fixed serial read supply; the
+            # feed's ~ms catalog reads make the supply parallel, so the
+            # machinery is deleted, not retuned. There is deliberately no
+            # cycle time budget: every unit is row/byte-bounded and every
+            # cluster dispatches every cycle (the barrier), so nothing
+            # starves.
+            clusters = _position_clusters(positions, read_ids, span_cap=cfg.poll.read_unit_max_span)
+            futures: dict = {}
+            for lo, members in clusters:
+                if lo >= current_id:
+                    continue  # this cluster has already read through head
+                # Per-destination read guards: at-cap members are excluded
+                # (their position freezes; they rejoin when their flush
+                # drains) — and the barrier below means no destination has
+                # two reads outstanding across cycles (tla/ViaduckReads.tla
+                # witnesses why that matters the day the barrier goes away).
+                readable = [d for d in members if not delivery.should_pause_reads_for(d)]
+                if not readable:
+                    continue
+                # Unit planning on the POLL thread: plan_read/plan_unit run
+                # catalog SQL on the FeedReader's psycopg connection, which
+                # is single-threaded — the pool never plans.
+                if feed_reader is not None and not full_cdc:
+                    hi = feed_reader.plan_unit(
+                        src_table,
+                        lo,
+                        current_id,
+                        max_rows=cfg.poll.read_unit_max_rows,
+                        max_bytes=cfg.poll.read_unit_max_bytes,
+                        max_span=cfg.poll.read_unit_max_span,
                     )
-                    try:
-                        if full_cdc:
-                            raw_data = source.read_cdc_changes(
-                                src_table,
-                                after_snapshot=chunk_start,
-                                end_snapshot=chunk_end,
-                                filter_expr=filter_expr,
-                                columns=source_columns,
-                            )
-                        elif feed_reader is not None:
-                            # src_table._catalog.connection: same private
-                            # reach source.py's snapshot helpers already use;
-                            # the connection carries the S3 credentials.
-                            raw_data = feed_reader.read(
-                                src_table,
-                                src_table._catalog.connection,
-                                chunk_start,
-                                chunk_end,
-                                filter_expr=filter_expr,
-                                columns=source_columns,
-                            )
-                        else:
-                            raw_data = source.read_cdc(
-                                src_table,
-                                after_snapshot=chunk_start,
-                                end_snapshot=chunk_end,
-                                filter_expr=filter_expr,
-                                columns=source_columns,
-                            )
-
-                        read_elapsed = time.monotonic() - chunk_t0
-                        state["rows"] = raw_data.num_rows
-
-                        try:
-                            metrics.cdc_batch_rows.observe(raw_data.num_rows)
-                        except Exception:
-                            log.warning("Failed to record CDC batch size metric")
-
-                        cycle_rows_read += raw_data.num_rows
-
-                        if raw_data.num_rows == 0:
-                            for did in readable:
-                                delivery.advance_position(did, chunk_end, epoch=epochs[did])
-                            log.info(
-                                "CDC chunk %s: 0 rows in %.1fs, %d snapshots remaining",
-                                snap_range,
-                                read_elapsed,
-                                current_id - chunk_end,
-                            )
-                            delivery.maybe_flush()
-                            chunk_start = chunk_end
-                            continue
-
-                        # Phase 1: Resolve preimages (full CDC only, before routing)
-                        if full_cdc:
-                            try:
-                                raw_data = _resolve_preimages(raw_data, cfg.routing.field, key_columns)
-                            except RoutingError:
-                                log.exception("Preimage resolution failed — key column may be missing from CDC data")
-                                metrics.errors_total.labels(type="routing", destination="").inc()
-                                routing_error = True
-                                break
-
-                        # Route in a single pass (split + count unrouted)
-                        try:
-                            routed, unrouted = router.split_and_count(raw_data, routing_values)
-                        except RoutingError:
-                            log.exception("Routing failed — routing field may be missing from source schema")
-                            metrics.errors_total.labels(type="routing", destination="").inc()
-                            routing_error = True
-                            break
-
-                        if unrouted > 0:
-                            metrics.unrouted_rows_total.inc(unrouted)
-
-                        # Buffer routed batches (BufferRead); destinations with no
-                        # routed rows just advance their read position in memory.
-                        routed_dest_ids = set()
-                        for routing_val, batch in routed.items():
-                            dest_id = rv_to_dest[routing_val]
-                            routed_dest_ids.add(dest_id)
-                            if batch.num_rows > 0:
-                                delivery.buffer(dest_id, batch, chunk_end, epoch=epochs[dest_id])
-                        for did in readable:
-                            if did not in routed_dest_ids:
-                                delivery.advance_position(did, chunk_end, epoch=epochs[did])
-
-                        log.info(
-                            "CDC chunk %s: %d rows in %.1fs (%.0f rows/s), %d snapshots remaining",
-                            snap_range,
-                            raw_data.num_rows,
-                            read_elapsed,
-                            raw_data.num_rows / read_elapsed if read_elapsed > 0 else 0,
-                            current_id - chunk_end,
+                    planned = feed_reader.plan_read(
+                        src_table,
+                        lo,
+                        hi,
+                        filter_expr=router.build_filter_expr([dest_configs[d].routing_value for d in readable]),
+                        columns=source_columns,
+                        with_snapshot=True,
+                    )
+                else:
+                    hi = min(lo + cfg.poll.read_unit_max_span, current_id)
+                    planned = None
+                if feed_reader is not None and planned is None:
+                    # Empty unit: no read needed — advance positions directly.
+                    for d in readable:
+                        delivery.advance_position(d, hi, epoch=epochs[d])
+                    continue
+                future = (
+                    read_pool.submit(
+                        _read_unit,
+                        src_table=src_table,
+                        feed_reader=feed_reader,
+                        planned=planned,
+                        lo=lo,
+                        hi=hi,
+                        members=readable,
+                        router=router,
+                        dest_configs=dest_configs,
+                        full_cdc=full_cdc,
+                        source_columns=source_columns,
+                    )
+                    if read_pool is not None
+                    else _InlineFuture(
+                        # Bind loop variables NOW (default args): a bare
+                        # closure over lo/readable would see the final
+                        # iteration's values in every thunk.
+                        lambda lo=lo, readable=readable, hi=hi: _read_unit(
+                            src_table=src_table,
+                            read_conn=src_table._catalog.connection,
+                            feed_reader=feed_reader,
+                            planned=planned,
+                            lo=lo,
+                            hi=hi,
+                            members=readable,
+                            router=router,
+                            dest_configs=dest_configs,
+                            full_cdc=full_cdc,
+                            source_columns=source_columns,
                         )
-                        delivery.maybe_flush()
-                        chunk_start = chunk_end
-
-                    except Exception:
-                        # Contain read/route/buffer failures to THIS group:
-                        # letting them propagate makes the run loop exit for
-                        # the whole instance. The residual retention-expiry
-                        # race lands here too (the floor is computed once
-                        # per cycle; an expiry job advancing it mid-cycle
-                        # makes this group's read raise — next cycle's clamp
-                        # absorbs it). Source-connection death still exits
-                        # via snapshot_bounds at the top of the cycle, so a
-                        # dead catalog connection keeps its restart-to-heal
-                        # behavior.
-                        log.exception(
-                            "CDC read failed for group at %d (chunk %s); skipping group this cycle",
-                            start_snap,
-                            snap_range,
-                        )
-                        metrics.errors_total.labels(type="cdc_read", destination="").inc()
-                        break
-                    finally:
-                        _hb.set()
-
-                if group_read_anything:
-                    cycle_groups_processed += 1
-                groups_completed += 1
-                groups_read += 1
-                if routing_error:
-                    break
-
-            if rotation is not None and ordered_groups:
-                # Next cycle resumes at the first group not reached this
-                # one (mod wraps: a fully-covered cycle starts at the same
-                # offset as this one began).
-                rotation["offset"] = rot_off + groups_completed
-            if timeboxed:
-                deferred = len(ordered_groups) - groups_completed
-                metrics.poll_cycle_timeboxed_total.inc()
-                log.info(
-                    "Poll cycle time-boxed after %.1fs (budget %.1fs): %d cursor group(s) deferred to next cycle",
-                    time.monotonic() - cycle_t0,
-                    cycle_budget_s,
-                    deferred,
+                    )
                 )
+                futures[future] = (lo, readable)
+            # Barrier per cycle: read results are applied HERE on the poll
+            # thread as each unit completes (the buffer-writer discipline
+            # is unchanged — pool threads never touch delivery state).
+            for future in futures:
+                # Failure containment per unit (the retired per-group
+                # containment's successor): a read/route/apply failure skips
+                # THIS cluster this cycle — nothing fleet-wide. Source-
+                # connection death still exits via snapshot_bounds at the
+                # top of the cycle.
+                try:
+                    rows, hi = future.result()
+                    cycle_rows_read += rows.num_rows
+                    cycle_units += 1
+                    metrics.cdc_batch_rows.observe(rows.num_rows)
+                    _apply_unit(
+                        delivery,
+                        rows,
+                        hi,
+                        members=futures[future][1],
+                        positions=positions,
+                        epochs=epochs,
+                        router=router,
+                        rv_to_dest=rv_to_dest,
+                        full_cdc=full_cdc,
+                        key_columns=key_columns,
+                        unit_cfg=cfg.poll,
+                        src_table=src_table,
+                        routing_field=cfg.routing.field,
+                        dest_configs=dest_configs,
+                    )
+                    delivery.maybe_flush()
+                except Exception:
+                    log.exception(
+                        "CDC unit read failed for cluster at %d; skipping it this cycle",
+                        futures[future][0],
+                    )
+                    metrics.errors_total.labels(type="cdc_read", destination="").inc()
 
     # Evaluate flush triggers (FlushStart) — also persists position-only
+
     # advances for idle destinations on the flush cadence.
     flushes_submitted = delivery.maybe_flush()
 
@@ -1712,14 +1763,14 @@ def _poll_cycle(
     # Per-cycle summary log. Quiet for empty cycles (no work) so steady-state
     # idleness doesn't flood the log; verbose when there's work to report.
     cycle_secs = time.monotonic() - cycle_t0
-    if cycle_groups_processed > 0 or cycle_rows_read > 0 or flushes_submitted > 0:
+    if cycle_units > 0 or cycle_rows_read > 0 or flushes_submitted > 0:
         max_lag = max(((snap_now - delivery_snapshot[did].flushed_snapshot) for did in status_ids), default=0)
         buffered_rows = sum(delivery_snapshot[did].buffer_rows for did in status_ids)
         log.info(
-            "Poll cycle: snapshot=%d, groups=%d, cdc_rows_read=%d, buffered_rows=%d, "
+            "Poll cycle: snapshot=%d, units=%d, cdc_rows_read=%d, buffered_rows=%d, "
             "flushes_submitted=%d, max_lag=%d, duration=%.2fs",
             snap_now,
-            cycle_groups_processed,
+            cycle_units,
             cycle_rows_read,
             buffered_rows,
             flushes_submitted,

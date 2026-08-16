@@ -256,16 +256,6 @@ _delivery_flush_deadlines_total = Counter(
     "Flushes aborted by the overall flush deadline (retry loop exceeded delivery.flush_deadline_seconds)",
     ["pipeline", "destination"],
 )
-_poll_cycle_timeboxed_total = Counter(
-    "viaduck_poll_cycle_timeboxed_total",
-    "Poll cycles that hit the cycle time budget with cursor groups deferred to the next cycle",
-    ["pipeline"],
-)
-_cdc_snapshots_skipped_total = Counter(
-    "viaduck_cdc_snapshots_skipped_total",
-    "Source snapshots fast-forwarded by the skip-scan probe (no changes to the CDC table) without a CDC read",
-    ["pipeline"],
-)
 _destination_lifecycle_state = Gauge(
     "viaduck_destination_lifecycle_state",
     "1 for the destination's current lifecycle state (active|paused|draining|retired); see viaduck/lifecycle.py",
@@ -476,8 +466,6 @@ delivery_reads_paused = _delivery_reads_paused
 delivery_circuit_open = _delivery_circuit_open
 delivery_circuit_opens_total = _delivery_circuit_opens_total
 delivery_flush_deadlines_total = _delivery_flush_deadlines_total
-poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total
-cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
 retention_clamp_total = _retention_clamp_total
@@ -514,7 +502,7 @@ def set_destination_lifecycle(dest_id: str, state: str, all_states) -> None:
 
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
-    global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id, cdc_snapshots_skipped_total
+    global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id
     global cdc_feed_query_seconds, cdc_feed_files_total, cdc_feed_inlined_rows_total, cdc_feed_replans_total
     global self_recycles_total
     global source_columns_excluded_total
@@ -532,7 +520,6 @@ def init(pipeline: str):
     global delivery_covered_replays_dropped_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
     global delivery_circuit_open, delivery_circuit_opens_total, delivery_flush_deadlines_total
-    global poll_cycle_timeboxed_total
     global retention_clamp_total, secret_cache_stale_fallback_total
     global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
     global discovery_poll_failures_total, discovery_broken_entries_total
@@ -591,8 +578,6 @@ def init(pipeline: str):
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
     self_recycles_total = _self_recycles_total.labels(pipeline=pipeline)
-    poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total.labels(pipeline=pipeline)
-    cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
     cdc_feed_query_seconds = _AutoPipelineLabels(_cdc_feed_query_seconds, pipeline)

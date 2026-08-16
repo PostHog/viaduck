@@ -1781,7 +1781,7 @@ def test_flush_commit_drops_covered_replay_entries():
     # Covered replay entries (through <= 20) dropped; the post-range entry
     # survives. Positions/cursors are at the zombie's through.
     buf = mgr._buffers["d1"]
-    assert [t.num_rows for t, _ in buf.entries] == [1]
+    assert [t.num_rows for t, _, _ in buf.entries] == [1]
     assert buf.entries[0][1] == 30
     assert buf.rows == 1
     assert mgr._flushed["d1"] == 20

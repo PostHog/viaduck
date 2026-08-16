@@ -63,6 +63,8 @@ import psycopg
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from viaduck import metrics
+
 if TYPE_CHECKING:
     from pyducklake import Table
 
@@ -82,7 +84,8 @@ _PHYSICAL_SNAPSHOT_COL = "_ducklake_internal_snapshot_id"
 
 # Alias for the injected attribution column in the straddle-filter subquery.
 # A source column with this exact name would collide — read() refuses loudly.
-_SNAP_ALIAS = "__viaduck_snap"
+_SNAP_OUT = "__viaduck_snap"
+SNAP_COL = _SNAP_OUT
 
 
 def _is_missing_file_error(exc: Exception) -> bool:
@@ -273,9 +276,66 @@ class FeedReader:
         self._path_cache[key] = value
         return value
 
-    # ------------------------------------------------------------------ #
-    # The read
-    # ------------------------------------------------------------------ #
+    def plan_unit(
+        self,
+        table: Table,
+        after_snapshot: int,
+        head: int,
+        *,
+        max_rows: int = 50_000,
+        max_bytes: int = 256 * 1024 * 1024,
+        max_span: int = 10_000,
+    ) -> int:
+        """The read unit's hi: extend from `after_snapshot` toward `head`
+        until a budget trips (proposal §6.2). Row/byte budgets bound memory
+        AND keep the flush unit under the destination commit cliff; the span
+        cap bounds inline-row overrun and GET fan-out. Snapshot-atomic: a
+        unit never splits a commit's files (hi lands on a begin_snapshot
+        group boundary). Catalog cost: one indexed range query (+ inline
+        COUNTs) — ~ms.
+        """
+        self.verify_catalog()
+        namespace, table_name = table._identifier[0], table._identifier[1]
+        pg = self._pg()
+        tid = self._table_id(pg, namespace, table_name)
+        lo1 = after_snapshot + 1
+        rows = pg.execute(
+            f"SELECT begin_snapshot, record_count, file_size_bytes "
+            f'FROM "{self._meta_schema}".ducklake_data_file '
+            f"WHERE table_id = %s AND begin_snapshot <= %s "
+            f"AND (begin_snapshot >= %s OR (partial_max IS NOT NULL AND partial_max >= %s)) "
+            f"ORDER BY begin_snapshot, data_file_id",
+            (tid, head, lo1, lo1),
+        ).fetchall()
+        # Inline rows count toward the budget but carry no record_count.
+        inline_count = 0
+        registry = pg.execute(
+            f'SELECT table_name FROM "{self._meta_schema}".ducklake_inlined_data_tables WHERE table_id = %s',
+            (tid,),
+        ).fetchall()
+        for (store,) in registry:
+            store = store.replace('"', '""')
+            row = pg.execute(
+                f'SELECT COUNT(*) FROM "{self._meta_schema}"."{store}" '
+                f"WHERE begin_snapshot > %s AND begin_snapshot <= %s",
+                (after_snapshot, head),
+            ).fetchone()
+            inline_count += int(row[0]) if row else 0
+
+        total_rows = inline_count
+        total_bytes = 0
+        hi = head
+        cur_begin = None
+        for begin, record_count, size_bytes in rows:
+            if cur_begin is not None and begin != cur_begin:
+                # Boundary check BEFORE starting a new snapshot group.
+                if total_rows >= max_rows or total_bytes >= max_bytes or begin > after_snapshot + max_span:
+                    hi = cur_begin
+                    break
+            cur_begin = begin
+            total_rows += int(record_count)
+            total_bytes += int(size_bytes)
+        return hi
 
     def read(
         self,
@@ -286,42 +346,34 @@ class FeedReader:
         *,
         filter_expr: str | None = None,
         columns: tuple[str, ...] | None = None,
+        with_snapshot: bool = False,
     ) -> pa.Table:
         """Inserted rows in (after_snapshot, end_snapshot] for the filter's
         routing values — the drop-in replacement for source.read_cdc.
 
         `conn` is the source catalog's DuckDB connection (carries the S3
-        credentials); used for parquet scans only.
+        credentials); used for parquet scans only. `with_snapshot` appends a
+        per-row __viaduck_snap column (the read loop slices on it; it is
+        stripped before buffering — destinations never see it).
         """
-        from viaduck import metrics
-
         self.verify_catalog()
         if end_snapshot <= after_snapshot:
-            return _empty_table(table, columns)
+            return _empty_table(table, columns, with_snapshot)
 
-        # The projection is ALWAYS explicit: the inline store prepends
-        # row_id/begin/end_snapshot to the data columns, so a `*` read would
-        # misalign rows against the data schema.
-        data_columns = columns if columns is not None else tuple(f.name for f in table.schema.fields)
-        namespace, table_name = table._identifier[0], table._identifier[1]
         t0 = time.monotonic()
-        file_rows, inline_rows, path_info = self._plan(
-            table, namespace, table_name, after_snapshot, end_snapshot, data_columns, filter_expr
+        planned = self.plan_read(
+            table,
+            after_snapshot,
+            end_snapshot,
+            filter_expr=filter_expr,
+            columns=columns,
+            with_snapshot=with_snapshot,
         )
-
-        if not file_rows and not inline_rows:
-            return _empty_table(table, columns)
-
-        full_schema = table.schema.as_arrow()
-        target_schema = pa.schema([full_schema.field(c) for c in data_columns])
-
-        def scan(rows) -> pa.Table | None:
-            return self._scan_files(
-                conn, rows, path_info, after_snapshot, end_snapshot, data_columns, filter_expr, target_schema
-            )
+        if planned is None:
+            return _empty_table(table, columns, with_snapshot)
 
         try:
-            result = scan(file_rows)
+            result = execute_read(conn, planned)
         except Exception as exc:
             if not _is_missing_file_error(exc):
                 raise
@@ -337,23 +389,23 @@ class FeedReader:
                 type(exc).__name__,
             )
             metrics.cdc_feed_replans_total.inc()
-            file_rows, inline_rows, path_info = self._plan(
-                table, namespace, table_name, after_snapshot, end_snapshot, data_columns, filter_expr
+            planned = self.plan_read(
+                table,
+                after_snapshot,
+                end_snapshot,
+                filter_expr=filter_expr,
+                columns=columns,
+                with_snapshot=with_snapshot,
             )
-            result = scan(file_rows)
-
-        if inline_rows:
-            inline_table = _inline_to_arrow(table, data_columns, inline_rows)
-            result = (
-                inline_table if result is None else pa.concat_tables([result, inline_table], promote_options="default")
-            )
-            metrics.cdc_feed_inlined_rows_total.inc(len(inline_rows))
+            if planned is None:
+                return _empty_table(table, columns, with_snapshot)
+            result = execute_read(conn, planned)
 
         if result is None:
             # The re-plan found the whole range compacted/emptied out from
             # under us — legal (all-inline ranges get flushed; files can
             # vanish between plan and GET). Return the empty projection.
-            return _empty_table(table, columns)
+            return _empty_table(table, columns, with_snapshot)
 
         duration = time.monotonic() - t0
         metrics.cdc_read_seconds.observe(duration)
@@ -367,9 +419,64 @@ class FeedReader:
         )
         return result
 
-    # ------------------------------------------------------------------ #
-    # Internals
-    # ------------------------------------------------------------------ #
+    def plan_read(
+        self,
+        table: Table,
+        after_snapshot: int,
+        end_snapshot: int,
+        *,
+        filter_expr: str | None,
+        columns: tuple[str, ...] | None,
+        with_snapshot: bool,
+    ) -> _PlannedRead | None:
+        """Plan one read unit (POLL THREAD — catalog SQL, ~ms): bucket the
+        file list into plain/partial-unfiltered/partial-filtered parquet
+        scans and carry the inline rows. The data plane (execute_read) runs
+        on the read pool. Returns None when the range has nothing.
+        """
+        namespace, table_name = table._identifier[0], table._identifier[1]
+        data_columns = columns if columns is not None else tuple(f.name for f in table.schema.fields)
+        file_rows, inline_rows, path_info = self._plan(
+            table, namespace, table_name, after_snapshot, end_snapshot, data_columns, filter_expr, with_snapshot
+        )
+        if not file_rows and not inline_rows:
+            return None
+        full_schema = table.schema.as_arrow()
+        target_schema = pa.schema([full_schema.field(c) for c in data_columns])
+
+        lo1 = after_snapshot + 1
+        table_path, schema_path = path_info
+        plain_by_begin: dict[int, list[str]] = {}
+        partial_unfiltered: list[str] = []
+        partial_filtered: list[str] = []
+        for _fid, begin, partial_max, _rid_start, _rc, path, path_is_relative, _size in file_rows:
+            resolved = self._resolve_path(path, path_is_relative, table_path, schema_path)
+            if partial_max is None:
+                plain_by_begin.setdefault(begin, []).append(resolved)
+            elif begin < lo1 or partial_max > end_snapshot:
+                partial_filtered.append(resolved)
+            else:
+                partial_unfiltered.append(resolved)
+        metrics.cdc_feed_files_total.inc(len(file_rows))
+        if (partial_filtered or with_snapshot) and _SNAP_OUT in data_columns:
+            raise FeedError(f"Source column named {_SNAP_OUT!r} collides with the feed's internal alias; rename it")
+
+        return _PlannedRead(
+            plain_groups=(
+                sorted(plain_by_begin.items())
+                if with_snapshot
+                else [(None, [p for ps in plain_by_begin.values() for p in ps])]
+            ),
+            partial_unfiltered=partial_unfiltered,
+            partial_filtered=partial_filtered,
+            inline_rows=inline_rows,
+            after_snapshot=after_snapshot,
+            end_snapshot=end_snapshot,
+            data_columns=data_columns,
+            filter_expr=filter_expr,
+            with_snapshot=with_snapshot,
+            target_schema=target_schema,
+        )
 
     def _plan(
         self,
@@ -380,6 +487,7 @@ class FeedReader:
         end_snapshot: int,
         data_columns: tuple[str, ...],
         filter_expr: str | None,
+        with_snapshot: bool = False,
     ) -> tuple[list[tuple], list[tuple], tuple[tuple[str | None, bool], tuple[str | None, bool]]]:
         """(file rows, inline rows, (table_path, schema_path)) for the
         range, from ONE consistent
@@ -393,8 +501,6 @@ class FeedReader:
         NOTE: the SET TRANSACTION must be the first statement inside the
         transaction() block or PG silently keeps READ COMMITTED.
         """
-        from viaduck import metrics
-
         t0 = time.monotonic()
         pg = self._pg()
         with pg.transaction():
@@ -410,77 +516,11 @@ class FeedReader:
                 f"ORDER BY begin_snapshot, data_file_id",
                 (tid, end_snapshot, lo1, lo1),
             ).fetchall()
-            inline_rows = self._read_inline(pg, tid, after_snapshot, end_snapshot, data_columns, filter_expr)
+            inline_rows = self._read_inline(
+                pg, tid, after_snapshot, end_snapshot, data_columns, filter_expr, with_snapshot
+            )
         metrics.cdc_feed_query_seconds.labels(surface="catalog").observe(time.monotonic() - t0)
         return file_rows, inline_rows, path_info
-
-    def _scan_files(
-        self,
-        conn,
-        file_rows: list[tuple],
-        path_info: tuple[tuple[str | None, bool], tuple[str | None, bool]],
-        after_snapshot: int,
-        end_snapshot: int,
-        data_columns: tuple[str, ...],
-        filter_expr: str | None,
-        target_schema: pa.Schema,
-    ) -> pa.Table | None:
-        """Parquet data plane for one plan. None when the plan has no files.
-
-        The two-sided snapshot filter is applied to a partial_max file only
-        when the extension would apply it (verified against
-        SetSnapshotFilter call sites): low side when the file's
-        begin_snapshot predates the range, high side when partial_max
-        exceeds it. A partial file fully inside the window scans
-        unfiltered — the filter forces a physical-column materialization
-        per row, and on megaduck's compactor cadence that difference is the
-        hot path.
-        """
-        from viaduck import metrics
-
-        if not file_rows:
-            return None
-        table_path, schema_path = path_info
-        lo1 = after_snapshot + 1
-        plain_paths: list[str] = []
-        partial_unfiltered: list[str] = []
-        partial_filtered: list[str] = []
-        for _fid, begin, partial_max, _rid_start, _rc, path, path_is_relative, _size in file_rows:
-            resolved = self._resolve_path(path, path_is_relative, table_path, schema_path)
-            if partial_max is None:
-                plain_paths.append(resolved)
-            elif begin < lo1 or partial_max > end_snapshot:
-                partial_filtered.append(resolved)
-            else:
-                partial_unfiltered.append(resolved)
-        metrics.cdc_feed_files_total.inc(len(file_rows))
-        if partial_filtered and _SNAP_ALIAS in data_columns:
-            raise FeedError(f"Source column named {_SNAP_ALIAS!r} collides with the feed's internal alias; rename it")
-
-        proj_sql = _projection_sql(data_columns)
-        parts: list[pa.Table] = []
-
-        read_t0 = time.monotonic()
-        for paths in (plain_paths, partial_unfiltered):
-            if paths:
-                sql = f"SELECT {proj_sql} FROM parquet_scan({_path_list_sql(paths)})"
-                if filter_expr:
-                    sql += f" WHERE {filter_expr}"
-                parts.append(_align_temporal_types(conn.execute(sql).to_arrow_table(), target_schema))
-        if partial_filtered:
-            paths_sql = _path_list_sql(partial_filtered)
-            sql = (
-                f"SELECT {proj_sql} FROM ("
-                f"SELECT *, {_PHYSICAL_SNAPSHOT_COL} AS {_SNAP_ALIAS} FROM parquet_scan({paths_sql})) "
-                f"WHERE {_SNAP_ALIAS} > {int(after_snapshot)} AND {_SNAP_ALIAS} <= {int(end_snapshot)}"
-            )
-            if filter_expr:
-                sql += f" AND ({filter_expr})"
-            parts.append(_align_temporal_types(conn.execute(sql).to_arrow_table(), target_schema))
-        metrics.cdc_feed_query_seconds.labels(surface="parquet").observe(time.monotonic() - read_t0)
-        if not parts:
-            return None
-        return parts[0] if len(parts) == 1 else pa.concat_tables(parts, promote_options="default")
 
     def _read_inline(
         self,
@@ -490,8 +530,10 @@ class FeedReader:
         end_snapshot: int,
         columns: tuple[str, ...],
         filter_expr: str | None,
+        with_snapshot: bool = False,
     ) -> list[tuple]:
         """Union of all registered inline stores for the table, in-range.
+        When with_snapshot, each row carries begin_snapshot appended.
 
         Called inside the read's REPEATABLE READ transaction. Returns raw
         rows of the projected data columns (in projection order); Arrow
@@ -507,6 +549,8 @@ class FeedReader:
         # column mapping is a golden-suite concern (the branch is dormant in
         # prod), and a mismatch raises loudly rather than drifting.
         data_cols = ", ".join(f'"{c.replace(chr(34), chr(34) * 2)}"' for c in columns)
+        if with_snapshot:
+            data_cols += ", begin_snapshot"
         # The routing filter applies here too — inline rows are rows, full
         # stop. (Caught by the parity suite: unfiltered inline rows leak
         # other tenants' data into the read.)
@@ -587,16 +631,113 @@ def _path_list_sql(paths: list[str]) -> str:
     return "[" + ", ".join("'" + p.replace("'", "''") + "'" for p in paths) + "]"
 
 
-def _empty_table(table: Table, columns: tuple[str, ...] | None) -> pa.Table:
+class _PlannedRead:
+    """One read unit's data-plane plan: bucketed file lists + inline rows +
+    everything execute_read needs. Built on the poll thread (catalog SQL,
+    ~ms); executed on a read-pool thread (pure I/O + Arrow compute).
+
+    NOT a dataclass: slots only, built once per unit."""
+
+    __slots__ = (
+        "plain_groups",
+        "partial_unfiltered",
+        "partial_filtered",
+        "inline_rows",
+        "after_snapshot",
+        "end_snapshot",
+        "data_columns",
+        "filter_expr",
+        "with_snapshot",
+        "target_schema",
+    )
+
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def execute_read(conn, plan: _PlannedRead) -> pa.Table | None:
+    """Data plane for one planned read unit (READ POOL thread): parquet
+    scans + inline conversion + temporal alignment. Returns None when the
+    plan has no content (a re-plan that came back empty). Raises
+    duckdb.IOException/HTTPException on a vanished file — the caller
+    (poll thread) re-plans and re-dispatches once.
+
+    Bucket semantics (verified against the extension's SetSnapshotFilter):
+    the two-sided per-row snapshot filter applies only to a partial_max
+    file that genuinely straddles the range; a contained partial file
+    scans unfiltered (the per-row physical-column read is the hot-path
+    cost worth skipping).
+    """
+    from viaduck import metrics
+
+    proj_sql = _projection_sql(plan.data_columns)
+    snap_select = f", {_SNAP_OUT}" if plan.with_snapshot else ""
+    parts: list[pa.Table] = []
+
+    read_t0 = time.monotonic()
+    # Plain files carry no attribution column; when the caller wants
+    # per-row snapshots, group by begin_snapshot and inject the constant
+    # (cheap: one scan per distinct begin; groups per unit are few).
+    for begin, paths in plan.plain_groups:
+        if not paths:
+            continue
+        snap_col = f", {int(begin)} AS {_SNAP_OUT}" if plan.with_snapshot else ""
+        sql = f"SELECT {proj_sql}{snap_col} FROM parquet_scan({_path_list_sql(paths)})"
+        if plan.filter_expr:
+            sql += f" WHERE {plan.filter_expr}"
+        parts.append(_align_temporal_types(conn.execute(sql).to_arrow_table(), plan.target_schema))
+    if plan.partial_unfiltered:
+        # Contained merged files need no filter; attribution still
+        # available via the physical column when requested.
+        phys = f", {_PHYSICAL_SNAPSHOT_COL} AS {_SNAP_OUT}" if plan.with_snapshot else ""
+        sql = f"SELECT {proj_sql}{phys} FROM parquet_scan({_path_list_sql(plan.partial_unfiltered)})"
+        if plan.filter_expr:
+            sql += f" WHERE {plan.filter_expr}"
+        parts.append(_align_temporal_types(conn.execute(sql).to_arrow_table(), plan.target_schema))
+    if plan.partial_filtered:
+        paths_sql = _path_list_sql(plan.partial_filtered)
+        inner_snap = f"{_PHYSICAL_SNAPSHOT_COL} AS {_SNAP_OUT}"
+        sql = (
+            f"SELECT {proj_sql}{snap_select} FROM ("
+            f"SELECT *, {inner_snap} FROM parquet_scan({paths_sql})) "
+            f"WHERE {_SNAP_OUT} > {int(plan.after_snapshot)} AND {_SNAP_OUT} <= {int(plan.end_snapshot)}"
+        )
+        if plan.filter_expr:
+            sql += f" AND ({plan.filter_expr})"
+        parts.append(_align_temporal_types(conn.execute(sql).to_arrow_table(), plan.target_schema))
+    metrics.cdc_feed_query_seconds.labels(surface="parquet").observe(time.monotonic() - read_t0)
+
+    if plan.inline_rows:
+        inline_rows = plan.inline_rows
+        if plan.with_snapshot:
+            snaps = [int(r[-1]) for r in inline_rows]
+            inline_rows = [r[:-1] for r in inline_rows]
+            inline_table = _inline_to_arrow(plan.target_schema, plan.data_columns, inline_rows).append_column(
+                _SNAP_OUT, pa.array(snaps, type=pa.int64())
+            )
+        else:
+            inline_table = _inline_to_arrow(plan.target_schema, plan.data_columns, inline_rows)
+        parts.append(inline_table)
+        metrics.cdc_feed_inlined_rows_total.inc(len(plan.inline_rows))
+
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else pa.concat_tables(parts, promote_options="default")
+
+
+def _empty_table(table: Table, columns: tuple[str, ...] | None, with_snapshot: bool = False) -> pa.Table:
     """Zero-row table with the projected schema (parity with an empty
     table_insertions result)."""
     schema = table.schema.as_arrow()
     if columns is not None:
         schema = pa.schema([schema.field(c) for c in columns])
+    if with_snapshot:
+        schema = schema.append(pa.field(_SNAP_OUT, pa.int64()))
     return schema.empty_table()
 
 
-def _inline_to_arrow(table: Table, columns: tuple[str, ...], rows: list[tuple]) -> pa.Table:
+def _inline_to_arrow(schema: pa.Schema, columns: tuple[str, ...], rows: list[tuple]) -> pa.Table:
     """Inline PG rows → Arrow, typed per the (projected) source schema.
 
     The inline store's PG column types do NOT match the source types
@@ -647,8 +788,6 @@ def _inline_to_arrow(table: Table, columns: tuple[str, ...], rows: list[tuple]) 
             f"— refusing to guess (extend the allowlist deliberately)"
         )
 
-    schema = table.schema.as_arrow()
-    schema = pa.schema([schema.field(c) for c in columns])
     arrays = [
         pa.array([coerce(r[i], field.type, field.name) for r in rows], type=field.type)
         for i, field in enumerate(schema)

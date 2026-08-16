@@ -303,46 +303,27 @@ class TestInlineCoercion:
     """The allowlist in _inline_to_arrow: pass-through pairs stay exact,
     everything else raises FeedError (never silent)."""
 
-    def _table(self):
-        table = MagicMock()
-        f1 = MagicMock()
-        f1.name = "s"
-        f2 = MagicMock()
-        f2.name = "ts"
-        table.schema.fields = [f1, f2]
-        table.schema.as_arrow.return_value = pa.schema(
-            [pa.field("s", pa.string()), pa.field("ts", pa.timestamp("us", tz="UTC"))]
-        )
-        return table
-
     def test_bytes_to_string_and_str_to_timestamp(self):
         import datetime
 
-        out = feed._inline_to_arrow(self._table(), ("s", "ts"), [(b"duck", "2026-01-02 03:04:05+00:00")])
+        schema = pa.schema([pa.field("s", pa.string()), pa.field("ts", pa.timestamp("us", tz="UTC"))])
+        out = feed._inline_to_arrow(schema, ("s", "ts"), [(b"duck", "2026-01-02 03:04:05+00:00")])
         assert out.column("s").to_pylist() == ["duck"]
         assert out.column("ts").to_pylist() == [datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.UTC)]
 
     def test_interval_refused_loudly(self):
         import datetime
 
-        table = MagicMock()
-        f = MagicMock()
-        f.name = "i"
-        table.schema.fields = [f]
-        table.schema.as_arrow.return_value = pa.schema([pa.field("i", pa.month_day_nano_interval())])
+        schema = pa.schema([pa.field("i", pa.month_day_nano_interval())])
         with pytest.raises(FeedError, match="column 'i'"):
-            feed._inline_to_arrow(table, ("i",), [(datetime.timedelta(days=3),)])
+            feed._inline_to_arrow(schema, ("i",), [(datetime.timedelta(days=3),)])
 
     def test_uuid_refused_loudly(self):
         import uuid
 
-        table = MagicMock()
-        f = MagicMock()
-        f.name = "u"
-        table.schema.fields = [f]
-        table.schema.as_arrow.return_value = pa.schema([pa.field("u", pa.string())])
+        schema = pa.schema([pa.field("u", pa.string())])
         with pytest.raises(FeedError, match="column 'u'"):
-            feed._inline_to_arrow(table, ("u",), [(uuid.uuid4(),)])
+            feed._inline_to_arrow(schema, ("u",), [(uuid.uuid4(),)])
 
 
 class TestMissingFileMatcher:

@@ -359,24 +359,27 @@ class DestinationConfig:
 @dataclass(frozen=True)
 class PollConfig:
     interval_seconds: float = 5.0
-    cdc_chunk_snapshots: int = 100
-    # Per-cycle wall-clock budget for CDC group reads. When the budget trips,
-    # remaining cursor groups defer to the next cycle (group iteration
-    # rotates, so deferred groups resume near the rotation offset —
-    # approximate under group merge/split). Without it, K lagging groups x
-    # the per-group chunk quota can stretch a cycle past the interval — the
-    # 2026-07-31 cursor-scatter incident ran 100s cycles on a 5s interval,
-    # slowing flush evaluation, lifecycle application, and lag exports for
-    # every destination, not just the lagging ones. The budget is checked
-    # only BETWEEN groups (real bound: budget + one group's chunk quota) and
-    # is skipped until one group with work has read (never a zero-progress
-    # cycle). 0 (default) derives 0.8 x interval_seconds; negative disables
-    # (legacy unbounded cycles).
-    cycle_time_budget_seconds: float = 0.0
+    # Read loop (log-consumer-proposal.md §6.3): each read unit is bounded
+    # by rows AND bytes AND snapshot span. Row/byte budgets bound memory and
+    # keep a unit's flush under the destination commit cliff (measured:
+    # 56.5s @60-90k rows vs the 240s deadline); the span cap bounds
+    # inline-row overrun and GET fan-out. Units are the read-amortization
+    # knob — the retired cdc_chunk_snapshots coupled read size to the flush
+    # floor, which is exactly the wedge it caused.
+    read_unit_max_rows: int = 50_000
+    read_unit_max_bytes: int = 256 * 1024 * 1024
+    read_unit_max_span: int = 10_000
+    # Parallel read pool size (bare duckdb connections; one in-flight read
+    # per destination regardless — tla/ViaduckReads.tla).
+    read_workers: int = 8
 
     def __post_init__(self):
-        if self.cdc_chunk_snapshots < 1:
-            raise ConfigError(f"poll.cdc_chunk_snapshots must be >= 1, got {self.cdc_chunk_snapshots}")
+        if self.read_unit_max_rows < 1:
+            raise ConfigError(f"poll.read_unit_max_rows must be >= 1, got {self.read_unit_max_rows}")
+        if self.read_unit_max_span < 1:
+            raise ConfigError(f"poll.read_unit_max_span must be >= 1, got {self.read_unit_max_span}")
+        if self.read_workers < 1:
+            raise ConfigError(f"poll.read_workers must be >= 1, got {self.read_workers}")
 
 
 @dataclass(frozen=True)
@@ -524,7 +527,7 @@ class DeliveryConfig:
     # buffer-manager corruption + SIGSEGV (2026-07-29 incident).
     # Batches <=~60K rows are the empirically stable regime. A single
     # buffered chunk larger than the cap still flushes whole (slicing
-    # never splits a chunk) — poll.cdc_chunk_snapshots bounds that.
+    # never splits a read entry) — poll.read_unit_max_rows bounds that.
     # 0 = unlimited (pre-slicing behavior).
     flush_batch_max_rows: int = 60_000
     # Adaptive per-destination flush sizing (AIMD on flush duration).
@@ -540,7 +543,7 @@ class DeliveryConfig:
     # duration: in the [low, high] band → hold; faster than low → additive
     # increase (step_bytes, capped at flush_max_bytes); slower than high →
     # halve (floored at min_bytes). Effective floor is one CDC chunk —
-    # slicing never splits a chunk — so poll.cdc_chunk_snapshots stays the
+    # slicing never splits a read entry — so poll.read_unit_max_rows stays the
     # true lower bound on batch size.
     flush_adaptive: bool = True
     flush_adaptive_low_seconds: float = 5.0
@@ -791,10 +794,12 @@ class ViaduckConfig:
         log.info("config: routing.seed_truncate=%s", self.routing.seed_truncate)
 
         log.info("config: poll.interval_seconds=%s", self.poll.interval_seconds)
-        log.info("config: poll.cdc_chunk_snapshots=%d", self.poll.cdc_chunk_snapshots)
         log.info(
-            "config: poll.cycle_time_budget_seconds=%s (0=derive: 0.8x interval)",
-            self.poll.cycle_time_budget_seconds,
+            "config: poll.read_unit max_rows=%d max_bytes=%d max_span=%d read_workers=%d",
+            self.poll.read_unit_max_rows,
+            self.poll.read_unit_max_bytes,
+            self.poll.read_unit_max_span,
+            self.poll.read_workers,
         )
 
         log.info("config: delivery.workers=%d", self.delivery.workers)
@@ -991,8 +996,12 @@ def load(path: str | Path) -> ViaduckConfig:
     poll_raw = raw.get("poll", {})
     poll = PollConfig(
         interval_seconds=poll_raw.get("interval_seconds", 5.0),
-        cdc_chunk_snapshots=_validate_int(poll_raw.get("cdc_chunk_snapshots", 100), "poll.cdc_chunk_snapshots"),
-        cycle_time_budget_seconds=float(poll_raw.get("cycle_time_budget_seconds", 0.0)),
+        read_unit_max_rows=_validate_int(poll_raw.get("read_unit_max_rows", 50_000), "poll.read_unit_max_rows"),
+        read_unit_max_bytes=_validate_int(
+            poll_raw.get("read_unit_max_bytes", 256 * 1024 * 1024), "poll.read_unit_max_bytes"
+        ),
+        read_unit_max_span=_validate_int(poll_raw.get("read_unit_max_span", 10_000), "poll.read_unit_max_span"),
+        read_workers=_validate_int(poll_raw.get("read_workers", 8), "poll.read_workers"),
     )
 
     server_raw = raw.get("server", {})

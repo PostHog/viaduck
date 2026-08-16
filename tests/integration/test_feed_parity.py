@@ -13,6 +13,7 @@ or fall here; unit tests in tests/unit/test_feed.py pin only SQL shape.
 from __future__ import annotations
 
 import collections
+from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pytest
@@ -20,7 +21,10 @@ from pyducklake import Catalog
 from testcontainers.postgres import PostgresContainer
 
 from viaduck import metrics
+from viaduck.config import RoutingConfig
 from viaduck.feed import FeedError, FeedReader
+from viaduck.main import _poll_cycle, _ReadPool
+from viaduck.router import Router
 
 
 def setup_module():
@@ -714,3 +718,89 @@ class TestMixedPlaneFidelity:
         assert sum(_rows(got).values()) == 3
         # The parquet leg must have been normalized to the pinned UTC schema.
         assert got.column("tstz").type == pa.timestamp("us", tz="UTC")
+
+
+class TestPollCycleWithFeed:
+    """The M4 loop end-to-end locally: _poll_cycle driving the real feed
+    reader + read pool against a PG-backed source — cluster planning, unit
+    reads, per-row attribution, slicing, and buffering into a real
+    DeliveryManager (mocked pool/state so no destination writes land)."""
+
+    def test_poll_cycle_feed_end_to_end(self, pg_dsn, reader, catalog):
+
+        conn = catalog.connection
+        conn.execute("CREATE TABLE IF NOT EXISTS lake.main.e2e (team_id BIGINT, event VARCHAR, value BIGINT)")
+        created = _head_snapshot(catalog)
+        tbl = catalog.load_table("main.e2e")
+        for i in range(6):
+            _insert(catalog, [(2, f"e{i}a", i), (7, f"e{i}b", i)], "main.e2e")
+        head = _head_snapshot(catalog)
+        assert head - created >= 6
+
+        router = Router(RoutingConfig(field="team_id", mode="append_only", key_columns=[]))
+
+        delivery = MagicMock()
+        buffered: list = []
+        positions = {"dest-a": created, "dest-b": created}
+
+        def fake_buffer(dest_id, batch, through, epoch=None, hi=None):
+            buffered.append((dest_id, batch.num_rows, through, hi, batch.column("team_id").to_pylist()))
+
+        delivery.buffer.side_effect = fake_buffer
+        delivery.advance_position.side_effect = lambda d, s, epoch=None: None
+        delivery.read_plan.side_effect = lambda: {d: (positions[d], 0) for d in positions}
+        delivery.should_pause_all_reads.return_value = False
+        delivery.should_pause_reads_for.return_value = False
+        delivery.maybe_flush.return_value = 0
+        delivery.flushed_snapshots.return_value = dict(positions)
+        delivery.status_snapshot.return_value = {}
+        delivery.active_ids.return_value = set(positions)
+
+        cfg = MagicMock()
+        cfg.source.name = "lake"
+        cfg.source.table = "main.e2e"
+        cfg.routing.field = "team_id"
+        cfg.routing.mode = "append_only"
+        cfg.poll.interval_seconds = 5.0
+        cfg.poll.read_unit_max_rows = 50_000
+        cfg.poll.read_unit_max_bytes = 256 * 1024 * 1024
+        cfg.poll.read_unit_max_span = 10_000
+        cfg.poll.read_workers = 4
+        cfg.destinations = []
+        dest_a = MagicMock(id="dest-a", routing_value="2")
+        dest_b = MagicMock(id="dest-b", routing_value="7")
+        cfg.destinations = [dest_a, dest_b]
+        cfg.destination_by_id = lambda d: {"dest-a": dest_a, "dest-b": dest_b}[d]
+
+        pool = _ReadPool({}, 2)
+        try:
+            from unittest.mock import patch as _patch
+
+            with _patch("viaduck.main._log_memory_stats"):
+                _poll_cycle(
+                    tbl,
+                    delivery,
+                    MagicMock(),
+                    router,
+                    cfg,
+                    ["dest-a", "dest-b"],
+                    {"2": "dest-a", "7": "dest-b"},
+                    [],
+                    "append_only",
+                    source_columns=("team_id", "event", "value"),
+                    feed_reader=reader,
+                    read_pool=pool,
+                )
+        finally:
+            pool.close()
+
+        # Every source row landed exactly once across the two buffers.
+        total = sum(n for _, n, _, _, _ in buffered)
+        assert total == 12
+        teams_a = [t for d, _, _, _, ts in buffered if d == "dest-a" for t in ts]
+        teams_b = [t for d, _, _, _, ts in buffered if d == "dest-b" for t in ts]
+        assert set(teams_a) == {2} and set(teams_b) == {7}
+        # Cov chains are sane: non-decreasing per destination, last == unit hi.
+        for dest in ("dest-a", "dest-b"):
+            covs = [c for d, _, c, _, _ in buffered if d == dest]
+            assert covs == sorted(covs) and covs and covs[-1] == head

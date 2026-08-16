@@ -367,15 +367,16 @@ Per poll cycle (barrier semantics — specified per review):
 ```
 plan := delivery.read_plan()                    # atomic (position, epoch) per destination
 head  := source bounds (sampled ONCE per cycle) # merge precondition
-clusters := cluster positions whose ranges fit one budget span,
-             each cluster reading from min(position)
-for each cluster, dispatched onto the reader pool (~8):
-    eligible := members with buffer headroom AND no in-flight read
-    seg := read_feed(cluster_min, head, union(routing_values(eligible)), budget)
-    per destination d in eligible:
-        rows := seg where snapshot_id > plan[d].position   # cluster fan-in mask
-        slice rows (§6.2) → delivery.buffer(d, entry, through, epoch=plan[d].epoch)
-poll thread, same cycle: delivery.maybe_flush(); health.record_poll()   # unconditional
+clusters := _position_clusters(positions, active, span_cap)  # positions
+             within one budget span share a read (cluster fan-in);
+             legacy/extension mode clusters by exact position only
+for each cluster (ascending), dispatched onto the read pool (~8):
+    eligible := members with buffer headroom    # at-cap members freeze
+    POLL THREAD: unit planning (feed.plan_read — indexed catalog SQL)
+    POOL THREAD: execute_read (parquet + inline data plane only)
+    POLL THREAD, as each completes: route → mask (snapshot_id > position_d)
+    → slice (cov chain, §6.2) → buffer(d, entry, cov, epoch) per member
+poll thread, per completion and at cycle end: delivery.maybe_flush()
 ```
 
 Mechanisms stated per review (all load-bearing):
@@ -442,16 +443,21 @@ replays duplicate (destinations tolerate).
 Invariant carryover from `Viaduck.tla` (the seven current invariants):
 EventualConsistency, CursorMonotonicity, FlushStateConsistency,
 BufferPositionBound carry; NoPhantomWhenCurrent/NoDataLossWhenCurrent are
-re-expressed against the slice-cursor rule; PartitionCorrectness maps to
-per-cluster reads. **BufferCap is extended explicitly** to model at-cap
-member exclusion within a shared segment (position freezes while peers
-advance — new state space). SeedDestination/CrashAfterSeed/PauseDest
-actions carry over. New mechanism modeled: segment read with row budget,
-the slice-cursor chain, cluster fan-in masking. SQL-level feed parity is
-a golden-test property, not a TLC property — stated plainly: the formal
-budget covers the cursor machinery, the test budget covers SQL semantics.
-**Order: spec change lands and TLC passes before the read-loop
-implementation (milestone ordering, §12).**
+re-expressed against the slice-cursor chain; PartitionCorrectness maps to
+per-cluster reads. **New structural invariant: EntryCoverageInvariant**
+(covs non-decreasing; no row in a later entry has snap ≤ an earlier
+entry's cov). BufferCap stays per-destination (an at-cap member of a
+shared cluster is excluded from the filter — position splits and rejoins
+are already the model's per-destination interleavings; no new modeling
+needed). SeedDestination/CrashAfterSeed/PauseDest carry over. Cluster
+fan-in masking is a refinement (a shared physical read ≡ the union of
+per-destination logical reads of the same span) — stated, not a new
+action. SQL-level feed parity is a golden-test property, not a TLC
+property — stated plainly: the formal budget covers the cursor machinery,
+the test budget covers SQL semantics. The per-destination in-flight read
+guard got its own companion module (`tla/ViaduckReads.tla`, guarded PASS
+/ unguarded counterexample) per spec-first. **Order: spec change lands
+and TLC passes before the read-loop implementation.**
 
 ## 7. Performance model (estimates; assumptions explicit)
 

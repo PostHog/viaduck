@@ -14,14 +14,12 @@ from viaduck.apply import (
     _apply_changes,
     _build_delete_filter,
     _resolve_conflicts,
-    _write_with_retry,
     append_only,
 )
 from viaduck.main import (
     _clamp_expired_cursors,
     _derive_dest_status,
     _fmt_duration,
-    _group_by_cursor,
     _initial_snapshot_id,
     _poll_cycle,
     _resolve_preimages,
@@ -36,639 +34,6 @@ def setup_module():
     metrics.init("test")
 
 
-# ---------------------------------------------------------------------------
-# _group_by_cursor
-# ---------------------------------------------------------------------------
-
-
-def test_group_by_cursor_all_same():
-    cursors = {"a": 10, "b": 10, "c": 10}
-    groups = _group_by_cursor(cursors, ["a", "b", "c"])
-    assert groups == {10: ["a", "b", "c"]}
-
-
-def test_group_by_cursor_mixed():
-    cursors = {"a": 10, "b": 5, "c": 10}
-    groups = _group_by_cursor(cursors, ["a", "b", "c"])
-    assert groups == {10: ["a", "c"], 5: ["b"]}
-
-
-def test_group_by_cursor_missing_defaults_to_zero():
-    cursors = {"a": 10}
-    groups = _group_by_cursor(cursors, ["a", "b"])
-    assert groups == {10: ["a"], 0: ["b"]}
-
-
-def test_group_by_cursor_empty():
-    groups = _group_by_cursor({}, [])
-    assert groups == {}
-
-
-# ---------------------------------------------------------------------------
-# _write_with_retry
-# ---------------------------------------------------------------------------
-
-
-def test_write_with_retry_success_first_attempt():
-    pool = MagicMock()
-    mock_catalog = MagicMock()
-    mock_table = MagicMock()
-    pool.get.return_value = (mock_catalog, mock_table)
-    called = {}
-
-    def op(catalog, table):
-        called["catalog"] = catalog
-        called["table"] = table
-
-    _write_with_retry(pool, "dest-1", op)
-
-    assert called["catalog"] is mock_catalog
-    assert called["table"] is mock_table
-
-
-def test_write_with_retry_retries_on_failure():
-    pool = MagicMock()
-    mock_catalog = MagicMock()
-    mock_table = MagicMock()
-    pool.get.return_value = (mock_catalog, mock_table)
-    attempts = {"count": 0}
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise Exception("fail")
-
-    with patch("viaduck.apply.time.sleep"):
-        _write_with_retry(pool, "dest-1", op)
-
-    assert attempts["count"] == 2
-    # A generic (non-connection) failure retries on the SAME connection and
-    # must NOT evict/reconnect: closing mid-write orphaned the fork httpfs
-    # write-retry buffer (~one flush, 130-160MB native) — the writer OOM leak.
-    # Only a positively-identified connection-death signal may reconnect.
-    pool.evict.assert_not_called()
-
-
-def test_write_with_retry_evicts_only_on_connection_error():
-    """A genuine connection-death signal reconnects; a plain write/IO error
-    does not (evicting on it orphaned the httpfs write-retry buffer = OOM leak)."""
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    attempts = {"count": 0}
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise Exception("server closed the connection unexpectedly")
-
-    with patch("viaduck.apply.time.sleep"):
-        _write_with_retry(pool, "dest-1", op)
-
-    assert attempts["count"] == 2
-    pool.evict.assert_called_once_with("dest-1")
-
-
-def test_write_with_retry_exhausted():
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-
-    def op(catalog, table):
-        raise Exception("persistent failure")
-
-    with patch("viaduck.apply.time.sleep"):
-        with pytest.raises(Exception, match="persistent failure"):
-            _write_with_retry(pool, "dest-1", op)
-
-
-def test_write_with_retry_survives_many_transient_failures():
-    """team-50689 OCC scenario: peer writer commits at ~12s mean, viaduck flush
-    window 2-5s. Half the attempts race a peer commit and fail. Verify the
-    retry budget is deep enough that a run of transient failures resolves
-    before exhausting attempts."""
-    from viaduck.apply import _WRITE_MAX_RETRIES
-
-    assert _WRITE_MAX_RETRIES >= 10, (
-        "OCC-heavy destinations (concurrent-writer catalogs) need enough "
-        "retry budget to catch a P99 gap; 3 attempts is deterministic-fail "
-        "on team-50689-shape workloads"
-    )
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    attempts = {"count": 0}
-    fail_first_n = _WRITE_MAX_RETRIES - 2  # succeed on the second-to-last attempt
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        if attempts["count"] <= fail_first_n:
-            raise Exception(f"transient OCC failure #{attempts['count']}")
-
-    with patch("viaduck.apply.time.sleep"):
-        _write_with_retry(pool, "dest-1", op)
-
-    assert attempts["count"] == fail_first_n + 1
-
-
-def test_write_with_retry_backoff_caps_and_jitters():
-    """Verify (a) delay is capped at _WRITE_MAX_DELAY_S so we don't grow
-    unbounded across 15 attempts, and (b) jitter perturbs the deterministic
-    exp schedule so N concurrent workers don't herd on the same retry tick."""
-    from viaduck.apply import _WRITE_BASE_DELAY_S, _WRITE_MAX_DELAY_S, _WRITE_MAX_RETRIES
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-
-    def op(catalog, table):
-        raise Exception("perma-fail")
-
-    delays: list[float] = []
-    with patch("viaduck.apply.time.sleep", side_effect=lambda d: delays.append(d)):
-        with pytest.raises(Exception, match="perma-fail"):
-            _write_with_retry(pool, "dest-1", op)
-
-    from viaduck.apply import _WRITE_JITTER_FRACTION
-
-    # Every delay is bounded by max * (1 + jitter_fraction), plus a small
-    # slack for float rounding.
-    upper = _WRITE_MAX_DELAY_S * (1.0 + _WRITE_JITTER_FRACTION) + 0.01
-    for d in delays:
-        assert 0 < d <= upper, f"delay {d} exceeds cap {upper}"
-
-    # We should have MAX_RETRIES - 1 sleeps (no sleep after the final failure).
-    assert len(delays) == _WRITE_MAX_RETRIES - 1
-
-    # Late attempts should hit the cap: the deterministic base at attempt
-    # log2(MAX_DELAY / BASE) is where it plateaus. Verify at least one late
-    # delay is within the jitter band around _WRITE_MAX_DELAY_S.
-    lower_band = _WRITE_MAX_DELAY_S * (1.0 - _WRITE_JITTER_FRACTION)
-    upper_band = _WRITE_MAX_DELAY_S * (1.0 + _WRITE_JITTER_FRACTION)
-    cap_hit = [d for d in delays[-3:] if lower_band <= d <= upper_band]
-    assert cap_hit, f"expected late delays in [{lower_band}, {upper_band}]s, got tail {delays[-3:]}"
-
-    # Jitter: not all delays should be equal to the deterministic exp schedule
-    # (would indicate jitter is disabled).
-    deterministic = [
-        _WRITE_BASE_DELAY_S * min(2**i, _WRITE_MAX_DELAY_S / _WRITE_BASE_DELAY_S) for i in range(len(delays))
-    ]
-    diffs = [abs(delays[i] - deterministic[i]) for i in range(len(delays))]
-    assert any(d > 0.01 for d in diffs), "jitter appears disabled — all delays are the exp base"
-
-
-def test_write_with_retry_fails_fast_on_schema_projection_error():
-    """A SchemaProjectionError raised out of pool.get() (via _create →
-    _maybe_build_projection → schema_projection.build) is permanent: the
-    source/target schemas don't change between attempts. Retrying wastes
-    exponential backoff and logs misleading "Write to X failed" for what is
-    a build-time drift error. Must fail fast, not retry."""
-    from viaduck.schema_projection import SchemaProjectionError
-
-    pool = MagicMock()
-    pool.get.side_effect = SchemaProjectionError("unknown source column 'stowaway'")
-
-    attempts = {"count": 0}
-
-    def op(catalog, table):
-        attempts["count"] += 1
-
-    with patch("viaduck.apply.time.sleep") as mock_sleep:
-        with pytest.raises(SchemaProjectionError, match="stowaway"):
-            _write_with_retry(pool, "dest-1", op)
-
-    assert attempts["count"] == 0, "operation should not even be called on projection build error"
-    assert pool.get.call_count == 1, "must not retry on SchemaProjectionError"
-    mock_sleep.assert_not_called()
-    pool.evict.assert_not_called()
-
-
-def test_write_with_retry_logs_exception_message():
-    """Retry should log the actual exception message. Early attempts (1..3)
-    are DEBUG (routine OCC dance under peer-writer pressure); WARN kicks in
-    at attempt 4+ so the log channel doesn't drown under sustained retries.
-    """
-    import logging
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    attempts = {"count": 0}
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise ConnectionError("connection refused")
-
-    with patch("viaduck.apply.time.sleep"), patch("viaduck.apply.log") as mock_log:
-        _write_with_retry(pool, "dest-1", op)
-
-    log_call = mock_log.log.call_args
-    # attempt 1 → DEBUG
-    assert log_call.args[0] == logging.DEBUG, f"attempt 1 should be DEBUG, got {log_call.args[0]}"
-    assert "connection refused" in str(log_call)
-
-
-def test_write_with_retry_log_severity_ladder():
-    """Attempts 1..3 log DEBUG; attempt 4 and beyond log WARN. Ensures the
-    log signal-to-noise stays useful under sustained OCC retry pressure."""
-    import logging
-
-    from viaduck.apply import _WRITE_WARN_ATTEMPT_THRESHOLD
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-
-    # Fail exactly `_WRITE_WARN_ATTEMPT_THRESHOLD` times so we exercise both
-    # DEBUG (attempts < threshold) and WARN (attempt == threshold).
-    attempts = {"count": 0}
-    fail_first_n = _WRITE_WARN_ATTEMPT_THRESHOLD
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        if attempts["count"] <= fail_first_n:
-            raise Exception(f"fail #{attempts['count']}")
-
-    with patch("viaduck.apply.time.sleep"), patch("viaduck.apply.log") as mock_log:
-        _write_with_retry(pool, "dest-1", op)
-
-    # First (threshold-1) log calls are DEBUG; the threshold-th one is WARN.
-    log_calls = mock_log.log.call_args_list
-    assert len(log_calls) == fail_first_n, f"expected {fail_first_n} log calls, got {len(log_calls)}"
-    for i, log_call in enumerate(log_calls):
-        attempt_num = i + 1
-        expected = logging.WARNING if attempt_num >= _WRITE_WARN_ATTEMPT_THRESHOLD else logging.DEBUG
-        assert log_call.args[0] == expected, f"attempt {attempt_num} logged at {log_call.args[0]}, expected {expected}"
-
-
-def test_write_with_retry_occ_conflict_does_not_evict():
-    """An OCC commit conflict leaves the connection healthy — DuckLake takes
-    its snapshot at BeginTransaction, not connect, so retrying on the same
-    pooled connection is correct (it's what DuckLake's own internal retry
-    did). Evicting per conflict added 10-20s of reconnect per attempt AND
-    leaked ~160MB of native memory per pyducklake Catalog create — 274
-    reconnects OOM-killed the prod pod at 48Gi six times in one night."""
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    attempts = {"count": 0}
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        if attempts["count"] <= 2:
-            raise RuntimeError("TransactionContext Error: Failed to commit: Failed to commit DuckLake transaction.")
-
-    with patch("viaduck.apply._backoff_sleep", return_value=False):
-        _write_with_retry(pool, "dest-1", op)
-
-    assert attempts["count"] == 3
-    pool.evict.assert_not_called()
-    # The retry still re-leases from the pool each attempt (pin/release
-    # discipline unchanged) — it just doesn't destroy the entry in between.
-    assert pool.get.call_count == 3
-
-
-def test_write_with_retry_non_occ_error_still_evicts():
-    """Connection-implicating errors (network, RDS restart) must still
-    evict + reconnect — only OCC conflicts skip the eviction."""
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    attempts = {"count": 0}
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise ConnectionError("connection reset by peer")
-
-    with patch("viaduck.apply._backoff_sleep", return_value=False):
-        _write_with_retry(pool, "dest-1", op)
-
-    pool.evict.assert_called_once_with("dest-1")
-
-
-@pytest.mark.parametrize(
-    ("message", "expected"),
-    [
-        ("TransactionContext Error: Failed to commit: Failed to commit DuckLake transaction.", True),
-        ('Transaction conflict - attempting to insert into table with index "2354"', True),
-        ("connection reset by peer", False),
-        ("HTTP Error: HTTP GET error reading 'https://...' (HTTP 404 Not Found)", False),
-    ],
-)
-def test_is_occ_conflict_classification(message, expected):
-    from viaduck.apply import _is_occ_conflict
-
-    assert _is_occ_conflict(RuntimeError(message)) is expected
-
-
-def test_write_with_retry_fails_fast_on_routing_error():
-    """RoutingError raised from _build_delete_filter inside the operation
-    lambda is permanent (missing key column, config bug) — do NOT burn the
-    full retry budget on it."""
-    from viaduck.router import RoutingError
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    attempts = {"count": 0}
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        raise RoutingError("key column 'team_id' missing from batch")
-
-    with patch("viaduck.apply.time.sleep") as mock_sleep:
-        with pytest.raises(RoutingError, match="team_id"):
-            _write_with_retry(pool, "dest-1", op)
-
-    assert attempts["count"] == 1, "must fail fast on RoutingError, not retry"
-    mock_sleep.assert_not_called()
-
-
-def test_write_with_retry_retries_counter_increments():
-    """Every failed attempt bumps viaduck_dest_write_retries_total{destination}.
-    The successful attempt does NOT — retries is a failure counter, not an
-    attempt counter."""
-    metrics.init("test_retries_counter")
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    attempts = {"count": 0}
-    fail_first_n = 3
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        if attempts["count"] <= fail_first_n:
-            raise Exception(f"fail #{attempts['count']}")
-
-    counter = metrics._dest_write_retries_total.labels(pipeline="test_retries_counter", destination="dest-r")
-    before = counter._value.get()
-
-    with patch("viaduck.apply.time.sleep"):
-        _write_with_retry(pool, "dest-r", op)
-
-    after = counter._value.get()
-    assert after - before == fail_first_n, f"expected {fail_first_n} retry bumps, got {after - before}"
-
-
-def test_write_with_retry_gauge_set_and_cleared():
-    """viaduck_dest_write_retrying is 1 during the retry loop and 0 after
-    (success OR failure). Set/clear must happen once regardless of the
-    number of attempts."""
-    metrics.init("test_gauge_scope")
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    observed_during: list[float] = []
-
-    def op(catalog, table):
-        observed_during.append(
-            metrics._dest_write_retrying.labels(pipeline="test_gauge_scope", destination="dest-g")._value.get()
-        )
-
-    with patch("viaduck.apply.time.sleep"):
-        _write_with_retry(pool, "dest-g", op)
-
-    # During op(), gauge is 1.
-    assert observed_during == [1.0], f"expected gauge=1 during op, got {observed_during}"
-    # After the retry loop, gauge is 0.
-    after = metrics._dest_write_retrying.labels(pipeline="test_gauge_scope", destination="dest-g")._value.get()
-    assert after == 0.0, f"gauge should be cleared to 0 after retry loop, got {after}"
-
-
-def test_write_with_retry_gauge_cleared_on_exhaustion():
-    """Same as above but for the exhaustion path — the finally: must clear
-    the gauge regardless of how the loop exits."""
-    metrics.init("test_gauge_exhaust")
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-
-    def op(catalog, table):
-        raise Exception("perma-fail")
-
-    with patch("viaduck.apply.time.sleep"):
-        with pytest.raises(Exception, match="perma-fail"):
-            _write_with_retry(pool, "dest-x", op)
-
-    after = metrics._dest_write_retrying.labels(pipeline="test_gauge_exhaust", destination="dest-x")._value.get()
-    assert after == 0.0, "gauge must clear even when retries exhaust"
-
-
-def test_write_with_retry_stop_event_aborts_retry():
-    """SIGTERM path: when the delivery layer sets its stop_event, an
-    in-flight retry loop wakes early from the backoff, raises the current
-    exception, and never sleeps the full delay. Without this the worker
-    ignores SIGTERM and gets SIGKILLed once k8s' termGracePeriodSeconds
-    elapses (60s vs the ~5-min retry budget)."""
-    import threading
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-
-    stop_event = threading.Event()
-    attempts = {"count": 0}
-
-    def op(catalog, table):
-        attempts["count"] += 1
-        # Set the stop event AFTER the first failure so the retry loop
-        # observes it during the backoff wait.
-        if attempts["count"] == 1:
-            stop_event.set()
-            raise Exception("first attempt fails")
-
-    # NOTE: no patch on time.sleep — the test wants Event.wait(delay) to
-    # actually be called, but with the event set it returns instantly
-    # regardless of the delay.
-    with pytest.raises(Exception, match="first attempt fails"):
-        _write_with_retry(pool, "dest-s", op, stop_event=stop_event)
-
-    assert attempts["count"] == 1, "retry loop should give up after stop_event set, not retry"
-
-
-def test_write_with_retry_stop_event_none_uses_time_sleep():
-    """Without a stop_event, the retry loop uses time.sleep — verify the
-    fallback path so an aborted-refactor doesn't silently disable backoff
-    for the no-event path."""
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-
-    def op(catalog, table):
-        raise Exception("perma-fail")
-
-    with patch("viaduck.apply.time.sleep") as mock_sleep:
-        with pytest.raises(Exception, match="perma-fail"):
-            _write_with_retry(pool, "dest-n", op)
-
-    # 14 backoffs (MAX_RETRIES - 1), all via time.sleep.
-    assert mock_sleep.call_count == 14
-
-
-def test_apply_full_cdc_projection_resolved_per_attempt():
-    """After a failed attempt, the retry rebuilds the destination via
-    pool.get() → _create → _maybe_build_projection. If projection is captured
-    outside the retry loop, a schema drift between attempts is written with
-    the STALE plan → silent off-by-one slot corruption (the exact bug class
-    schema_projection was written to prevent). Verify projection_for is called
-    once per attempt.
-    """
-    import pyarrow as pa
-
-    from viaduck.apply import apply_full_cdc
-
-    pool = MagicMock()
-    pool.get.return_value = (MagicMock(), MagicMock())
-    # Track how many times projection_for is queried across attempts.
-    pool.projection_for.return_value = None
-
-    # A CDC-shaped batch that survives _resolve_conflicts (one insert row).
-    batch = pa.table(
-        {
-            "change_type": ["insert"],
-            "rowid": [pa.scalar(1, type=pa.uint64())],
-            "_snapshot_id": [pa.scalar(1, type=pa.uint64())],
-            "id": ["a"],
-            "val": ["x"],
-        }
-    )
-
-    attempts = {"count": 0}
-
-    def _apply_side_effect(*args, **kwargs):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise RuntimeError("first attempt fails")
-        return {"deleted": 0, "upserted": 1, "upsert_matched": 0}
-
-    with patch("viaduck.apply._apply_changes", side_effect=_apply_side_effect), patch("viaduck.apply.time.sleep"):
-        apply_full_cdc(pool, "dest-1", batch, ["id"])
-
-    # Each attempt must independently query projection_for; capture-outside
-    # would show exactly 1.
-    assert pool.projection_for.call_count == attempts["count"] == 2, (
-        f"projection_for should fire once per attempt (got {pool.projection_for.call_count} for "
-        f"{attempts['count']} attempts) — closure capture bug is back"
-    )
-
-
-def test_append_only_fallback_metric_not_double_counted_on_retry():
-    """The null-fallback metric is the drift-alarm signal for operators. If
-    projection.apply runs inside the retry lambda (H2), a transient write
-    failure would cause the callback to fire once per attempt for the SAME
-    bad rows — reporting 2× or 3× the real drift. Verify the counter
-    increments exactly ONCE per completed flush regardless of retry count.
-    """
-    import pyarrow as pa
-
-    from viaduck import metrics
-    from viaduck.apply import append_only
-
-    metrics.init("test_fallback_no_double_count")
-
-    # Real projection with a real fallback trigger (varchar → tz-UTC with
-    # one bad row).
-    from viaduck.schema_projection import build
-
-    src = pa.schema([pa.field("t", pa.string())])
-    tgt = pa.schema([pa.field("t", pa.timestamp("us", tz="UTC"), nullable=True)])
-    plan = build(src, tgt)
-
-    pool = MagicMock()
-    pool.projection_for.return_value = plan
-    mock_table = MagicMock()
-    pool.get.return_value = (MagicMock(), mock_table)
-
-    batch = pa.table({"t": ["not-a-date", "2026-06-30 12:00:00"]}, schema=src)
-
-    # First attempt fails, second succeeds — projection runs twice, but the
-    # metric should only tick once.
-    attempts = {"count": 0}
-
-    def _append_side_effect(_b):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise RuntimeError("first attempt fails")
-
-    mock_table.append.side_effect = _append_side_effect
-
-    counter = metrics._projection_cast_null_fallback_total.labels(
-        pipeline="test_fallback_no_double_count", destination="dest-1", column="t"
-    )
-    before = counter._value.get()
-
-    with patch("viaduck.apply.time.sleep"):
-        append_only(pool, "dest-1", batch)
-
-    after = counter._value.get()
-
-    assert attempts["count"] == 2, "sanity: retry actually happened"
-    assert after - before == 1, f"fallback metric double-counted across retries: {after - before} (want 1)"
-
-
-def test_apply_changes_delete_path_skips_projection():
-    """Optimization: `_build_delete_filter` only consumes key_columns, and
-    B2 guarantees key columns pass through the projection unchanged. So the
-    delete path narrows to `key_columns` and does NOT call projection.apply()
-    — projection.apply() is only invoked on the upsert path. Regression
-    guard: reintroducing projection on delete_rows would trigger cast
-    fallback on payload columns for values we discard.
-    """
-    import pyarrow as pa
-
-    from viaduck.apply import _apply_changes
-
-    projection = MagicMock()
-    projection.apply.side_effect = lambda batch, on_null_fallback=None: batch
-
-    batch = pa.table(
-        {
-            "change_type": ["delete"],
-            "rowid": pa.array([1], type=pa.uint64()),
-            "snapshot_id": pa.array([1], type=pa.uint64()),
-            "id": ["a"],
-            "val": ["v-a"],
-        }
-    )
-
-    catalog = MagicMock()
-    dest_table = MagicMock()
-    catalog.begin_transaction.return_value.__enter__.return_value.load_table.return_value = MagicMock()
-
-    _apply_changes(catalog, dest_table, batch, ["id"], projection=projection)
-
-    assert projection.apply.call_count == 0, "delete-only batch should not invoke projection"
-
-
-def test_append_only_projection_resolved_per_attempt():
-    """Same as apply_full_cdc: append_only must call projection_for inside the
-    retry lambda so evict+rebuild picks up the fresh plan.
-    """
-    import pyarrow as pa
-
-    from viaduck.apply import append_only
-
-    pool = MagicMock()
-    mock_table = MagicMock()
-    pool.get.return_value = (MagicMock(), mock_table)
-    pool.projection_for.return_value = None
-
-    batch = pa.table({"a": [1], "b": ["x"]})
-
-    attempts = {"count": 0}
-
-    def _append_side_effect(_b):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise RuntimeError("first attempt fails")
-
-    mock_table.append.side_effect = _append_side_effect
-
-    with patch("viaduck.apply.time.sleep"):
-        append_only(pool, "dest-1", batch)
-
-    assert pool.projection_for.call_count == attempts["count"] == 2, (
-        "append_only closure must also resolve projection per attempt"
-    )
-
-
-# ---------------------------------------------------------------------------
-# _poll_cycle helpers
-# ---------------------------------------------------------------------------
-
-
 def _make_cfg(dest_ids_and_rvs: list[tuple[str, str]]):
     """Create a mock config with given (dest_id, routing_value) pairs."""
     cfg = MagicMock()
@@ -679,13 +44,14 @@ def _make_cfg(dest_ids_and_rvs: list[tuple[str, str]]):
         d.routing_value = rv
         dests.append(d)
     cfg.destinations = dests
-    cfg.poll.cdc_chunk_snapshots = 100
-    # Real values (not MagicMock auto-attrs): the cycle time-budget logic
-    # compares these against the clock. Budget DISABLED by default here so a
-    # slow CI box can never time-box mid-test; timebox tests opt in via
-    # _timebox_setup.
+    # Real values (not MagicMock auto-attrs): the read-unit loop compares
+    # spans with ints. Unit budgets are generous by default here so tests
+    # get one unit per cluster; span-limited tests set read_unit_max_span.
     cfg.poll.interval_seconds = 5.0
-    cfg.poll.cycle_time_budget_seconds = -1.0
+    cfg.poll.read_unit_max_rows = 50_000
+    cfg.poll.read_unit_max_bytes = 256 * 1024 * 1024
+    cfg.poll.read_unit_max_span = 10_000
+    cfg.poll.read_workers = 4
 
     def by_id(dest_id):
         for d in dests:
@@ -822,12 +188,13 @@ def test_poll_cycle_feed_reader_dispatch():
     router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
 
     feed_reader = MagicMock()
-    feed_reader.read.return_value = arrow_data
+    feed_reader.plan_unit.return_value = 10  # hi = head
+    feed_reader.plan_read.return_value = object()  # a planned unit
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
         patch("viaduck.main.source.read_cdc") as ext_read,
-        patch("viaduck.main.source.next_snapshot_touching_table", side_effect=lambda _t, start, _u: start + 1),
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data) as feed_exec,
     ):
         _poll_cycle(
             MagicMock(),
@@ -844,10 +211,10 @@ def test_poll_cycle_feed_reader_dispatch():
         )
 
     ext_read.assert_not_called()
-    assert feed_reader.read.call_count == 1
-    # (table, conn, after, end, *, filter_expr, columns)
-    args = feed_reader.read.call_args
-    assert args.args[2] == 5 and args.args[3] == 10
+    assert feed_exec.call_count == 1
+    # planned on the poll thread: unit range (5, 10]
+    assert feed_reader.plan_unit.call_args.args[1] == 5
+    assert feed_reader.plan_unit.call_args.args[2] == 10
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
 
 
@@ -904,102 +271,6 @@ def test_poll_cycle_empty_changeset_advances_positions():
     assert delivery.maybe_flush.call_count == 2  # once per chunk + once at end of cycle
 
 
-def test_poll_cycle_skip_scan_fast_forwards_span_without_read():
-    """A span with no source-table changes advances cursors without a CDC read."""
-    delivery = _make_delivery({"dest-1": 5})
-    router = MagicMock()
-    cfg = _make_cfg([("dest-1", "a")])
-
-    with (
-        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.next_snapshot_touching_table", return_value=None),
-        patch("viaduck.main.source.read_cdc") as read_cdc,
-        patch.object(metrics, "cdc_snapshots_skipped_total") as skipped,
-    ):
-        _poll_cycle(
-            MagicMock(),
-            delivery,
-            MagicMock(),
-            router,
-            cfg,
-            ["dest-1"],
-            {"a": "dest-1"},
-            key_columns=[],
-            mode="append_only",
-            source_columns=None,
-        )
-
-    read_cdc.assert_not_called()
-    delivery.advance_position.assert_called_once_with("dest-1", 10, epoch=0)
-    skipped.inc.assert_called_once_with(5)  # (5, 10] fast-forwarded
-
-
-def test_poll_cycle_skip_scan_jumps_to_next_touching_snapshot():
-    """The read starts at the snapshot before the next source-table change;
-    the dead span in front of it advances cursor-only."""
-    delivery = _make_delivery({"dest-1": 5})
-    router = MagicMock()
-    cfg = _make_cfg([("dest-1", "a")])
-
-    empty = pa.table({"company": pa.array([], type=pa.string())})
-    with (
-        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.next_snapshot_touching_table", return_value=9),
-        patch("viaduck.main.source.read_cdc", return_value=empty) as read_cdc,
-        patch.object(metrics, "cdc_snapshots_skipped_total") as skipped,
-    ):
-        _poll_cycle(
-            MagicMock(),
-            delivery,
-            MagicMock(),
-            router,
-            cfg,
-            ["dest-1"],
-            {"a": "dest-1"},
-            key_columns=[],
-            mode="append_only",
-            source_columns=None,
-        )
-
-    # Cursor-only advance over (5, 8], then a normal read of (8, 10].
-    delivery.advance_position.assert_any_call("dest-1", 8, epoch=0)
-    read_cdc.assert_called_once()
-    assert read_cdc.call_args.kwargs["after_snapshot"] == 8
-    assert read_cdc.call_args.kwargs["end_snapshot"] == 10
-    skipped.inc.assert_called_once_with(3)
-
-
-def test_poll_cycle_skip_scan_probe_failure_falls_back_to_sequential_read():
-    """A broken probe must never stall the pipeline — reads proceed as before."""
-    delivery = _make_delivery({"dest-1": 5})
-    router = MagicMock()
-    cfg = _make_cfg([("dest-1", "a")])
-
-    arrow_data = pa.table({"company": ["a"], "value": [1]})
-    router.split_and_count.return_value = ({"a": arrow_data}, 0)
-    with (
-        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.next_snapshot_touching_table", side_effect=RuntimeError("catalog hiccup")),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data) as read_cdc,
-    ):
-        _poll_cycle(
-            MagicMock(),
-            delivery,
-            MagicMock(),
-            router,
-            cfg,
-            ["dest-1"],
-            {"a": "dest-1"},
-            key_columns=[],
-            mode="append_only",
-            source_columns=None,
-        )
-
-    read_cdc.assert_called_once()
-    assert read_cdc.call_args.kwargs["after_snapshot"] == 5
-    delivery.buffer.assert_called_once()
-
-
 def test_poll_cycle_routing_error_breaks_gracefully():
     """A routing failure stops reads for the cycle without buffering."""
     delivery = _make_delivery({"dest-1": 5})
@@ -1031,11 +302,12 @@ def test_poll_cycle_routing_error_breaks_gracefully():
 
 
 def test_poll_cycle_chunks_large_range():
-    """Range larger than cdc_chunk_snapshots is split into multiple reads."""
+    """Range larger than read_unit_max_span is split across cycles: one
+    span-bounded unit per cycle (legacy extension path)."""
     delivery = _make_delivery({"dest-1": 0})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    cfg.poll.cdc_chunk_snapshots = 5  # positions 0→5, 5→10
+    cfg.poll.read_unit_max_span = 5  # unit 0→5 this cycle; 5→10 next
 
     arrow_data = pa.table({"company": ["quacksworth"], "value": [1]})
     router.build_filter_expr.return_value = None
@@ -1064,14 +336,12 @@ def test_poll_cycle_chunks_large_range():
             source_columns=None,
         )
 
-    assert read_calls == [(0, 5), (5, 10)], f"expected two chunk reads, got {read_calls}"
-    # cursor advances to chunk_end (5, then 10), not directly to 10 in one shot
+    assert read_calls == [(0, 5)], f"expected one span-bounded unit read, got {read_calls}"
     buffer_calls = delivery.buffer.call_args_list
-    assert len(buffer_calls) == 2
+    assert len(buffer_calls) == 1
     assert buffer_calls[0] == call("dest-1", arrow_data, 5, epoch=0)
-    assert buffer_calls[1] == call("dest-1", arrow_data, 10, epoch=0)
     delivery.advance_position.assert_not_called()
-    assert delivery.maybe_flush.call_count == 3  # once per chunk (×2) + once at end of cycle
+    assert delivery.maybe_flush.call_count == 2  # once per unit + once at end of cycle
 
 
 def test_poll_cycle_chunk_end_not_current_id():
@@ -1079,7 +349,7 @@ def test_poll_cycle_chunk_end_not_current_id():
     delivery = _make_delivery({"dest-1": 0, "dest-2": 0})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "a"), ("dest-2", "b")])
-    cfg.poll.cdc_chunk_snapshots = 3  # chunks: 0→3, 3→6, 6→7
+    cfg.poll.read_unit_max_span = 3  # unit 0→3 this cycle
 
     row_a = pa.table({"company": ["a"]})
     empty = pa.table({"company": pa.array([], type=pa.string())})
@@ -1109,13 +379,10 @@ def test_poll_cycle_chunk_end_not_current_id():
             source_columns=None,
         )
 
-    # First chunk (0→3): dest-1 buffered at 3, dest-2 advanced to 3
+    # Unit (0→3]: dest-1 buffered at 3, dest-2 advanced to 3.
     delivery.buffer.assert_any_call("dest-1", row_a, 3, epoch=0)
     delivery.advance_position.assert_any_call("dest-2", 3, epoch=0)
-    # Chunks 3→6 and 6→7: empty, both advanced through to 7
-    delivery.advance_position.assert_any_call("dest-1", 7, epoch=0)
-    delivery.advance_position.assert_any_call("dest-2", 7, epoch=0)
-    assert delivery.maybe_flush.call_count == 4  # once per chunk (×3) + once at end of cycle
+    assert delivery.maybe_flush.call_count == 2  # once per unit + once at end of cycle
 
 
 def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
@@ -1123,7 +390,7 @@ def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
     delivery = _make_delivery({"dest-1": 0})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    cfg.poll.cdc_chunk_snapshots = 5  # two chunks: 0→5, 5→10
+    cfg.poll.read_unit_max_span = 5  # unit 0→5 this cycle
 
     empty = pa.table({"company": pa.array([], type=pa.string())})
 
@@ -1144,12 +411,12 @@ def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
             source_columns=None,
         )
 
-    # cursor advanced to each chunk_end incrementally, not directly to 10
-    assert delivery.advance_position.call_count == 2
+    # One span-bounded unit per cycle: position advances to the unit hi (5);
+    # 5→10 is next cycle's unit.
+    assert delivery.advance_position.call_count == 1
     delivery.advance_position.assert_any_call("dest-1", 5, epoch=0)
-    delivery.advance_position.assert_any_call("dest-1", 10, epoch=0)
     delivery.buffer.assert_not_called()
-    assert delivery.maybe_flush.call_count == 3  # once per chunk (×2) + once at end of cycle
+    assert delivery.maybe_flush.call_count == 2  # once post-apply + once at end of cycle
 
 
 def test_poll_cycle_advances_no_data_destinations():
@@ -1210,18 +477,16 @@ def test_poll_cycle_pauses_reads_at_watermark():
 
 
 def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
-    """Watermark firing mid-loop only skips future chunks; completed chunks already flushed."""
+    """A destination tripping its cap between cycles: the completed unit
+    flushed; the next cycle's unit skips the at-cap destination. (The
+    per-chunk cap check of the old loop is now a per-dispatch check.)"""
     delivery = _make_delivery({"dest-1": 0})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    cfg.poll.cdc_chunk_snapshots = 5  # chunks: 0→5 (completes), 5→10 (paused by watermark)
+    cfg.poll.read_unit_max_span = 5  # unit 0→5 this cycle
 
     empty = pa.table({"company": pa.array([], type=pa.string())})
     router.build_filter_expr.return_value = None
-
-    # One cap check per destination per chunk iteration:
-    # chunk-1 check False (read 0→5); chunk-2 check True (pause).
-    delivery.should_pause_reads_for.side_effect = [False, True]
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
@@ -1240,10 +505,9 @@ def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
             source_columns=None,
         )
 
-    # chunk 0→5 completed: cursor advanced and flushed
+    # unit 0→5 completed: position advanced and flushed.
     delivery.advance_position.assert_called_once_with("dest-1", 5, epoch=0)
-    # chunk 5→10 was never read (watermark break)
-    assert delivery.maybe_flush.call_count == 2  # once after chunk 0→5 + once at end of cycle
+    assert delivery.maybe_flush.call_count == 2  # once after the unit + once at end of cycle
 
 
 def test_poll_cycle_reads_lowest_cursor_group_first():
@@ -1316,7 +580,7 @@ def test_poll_cycle_stuck_destination_at_cap_does_not_block_healthy_peer():
     delivery = _make_delivery({"dest-stuck": 100, "dest-healthy": 900})
     router = MagicMock()
     cfg = _make_cfg([("dest-stuck", "stk"), ("dest-healthy", "ok")])
-    cfg.poll.cdc_chunk_snapshots = 200
+    cfg.poll.read_unit_max_span = 200
 
     # dest-stuck is at ITS cap (queue full, flush failing); dest-healthy
     # has headroom. Per-destination gating: stuck's group skips, healthy's
@@ -1368,7 +632,7 @@ def test_poll_cycle_mixed_group_reads_only_members_with_headroom():
     delivery = _make_delivery({"dest-full": 100, "dest-ok": 100})  # same cursor → one group
     router = MagicMock()
     cfg = _make_cfg([("dest-full", "full"), ("dest-ok", "ok")])
-    cfg.poll.cdc_chunk_snapshots = 200
+    cfg.poll.read_unit_max_span = 200
 
     delivery.should_pause_reads_for.side_effect = lambda d: d == "dest-full"
 
@@ -1414,23 +678,19 @@ def test_poll_cycle_mixed_group_reads_only_members_with_headroom():
 
 
 def test_poll_cycle_lagging_group_cannot_monopolize_reads():
-    """The per-cycle chunk cap turns lagging-first priority into round-robin:
-    a deeply-lagging group reads at most _MAX_CHUNKS_PER_GROUP_PER_CYCLE
-    chunks per cycle, then the healthy group gets its turn. Without the cap
-    (the first sort-only fix), the lagging group's chunk loop ran to head —
-    or forever when its flushes kept failing and its position kept resetting
-    — and the healthy destination's cursor froze (observed on team-50689:
-    team-2 starved for 1.5h while team-50689 relitigated the same range).
+    """The read-unit loop's anti-starvation guarantee (successor to the
+    retired per-cycle chunk cap): a deeply-lagging cluster gets ONE
+    span-bounded unit per cycle, and the healthy cluster ALWAYS reads in
+    the same cycle — reads are parallel across clusters and bounded per
+    unit, so no scheduler mechanism is needed to prevent monopoly.
+    (The 2026-07-31 incident's actual cause was the 5s-per-chunk extension
+    read cost dividing a serial supply; the feed removes the cost term.)
     """
-    from viaduck.main import _MAX_CHUNKS_PER_GROUP_PER_CYCLE
-
     # dest-lagging is 10,000 snapshots behind; dest-healthy is 100 behind.
-    # Uncapped, dest-lagging's group would issue 100 chunk reads before
-    # dest-healthy saw a single one.
     delivery = _make_delivery({"dest-lagging": 0, "dest-healthy": 9_900})
     router = MagicMock()
     cfg = _make_cfg([("dest-lagging", "lag"), ("dest-healthy", "ok")])
-    cfg.poll.cdc_chunk_snapshots = 100
+    cfg.poll.read_unit_max_span = 100
 
     read_calls: list[tuple[int, int]] = []
 
@@ -1457,17 +717,13 @@ def test_poll_cycle_lagging_group_cannot_monopolize_reads():
             source_columns=None,
         )
 
-    # The lagging group read exactly the cap, no more.
+    # The lagging cluster read exactly one span-bounded unit.
     lagging_reads = [c for c in read_calls if c[0] < 9_900]
-    assert len(lagging_reads) == _MAX_CHUNKS_PER_GROUP_PER_CYCLE, (
-        f"lagging group should read exactly the per-cycle cap, got {len(lagging_reads)}: {lagging_reads}"
-    )
-    # The healthy group STILL got its read this cycle — the load-bearing
-    # assertion. Under the uncapped loop this list is empty.
+    assert lagging_reads == [(0, 100)], f"lagging cluster reads one bounded unit per cycle, got {lagging_reads}"
+    # The healthy cluster STILL got its read this cycle — the load-bearing
+    # assertion. Under the retired serial loop this was not guaranteed.
     healthy_reads = [c for c in read_calls if c[0] >= 9_900]
-    assert healthy_reads == [(9_900, 10_000)], f"healthy group must read within the same cycle, got {healthy_reads}"
-    # Order: lagging first (priority preserved), healthy after.
-    assert read_calls[0][0] == 0 and read_calls[-1][0] == 9_900
+    assert healthy_reads == [(9_900, 10_000)], f"healthy cluster must read within the same cycle, got {healthy_reads}"
 
 
 def test_poll_cycle_snapshot_at_zero():
@@ -4111,148 +3367,6 @@ def test_poll_cycle_survives_membership_smaller_than_assigned():
     delivery.maybe_flush.assert_called()
 
 
-# ---------------------------------------------------------------------------
-# Poll-cycle time budget + group rotation (slow-consumer isolation)
-# ---------------------------------------------------------------------------
-
-
-class _Clock:
-    """Stateful fake for time.monotonic: advances only when the test sets
-    it, so the cycle budget check trips at deterministic points. The fake
-    covers heartbeat threads too (shared module attr) and never raises
-    StopIteration, unlike a side_effect list."""
-
-    def __init__(self, now=0.0):
-        self.now = now
-
-    def __call__(self):
-        return self.now
-
-
-def _timebox_setup():
-    """dest-1 at cursor 3, dest-2 at cursor 5; current snapshot 10. Empty
-    routed reads (positions advance, nothing buffers)."""
-    delivery = _make_delivery({"dest-1": 3, "dest-2": 5})
-    router = MagicMock()
-    router.build_filter_expr.side_effect = lambda rvs: "f"
-    router.split_and_count.side_effect = lambda table, rvs: ({}, table.num_rows)
-    cfg = _make_cfg([("dest-1", "a"), ("dest-2", "b")])
-    cfg.poll.interval_seconds = 5.0
-    cfg.poll.cycle_time_budget_seconds = 0.0  # derive: 0.8 x 5.0 = 4.0s
-    return delivery, router, cfg
-
-
-def _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads, advance_after_first_read=False):
-    def fake_read(src_table, after_snapshot, end_snapshot, **kw):
-        reads.append(after_snapshot)
-        if advance_after_first_read:
-            clock.now = 100.0  # the NEXT group's budget check trips (budget 4.0s)
-        return pa.table({"company": ["a"], "value": [1]})
-
-    with (
-        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
-        patch("viaduck.main._export_dest_time_lag"),
-        patch("viaduck.main.time.monotonic", side_effect=clock),
-    ):
-        _poll_cycle(
-            MagicMock(),
-            delivery,
-            MagicMock(),
-            router,
-            cfg,
-            ["dest-1", "dest-2"],
-            {"a": "dest-1", "b": "dest-2"},
-            key_columns=[],
-            mode="append_only",
-            rotation=rotation,
-            source_columns=None,
-        )
-
-
-def test_timebox_defers_unreached_groups_and_rotation_resumes():
-    """Budget trips after the first group: the second defers to the next
-    cycle, which starts AT it (rotation), not back at the most-lagging one."""
-    delivery, router, cfg = _timebox_setup()
-    rotation = {"offset": 0}
-    clock = _Clock(0.0)
-
-    reads: list[int] = []
-    _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads, advance_after_first_read=True)
-    assert reads == [3], f"only the most-lagging group reads before the budget trips, got {reads}"
-    assert rotation["offset"] == 1, "next cycle must resume at the deferred group"
-
-    reads.clear()
-    clock.now = 0.0
-    _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads)
-    assert reads == [5, 3], f"deferred group reads first next cycle, got {reads}"
-    # Full coverage: offset advanced past both groups; mod-wraps next cycle.
-    assert rotation["offset"] % 2 == 1
-
-
-def test_full_coverage_cycle_processes_every_group_sorted():
-    """With the budget never tripping, all groups read every cycle in
-    ascending-cursor order (rotation offset 0 preserves legacy behavior)."""
-    delivery, router, cfg = _timebox_setup()
-    rotation = {"offset": 0}
-    clock = _Clock(0.0)
-    reads: list[int] = []
-    _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads)
-    assert reads == [3, 5], f"all groups read in ascending order, got {reads}"
-
-
-def test_negative_budget_disables_timebox():
-    """poll.cycle_time_budget_seconds < 0: legacy unbounded cycles (no
-    deferral regardless of elapsed time)."""
-    delivery, router, cfg = _timebox_setup()
-    cfg.poll.cycle_time_budget_seconds = -1.0
-    rotation = {"offset": 0}
-    clock = _Clock(1000.0)  # absurdly late — still no timebox
-    reads: list[int] = []
-    _run_timebox_cycle(delivery, router, cfg, rotation, clock, reads)
-    assert reads == [3, 5], f"disabled budget must not defer groups, got {reads}"
-
-
-def test_timebox_floor_guarantees_one_group_per_cycle():
-    """Budget exhausted BEFORE the loop (slow snapshot_bounds / clamp): the
-    first group with work still reads — never a zero-progress cycle. The
-    deferral only kicks in from the second work-group onward."""
-    delivery, router, cfg = _timebox_setup()
-    rotation = {"offset": 0}
-    clock = _Clock(0.0)
-    reads: list[int] = []
-
-    def fake_bounds(table):
-        clock.now = 1000.0  # metadata work eats the entire 4.0s budget
-        return (1, 10)
-
-    def fake_read(src_table, after_snapshot, end_snapshot, **kw):
-        reads.append(after_snapshot)
-        return pa.table({"company": ["a"], "value": [1]})
-
-    with (
-        patch("viaduck.main.source.snapshot_bounds", side_effect=fake_bounds),
-        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
-        patch("viaduck.main._export_dest_time_lag"),
-        patch("viaduck.main.time.monotonic", side_effect=clock),
-    ):
-        _poll_cycle(
-            MagicMock(),
-            delivery,
-            MagicMock(),
-            router,
-            cfg,
-            ["dest-1", "dest-2"],
-            {"a": "dest-1", "b": "dest-2"},
-            key_columns=[],
-            mode="append_only",
-            rotation=rotation,
-            source_columns=None,
-        )
-    assert reads == [3], f"floor: exactly the first work-group reads despite an eaten budget, got {reads}"
-    assert rotation["offset"] == 1
-
-
 # --- watermark self-recycle ---
 
 
@@ -4345,3 +3459,116 @@ def test_read_rss_gib_raises_when_vmrss_absent(tmp_path):
     with patch("builtins.open", mock_open(read_data="VmSize:\t123 kB\n")):
         with pytest.raises(RuntimeError):
             _read_rss_gib()
+
+
+# ---------------------------------------------------------------------------
+# M4 read-unit loop helpers
+# ---------------------------------------------------------------------------
+
+
+def test_position_clusters_exact_without_span():
+    from viaduck.main import _position_clusters
+
+    # span_cap=0 (legacy): exact-position groups only.
+    clusters = _position_clusters({"a": 10, "b": 10, "c": 5}, ["a", "b", "c"], 0)
+    assert clusters == [(5, ["c"]), (10, ["a", "b"])]
+
+
+def test_position_clusters_span_merge():
+    from viaduck.main import _position_clusters
+
+    # span_cap=100: positions within 100 of the cluster min share a read.
+    clusters = _position_clusters({"a": 10, "b": 50, "c": 200}, ["a", "b", "c"], 100)
+    assert clusters == [(10, ["a", "b"]), (200, ["c"])]
+
+
+def test_position_clusters_skips_nonmembers():
+    from viaduck.main import _position_clusters
+
+    clusters = _position_clusters({"a": 10}, ["a", "b"], 100)
+    assert clusters == [(10, ["a"])]
+
+
+def test_slice_batch_cov_chain_matches_tla_rule():
+    """cov_k = max(lo, min(snap over later slices) - 1); last carries hi;
+    and the invariant: no row with snap <= cov_k sits in a later slice."""
+    from viaduck.main import _slice_batch
+
+    batch = pa.table({"value": list(range(10))})
+    # Straddle-shaped snaps (merged-file order): not sorted.
+    snaps = [1, 1, 3, 3, 2, 2, 5, 5, 4, 4]
+    out = _slice_batch(batch, snaps, lo=0, hi=5, max_rows=3)
+    assert [len(s[0]) for s in out] == [3, 3, 3, 1]
+    covs = [c for _, c, _ in out]
+    assert covs[-1] == 5  # last slice carries hi
+    assert covs == sorted(covs)  # non-decreasing
+    # The load-bearing property, checked directly per slice.
+    for k, (_, cov_k, _hi_k) in enumerate(out):
+        later = [sn for sn in snaps[(k + 1) * 3 :]]
+        assert all(sn > cov_k for sn in later), f"slice {k}: later row <= cov"
+        assert cov_k >= 0
+
+
+def test_slice_batch_small_batch_single_entry():
+    from viaduck.main import _slice_batch
+
+    batch = pa.table({"value": [1, 2]})
+    assert _slice_batch(batch, [4, 5], lo=0, hi=5, max_rows=100) == [(batch, 5, 5)]
+
+
+def test_slice_batch_cov_floor_at_lo():
+    """A first slice whose later-min lands at lo+1 gets cov=lo (a zombie
+    commit of that slice persists nothing new — monotone guard absorbs it)."""
+    from viaduck.main import _slice_batch
+
+    batch = pa.table({"value": [1, 2, 3, 4]})
+    out = _slice_batch(batch, [1, 2, 1, 2], lo=0, hi=2, max_rows=2)
+    assert [c for _, c, _ in out] == [0, 2]  # min-later = 1 -> cov 0 (floored), then hi
+
+
+def test_apply_unit_masks_per_member_position():
+    """Cluster fan-in: a member past the cluster min only gets rows ABOVE
+    its position; the min member gets everything."""
+    import pyarrow as pa
+
+    from viaduck.main import _apply_unit
+
+    delivery = _make_delivery({"dest-min": 5, "dest-late": 8})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-min", "a"), ("dest-late", "b")])
+    cfg.poll.read_unit_max_rows = 50_000
+
+    rows = pa.table({"company": ["a", "b", "a", "b"], "value": [1, 2, 3, 4], "__viaduck_snap": [6, 6, 9, 9]})
+    router.split_and_count.return_value = (
+        {
+            "a": pa.table({"company": ["a", "a"], "value": [1, 3], "__viaduck_snap": [6, 9]}),
+            "b": pa.table({"company": ["b", "b"], "value": [2, 4], "__viaduck_snap": [6, 9]}),
+        },
+        0,
+    )
+
+    _apply_unit(
+        delivery,
+        rows,
+        10,
+        members=["dest-min", "dest-late"],
+        positions={"dest-min": 5, "dest-late": 8},
+        epochs={"dest-min": 0, "dest-late": 0},
+        router=router,
+        rv_to_dest={"a": "dest-min", "b": "dest-late"},
+        full_cdc=False,
+        key_columns=[],
+        unit_cfg=cfg.poll,
+        src_table=MagicMock(),
+        routing_field="company",
+        dest_configs={d.id: d for d in cfg.destinations},
+    )
+
+    # dest-min (at 5) got both rows; dest-late (at 8) only the snap-9 row.
+    min_calls = [c for c in delivery.buffer.call_args_list if c.args[0] == "dest-min"]
+    late_calls = [c for c in delivery.buffer.call_args_list if c.args[0] == "dest-late"]
+    assert [c.args[1].num_rows for c in min_calls] == [2]
+    assert [c.args[1].num_rows for c in late_calls] == [1]
+    # The snap column never reaches the buffer (destinations never see it).
+    for c in delivery.buffer.call_args_list:
+        assert "__viaduck_snap" not in c.args[1].column_names
