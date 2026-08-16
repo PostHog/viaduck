@@ -378,6 +378,8 @@ class PollConfig:
             raise ConfigError(f"poll.read_unit_max_rows must be >= 1, got {self.read_unit_max_rows}")
         if self.read_unit_max_span < 1:
             raise ConfigError(f"poll.read_unit_max_span must be >= 1, got {self.read_unit_max_span}")
+        if self.read_unit_max_bytes < 1:
+            raise ConfigError(f"poll.read_unit_max_bytes must be >= 1, got {self.read_unit_max_bytes}")
         if self.read_workers < 1:
             raise ConfigError(f"poll.read_workers must be >= 1, got {self.read_workers}")
 
@@ -994,6 +996,15 @@ def load(path: str | Path) -> ViaduckConfig:
 
     # Optional sections
     poll_raw = raw.get("poll", {})
+    # Deleted knobs refuse loudly (a stale chart carrying them must not
+    # silently get defaults — the failure mode is an operator believing the
+    # scheduler is bounded when the scheduler no longer exists).
+    for dead in ("cdc_chunk_snapshots", "cycle_time_budget_seconds"):
+        if dead in poll_raw:
+            raise ConfigError(
+                f"poll.{dead} was removed in M4 (unit-based reads supersede it): "
+                f"delete it from the values file. See log-consumer-proposal.md."
+            )
     poll = PollConfig(
         interval_seconds=poll_raw.get("interval_seconds", 5.0),
         read_unit_max_rows=_validate_int(poll_raw.get("read_unit_max_rows", 50_000), "poll.read_unit_max_rows"),

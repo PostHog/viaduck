@@ -881,9 +881,10 @@ class DeliveryManager:
                 # through <= this commit's through are redundant replays by
                 # construction (the commit covered their range), and
                 # dropping them is the pause's controlled-crash semantics
-                # completed late. (For today's chunk-contiguous entries,
-                # through is both the coverage watermark and the content
-                # hi bound, so entry-through <= commit-through <=> covered.)
+                # completed late. The drop keys on the entry's `hi` (its own
+                # max snapshot), per the model's DropCoveredPrefix — for
+                # contiguous units hi == cov; straddle entries (hi > cov)
+                # are NOT droppable by cov, and the model proves why.
                 buf = self._buffers[dest_id]
                 if buf.entries:
                     drop = 0

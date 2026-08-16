@@ -1384,6 +1384,9 @@ def _slice_batch(batch: pa.Table, snaps: list[int], lo: int, hi: int, max_rows: 
     later slice. append_only only (any row order is safe — no conflicting
     pairs; full_cdc units are never sliced, preserving snapshot order).
     """
+    # Fast path (small batch): hi_k is the UNIT hi, not MaxSnap(rows) —
+    # inflated on purpose (conservative for the drop rule: fewer entries
+    # droppable). The sliced path below computes the own-max per slice.
     if batch.num_rows <= max_rows:
         return [(batch, hi, hi)]
     slices = []
@@ -1393,12 +1396,16 @@ def _slice_batch(batch: pa.Table, snaps: list[int], lo: int, hi: int, max_rows: 
         offset += max_rows
     out = []
     running = lo
+    assert all(sn > lo for sn in snaps) and all(sn <= hi for sn in snaps), (
+        "slice rule precondition: every row's snapshot must be in (lo, hi]"
+    )
     for k, sl in enumerate(slices):
         later = snaps[(k + 1) * max_rows :]  # snaps of slices after k
         cov = max(running, (min(later) - 1) if later else hi)
         cov = hi if k == len(slices) - 1 else cov
         out.append((sl, cov, max(snaps[k * max_rows : (k + 1) * max_rows])))
         running = cov
+    assert [c for _, c, _ in out] == sorted(c for _, c, _ in out), "cov chain must be non-decreasing"
     return out
 
 
@@ -1415,7 +1422,6 @@ def _apply_unit(
     full_cdc: bool,
     key_columns,
     unit_cfg,
-    src_table,
     routing_field,
     dest_configs,
 ) -> None:
@@ -1468,6 +1474,11 @@ def _apply_unit(
             pos = positions[dest_id]
             batch = batch.filter(pc.greater(batch.column(feed.SNAP_COL), pa.scalar(pos)))
             if batch.num_rows == 0:
+                # Masked to empty: (pos, hi] is provably empty for this
+                # member — advance it like the zero-row path, or it re-reads
+                # and re-discards the same span every cycle until the
+                # cluster separates.
+                delivery.advance_position(dest_id, hi, epoch=epochs[dest_id])
                 continue
             snaps = batch.column(feed.SNAP_COL).to_pylist()
             clean = batch.drop([feed.SNAP_COL])
@@ -1584,7 +1595,15 @@ def _poll_cycle(
             # cycle time budget: every unit is row/byte-bounded and every
             # cluster dispatches every cycle (the barrier), so nothing
             # starves.
-            clusters = _position_clusters(positions, read_ids, span_cap=cfg.poll.read_unit_max_span)
+            clusters = _position_clusters(
+                # Span-merge clustering needs the per-row mask — feed only.
+                # Legacy/full_cdc reads can't mask (no per-row snapshot), so
+                # they cluster by exact position (span_cap=0) or they'd
+                # re-deliver (lo, pos_member] on every read.
+                positions,
+                read_ids,
+                span_cap=cfg.poll.read_unit_max_span if (feed_reader is not None and not full_cdc) else 0,
+            )
             futures: dict = {}
             for lo, members in clusters:
                 if lo >= current_id:
@@ -1597,30 +1616,37 @@ def _poll_cycle(
                 readable = [d for d in members if not delivery.should_pause_reads_for(d)]
                 if not readable:
                     continue
-                # Unit planning on the POLL thread: plan_read/plan_unit run
-                # catalog SQL on the FeedReader's psycopg connection, which
-                # is single-threaded — the pool never plans.
-                if feed_reader is not None and not full_cdc:
-                    hi = feed_reader.plan_unit(
-                        src_table,
-                        lo,
-                        current_id,
-                        max_rows=cfg.poll.read_unit_max_rows,
-                        max_bytes=cfg.poll.read_unit_max_bytes,
-                        max_span=cfg.poll.read_unit_max_span,
-                    )
-                    planned = feed_reader.plan_read(
-                        src_table,
-                        lo,
-                        hi,
-                        filter_expr=router.build_filter_expr([dest_configs[d].routing_value for d in readable]),
-                        columns=source_columns,
-                        with_snapshot=True,
-                    )
-                else:
-                    hi = min(lo + cfg.poll.read_unit_max_span, current_id)
-                    planned = None
-                if feed_reader is not None and planned is None:
+                # Plan on the POLL thread (catalog SQL on the FeedReader's
+                # psycopg connection is single-threaded; the pool never
+                # plans). Planning failures are contained per cluster like
+                # read failures — a catalog blip skips one cluster for one
+                # cycle, never crashes the instance (review: M4-SWE #2).
+                try:
+                    if feed_reader is not None and not full_cdc:
+                        hi = feed_reader.plan_unit(
+                            src_table,
+                            lo,
+                            current_id,
+                            max_rows=cfg.poll.read_unit_max_rows,
+                            max_bytes=cfg.poll.read_unit_max_bytes,
+                            max_span=cfg.poll.read_unit_max_span,
+                        )
+                        planned = feed_reader.plan_read(
+                            src_table,
+                            lo,
+                            hi,
+                            filter_expr=router.build_filter_expr([dest_configs[d].routing_value for d in readable]),
+                            columns=source_columns,
+                            with_snapshot=True,
+                        )
+                    else:
+                        hi = min(lo + cfg.poll.read_unit_max_span, current_id)
+                        planned = None
+                except Exception:
+                    log.exception("CDC unit planning failed for cluster at %d; skipping it this cycle", lo)
+                    metrics.errors_total.labels(type="cdc_read", destination="").inc()
+                    continue
+                if feed_reader is not None and not full_cdc and planned is None:
                     # Empty unit: no read needed — advance positions directly.
                     for d in readable:
                         delivery.advance_position(d, hi, epoch=epochs[d])
@@ -1642,9 +1668,9 @@ def _poll_cycle(
                     if read_pool is not None
                     else _InlineFuture(
                         # Bind loop variables NOW (default args): a bare
-                        # closure over lo/readable would see the final
+                        # closure over loop variables would see the final
                         # iteration's values in every thunk.
-                        lambda lo=lo, readable=readable, hi=hi: _read_unit(
+                        lambda lo=lo, readable=readable, hi=hi, planned=planned: _read_unit(
                             src_table=src_table,
                             read_conn=src_table._catalog.connection,
                             feed_reader=feed_reader,
@@ -1661,42 +1687,98 @@ def _poll_cycle(
                 )
                 futures[future] = (lo, readable)
             # Barrier per cycle: read results are applied HERE on the poll
-            # thread as each unit completes (the buffer-writer discipline
-            # is unchanged — pool threads never touch delivery state).
-            for future in futures:
-                # Failure containment per unit (the retired per-group
-                # containment's successor): a read/route/apply failure skips
-                # THIS cluster this cycle — nothing fleet-wide. Source-
-                # connection death still exits via snapshot_bounds at the
-                # top of the cycle.
-                try:
-                    rows, hi = future.result()
-                    cycle_rows_read += rows.num_rows
-                    cycle_units += 1
-                    metrics.cdc_batch_rows.observe(rows.num_rows)
-                    _apply_unit(
-                        delivery,
-                        rows,
-                        hi,
-                        members=futures[future][1],
-                        positions=positions,
-                        epochs=epochs,
-                        router=router,
-                        rv_to_dest=rv_to_dest,
-                        full_cdc=full_cdc,
-                        key_columns=key_columns,
-                        unit_cfg=cfg.poll,
-                        src_table=src_table,
-                        routing_field=cfg.routing.field,
-                        dest_configs=dest_configs,
-                    )
-                    delivery.maybe_flush()
-                except Exception:
-                    log.exception(
-                        "CDC unit read failed for cluster at %d; skipping it this cycle",
-                        futures[future][0],
-                    )
-                    metrics.errors_total.labels(type="cdc_read", destination="").inc()
+            # thread as each unit COMPLETES (as_completed — a slow lagging
+            # unit never head-of-line-blocks a completed head cluster's
+            # apply + flush). The heartbeat keeps the liveness budget fed
+            # while the poll thread waits on pool I/O.
+            _hb = _start_progress_heartbeat(
+                label=f"CDC read barrier ({len(futures)} units)",
+                pre_progress_label="reading",
+            )
+            try:
+                # Completion order under a real pool (as_completed);
+                # dispatch order on the inline (test) path.
+                if read_pool is not None:
+                    from concurrent.futures import as_completed
+
+                    pending = as_completed(futures)
+                else:
+                    pending = list(futures)
+                for future in pending:
+                    # Failure containment per unit (the retired per-group
+                    # containment's successor): a read/route/apply failure
+                    # skips THIS cluster this cycle — nothing fleet-wide.
+                    # Source-connection death still exits via snapshot_bounds
+                    # at the top of the cycle.
+                    lo, members = futures[future]
+                    try:
+                        rows, hi = future.result()
+                    except Exception as exc:
+                        # Plan/execute skew (a listed file vanished between
+                        # plan and GET): re-plan once on the poll thread and
+                        # retry INLINE (this is feed.py's read() recovery,
+                        # now at the loop level). Second failure skips the
+                        # cluster for the cycle.
+                        if feed_reader is not None and feed._is_missing_file_error(exc):
+                            log.warning("CDC unit at %d hit a vanished file; re-planning once inline", lo)
+                            metrics.cdc_feed_replans_total.inc()
+                            try:
+                                planned = feed_reader.plan_read(
+                                    src_table,
+                                    lo,
+                                    min(lo + cfg.poll.read_unit_max_span, current_id),
+                                    filter_expr=router.build_filter_expr(
+                                        [dest_configs[d].routing_value for d in members]
+                                    ),
+                                    columns=source_columns,
+                                    with_snapshot=True,
+                                )
+                                rows = (
+                                    feed.execute_read(src_table._catalog.connection, planned)
+                                    if planned is not None
+                                    else pa.table({})
+                                )
+                                if rows is None:
+                                    rows = pa.table({})
+                                hi = min(lo + cfg.poll.read_unit_max_span, current_id)
+                            except Exception:
+                                log.exception("CDC unit re-plan failed for cluster at %d", lo)
+                                metrics.errors_total.labels(type="cdc_read", destination="").inc()
+                                continue
+                        else:
+                            log.exception("CDC unit read failed for cluster at %d; skipping it this cycle", lo)
+                            metrics.errors_total.labels(type="cdc_read", destination="").inc()
+                            continue
+                    try:
+                        cycle_rows_read += rows.num_rows
+                        cycle_units += 1
+                        metrics.cdc_batch_rows.observe(rows.num_rows)
+                        _apply_unit(
+                            delivery,
+                            rows,
+                            hi,
+                            members=members,
+                            positions=positions,
+                            epochs=epochs,
+                            router=router,
+                            rv_to_dest=rv_to_dest,
+                            full_cdc=full_cdc,
+                            key_columns=key_columns,
+                            unit_cfg=cfg.poll,
+                            routing_field=cfg.routing.field,
+                            dest_configs=dest_configs,
+                        )
+                        delivery.maybe_flush()
+                    except Exception:
+                        # route/apply failures (Phase 1, router) are
+                        # contained per cluster exactly like read failures.
+                        log.exception(
+                            "CDC unit apply failed for cluster at %d; skipping it this cycle",
+                            lo,
+                        )
+                        metrics.errors_total.labels(type="routing", destination="").inc()
+            finally:
+                _hb.set()
 
     # Evaluate flush triggers (FlushStart) — also persists position-only
 

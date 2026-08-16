@@ -325,6 +325,11 @@ class FeedReader:
         total_rows = inline_count
         total_bytes = 0
         hi = head
+        if not rows:
+            # File-less range (all-inline, or empty): the row/byte budgets
+            # can't bite, but the span cap still bounds the unit.
+            hi = min(head, after_snapshot + max_span)
+            return hi
         cur_begin = None
         for begin, record_count, size_bytes in rows:
             if cur_begin is not None and begin != cur_begin:
@@ -335,7 +340,8 @@ class FeedReader:
             cur_begin = begin
             total_rows += int(record_count)
             total_bytes += int(size_bytes)
-        return hi
+        # Span cap also applies when the row/byte budgets never trip.
+        return min(hi, after_snapshot + max_span)
 
     def read(
         self,

@@ -525,7 +525,7 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
     delivery = _make_delivery({"dest-lagging": 100, "dest-caughtup": 900})
     router = MagicMock()
     cfg = _make_cfg([("dest-caughtup", "cup"), ("dest-lagging", "lag")])
-    cfg.poll.cdc_chunk_snapshots = 200
+    cfg.poll.read_unit_max_span = 200
 
     # One cap check per destination per chunk iteration. Caps trip after
     # the FIRST chunk read: lagging group's chunk-1 check False (one read),
@@ -3559,7 +3559,6 @@ def test_apply_unit_masks_per_member_position():
         full_cdc=False,
         key_columns=[],
         unit_cfg=cfg.poll,
-        src_table=MagicMock(),
         routing_field="company",
         dest_configs={d.id: d for d in cfg.destinations},
     )
@@ -3572,3 +3571,112 @@ def test_apply_unit_masks_per_member_position():
     # The snap column never reaches the buffer (destinations never see it).
     for c in delivery.buffer.call_args_list:
         assert "__viaduck_snap" not in c.args[1].column_names
+
+
+def test_poll_cycle_plan_phase_failure_contained():
+    """A catalog failure during unit PLANNING skips that cluster for the
+    cycle — planning is catalog SQL on the poll thread and must be contained
+    like read failures (never process-fatal)."""
+    delivery = _make_delivery({"dest-1": 5})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+
+    feed_reader = MagicMock()
+    feed_reader.plan_unit.side_effect = RuntimeError("catalog blip")
+
+    with patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-1"],
+            {"quacksworth": "dest-1"},
+            key_columns=[],
+            mode="append_only",
+            source_columns=None,
+            feed_reader=feed_reader,
+        )
+
+    delivery.buffer.assert_not_called()
+    delivery.maybe_flush.assert_called_once()  # end-of-cycle flush eval still runs
+
+
+def test_poll_cycle_legacy_clusters_exact_positions_only():
+    """Legacy/full_cdc reads cannot mask (no per-row snapshot): span merging
+    is OFF (span_cap=0), so members at different positions NEVER share a
+    read — else (lo, pos] rows would be re-delivered every cycle."""
+    delivery = _make_delivery({"dest-a": 5, "dest-b": 8})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-a", "a"), ("dest-b", "b")])
+
+    read_calls: list[tuple[int, int]] = []
+
+    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
+        read_calls.append((after_snapshot, end_snapshot))
+        return pa.table({"company": pa.array([], type=pa.string())})
+
+    router.build_filter_expr.return_value = None
+
+    with (
+        patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
+        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+    ):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-a", "dest-b"],
+            {"a": "dest-a", "b": "dest-b"},
+            key_columns=[],
+            mode="append_only",
+            source_columns=None,
+        )
+
+    # Two separate reads at the exact positions — NOT one merged (5, 10].
+    assert sorted(read_calls) == [(5, 10), (8, 10)], f"legacy mode must not span-merge, got {read_calls}"
+
+
+def test_poll_cycle_pool_failure_contained():
+    """A pool future raising at result() skips only its cluster; the peer
+    cluster still applies (the barrier's containment works on real
+    concurrent.futures)."""
+    import concurrent.futures
+
+    delivery = _make_delivery({"dest-a": 5, "dest-b": 8})
+    router = MagicMock()
+    cfg = _make_cfg([("dest-a", "a"), ("dest-b", "b")])
+    router.build_filter_expr.return_value = None
+    arrow_data = pa.table({"company": ["b"], "value": [1]})
+    router.split_and_count.return_value = ({"b": arrow_data}, 0)
+
+    f_fail = concurrent.futures.Future()
+    f_fail.set_exception(RuntimeError("read exploded"))
+    f_ok = concurrent.futures.Future()
+    f_ok.set_result((arrow_data, 10))
+
+    class FakePool:
+        def submit(self, fn, **kwargs):
+            return f_fail if kwargs["lo"] == 5 else f_ok
+
+    with patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)):
+        _poll_cycle(
+            MagicMock(),
+            delivery,
+            MagicMock(),
+            router,
+            cfg,
+            ["dest-a", "dest-b"],
+            {"a": "dest-a", "b": "dest-b"},
+            key_columns=[],
+            mode="append_only",
+            source_columns=None,
+            read_pool=FakePool(),
+        )
+
+    # The failing cluster is skipped; the healthy one applied.
+    assert {c.args[0] for c in delivery.buffer.call_args_list} == {"dest-b"}
+    delivery.maybe_flush.assert_called()

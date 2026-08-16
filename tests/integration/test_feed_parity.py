@@ -15,6 +15,7 @@ from __future__ import annotations
 import collections
 from unittest.mock import MagicMock
 
+import psycopg
 import pyarrow as pa
 import pytest
 from pyducklake import Catalog
@@ -804,3 +805,113 @@ class TestPollCycleWithFeed:
         for dest in ("dest-a", "dest-b"):
             covs = [c for d, _, c, _, _ in buffered if d == dest]
             assert covs == sorted(covs) and covs and covs[-1] == head
+
+
+class TestPollCycleFanInAndSlicing:
+    """QE/SWE M5-gating coverage: cluster fan-in with DIVERGENT positions
+    over the real feed + slicing through a real DeliveryManager's buffer
+    chain (cov chains asserted at the _Buffer level)."""
+
+    def test_divergent_positions_and_slicing(self, pg_dsn, catalog):
+        conn = catalog.connection
+        conn.execute("CREATE TABLE IF NOT EXISTS lake.main.fanin (team_id BIGINT, event VARCHAR, value BIGINT)")
+        tbl = catalog.load_table("main.fanin")
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            for i in range(8):
+                _insert(catalog, [(2, f"a{i}", i), (7, f"b{i}", i)], "main.fanin")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        head = _head_snapshot(catalog)
+        snaps = [
+            r[0]
+            for r in psycopg.connect(pg_dsn, autocommit=True)
+            .execute(
+                "SELECT df.begin_snapshot FROM public.ducklake_data_file df "
+                "JOIN public.ducklake_table t ON t.table_id = df.table_id "
+                "WHERE t.table_name='fanin' ORDER BY df.begin_snapshot"
+            )
+            .fetchall()
+        ]
+        assert len(snaps) == 8
+
+        from viaduck.config import DeliveryConfig
+        from viaduck.delivery import DeliveryManager
+
+        sm = MagicMock()
+        cursor = MagicMock()
+        cursor.last_snapshot_id = snaps[1]  # destinations start here
+        cursor.rows_replicated = 0
+        cursor.last_error = None
+        sm.load_cursors.return_value = {"dest-a": cursor, "dest-b": cursor}
+        delivery = DeliveryManager(
+            DeliveryConfig(workers=1, flush_interval_seconds=3600.0),
+            sm,
+            MagicMock(),
+            [],
+            ["dest-a", "dest-b"],
+            mode="append_only",
+        )
+        # dest-b is AHEAD: at snaps[5] (its read position has already
+        # covered the first four commits).
+        delivery._position["dest-b"] = snaps[5]
+
+        cfg = MagicMock()
+        cfg.source.name = "lake"
+        cfg.source.table = "main.fanin"
+        cfg.routing.field = "team_id"
+        cfg.routing.mode = "append_only"
+        cfg.poll.interval_seconds = 5.0
+        cfg.poll.read_unit_max_rows = 3  # force slicing
+        cfg.poll.read_unit_max_bytes = 256 * 1024 * 1024
+        cfg.poll.read_unit_max_span = 10_000
+        cfg.poll.read_workers = 2
+        dest_a = MagicMock(id="dest-a", routing_value="2")
+        dest_b = MagicMock(id="dest-b", routing_value="7")
+        cfg.destinations = [dest_a, dest_b]
+        cfg.destination_by_id = lambda d: {"dest-a": dest_a, "dest-b": dest_b}[d]
+
+        reader = FeedReader(postgres_uri=pg_dsn, catalog_name="lake", data_path=catalog._data_path)
+        pool2 = _ReadPool({}, 2)
+        from unittest.mock import patch as _patch
+
+        # One unit per cluster per cycle — catch-up is a cycle loop. Drive
+        # cycles until both destinations' positions reach head.
+        try:
+            with _patch("viaduck.main._log_memory_stats"):
+                for _cycle in range(20):
+                    _poll_cycle(
+                        tbl,
+                        delivery,
+                        MagicMock(),
+                        Router(RoutingConfig(field="team_id", mode="append_only", key_columns=[])),
+                        cfg,
+                        ["dest-a", "dest-b"],
+                        {"2": "dest-a", "7": "dest-b"},
+                        [],
+                        "append_only",
+                        source_columns=("team_id", "event", "value"),
+                        feed_reader=reader,
+                        read_pool=pool2,
+                    )
+                    if all(delivery._position[d] >= head for d in ("dest-a", "dest-b")):
+                        break
+                else:
+                    raise AssertionError("fleet did not converge in 20 cycles")
+        finally:
+            pool2.close()
+            reader.close()
+
+        # Each commit carries 1 row per team. dest-a (started at snaps[1]):
+        # commits 3..9 → 6 team-2 rows. dest-b (started at snaps[5]): commits
+        # 8,9 → 2 team-7 rows — the mask kept it from re-reading its range.
+        entries_a = delivery._buffers["dest-a"].entries
+        entries_b = delivery._buffers["dest-b"].entries
+        assert sum(t.num_rows for t, _, _ in entries_a) == 6
+        assert sum(t.num_rows for t, _, _ in entries_b) == 2
+        covs_a = [cov for _, cov, _ in entries_a]
+        assert covs_a == sorted(covs_a) and covs_a[-1] >= snaps[-1]
+        covs_b = [cov for _, cov, _ in entries_b]
+        assert covs_b and covs_b[0] >= snaps[5]
+        # dest-a read 3 units (each 2 rows ≤ max_rows=3 → one entry each).
+        assert len(entries_a) >= 3, f"expected one entry per unit, got {len(entries_a)}"
