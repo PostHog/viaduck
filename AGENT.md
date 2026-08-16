@@ -165,12 +165,15 @@ the M3 soak at the seed boundary, locked by integration tests).
 
 The CDC algorithm is formally specified in `tla/Viaduck.tla` and verified by
 TLC. Run via `flox activate` then `just tlc`. The spec models source operations,
-buffered CDC reads (bounded by BufferCap — per-destination backpressure),
-two-step flushes (buffer swap → commit/fail), concurrent per-destination
-flush workers, seeding, and commit/cursor-gap scenarios both with and
-without process death — ALL checked unconditionally; the tombstone rule
-retired the everCrashed phantom conditioning entirely — checking 7
-invariants across 85,012,333 distinct states. Modify the spec when changing
+buffered CDC reads as a SEQUENCE of slice entries with coverage watermarks
+(the slice-cursor rule; prefix flushes persist `cov(k)`), two-step flushes
+(buffer swap → commit/fail), commit-coverage drops of stale replay entries
+(`DropCoveredPrefix` — the pause/zombie/prefix-split phantom chain TLC found
+in the pre-slice model), concurrent per-destination flush workers, seeding,
+and commit/cursor-gap scenarios both with and without process death — ALL
+checked unconditionally; the tombstone rule retired the everCrashed phantom
+conditioning entirely — checking 8 invariants (incl. EntryCoverageInvariant)
+across 132,190,573 distinct states. Modify the spec when changing
 the CDC algorithm or adding new failure modes — and when designing semantic
 changes, extend the spec FIRST and let TLC pass judgment before implementing.
 Always run `just tlc` after spec changes.

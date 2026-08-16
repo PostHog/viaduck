@@ -38,6 +38,24 @@
 (* rowid grouping in Phase 2 at flush time, exactly as within-read         *)
 (* conflicts are.                                                          *)
 (*                                                                         *)
+(* M3 (2026-08, log-consumer-proposal.md): the buffer is now a SEQUENCE    *)
+(* of cursor-carrying entries [rows, cov] — the implementation's flush     *)
+(* slices. Reads append entries; FlushStart commits a nonempty PREFIX and  *)
+(* advances the cursor only to the prefix's coverage watermark (cov),      *)
+(* which the slice-cursor rule computes as (min snapshot over later        *)
+(* slices) - 1: no row with snap <= cov may sit in a later entry, so the   *)
+(* durable cursor never passes undelivered data even when an entry's own   *)
+(* rows exceed its cov (merged-file straddle slices). A failed slice flush *)
+(* discards the suffix and rewinds to the cursor; already-committed prefix *)
+(* slices are re-read — the at-least-once duplicate window, absorbed by    *)
+(* the same set semantics as every other replay. Cluster fan-in (one       *)
+(* physical read feeding destinations at different positions with per-     *)
+(* destination masks) is a refinement of per-destination BufferRead — the *)
+(* union of per-destination logical reads of the same span, so no new      *)
+(* action. BufferCap gating is unchanged (per-destination, hard guard);    *)
+(* exclusion of an at-cap member from a shared physical read is the        *)
+(* routing/mask layer, below this abstraction.                             *)
+(*                                                                         *)
 (* CRASH MODEL: every crash and failure transition is checked              *)
 (* UNCONDITIONALLY — ProcessCrash (lose all in-memory state), FlushFail    *)
 (* (destination rollback + drop-buffer recovery), CrashDuringFlush and     *)
@@ -92,7 +110,7 @@
 (* consistent with ValProj). Not modeled as a separate action.             *)
 (***************************************************************************)
 
-EXTENDS Integers, FiniteSets, TLC
+EXTENDS Integers, FiniteSets, Sequences, TLC
 
 CONSTANTS
     Keys,           \* e.g. {1, 2}
@@ -124,9 +142,16 @@ VARIABLES
     cdcLog,         \* set of CDC change records
     dstRows,        \* function: dest -> set of [key, rv, val]
     cursors,        \* function: dest -> last PERSISTED snapshot id (flushed-through)
-    buffered,       \* function: dest -> set of Phase-1-resolved CDC records awaiting flush
+    buffered,       \* function: dest -> SEQUENCE of pending flush entries
+                    \* [rows |-> set of Phase-1-resolved records, cov |-> Nat]
+                    \* (M3: slice-cursor chain — FlushStart commits a prefix and
+                    \* the cursor advances only to the prefix's coverage watermark;
+                    \* see EntryCoverageInvariant). Row order inside an entry is
+                    \* abstracted away (records are sets per entry).
     bufferedThrough,\* function: dest -> in-memory read position; reads issue from here.
                     \* Invariant: cursors[d] <= bufferedThrough[d] <= srcSnap.
+                    \* NOTE (M3): position may exceed the last entry's cov — idle
+                    \* advances persist through full swaps (see FlushStart).
     flushing,       \* function: dest -> BOOLEAN, a flush is in flight (in-flight guard)
     inflight,       \* function: dest -> set of records snapshot at FlushStart
     inflightThrough,\* function: dest -> cursor value to persist if the flush commits
@@ -216,6 +241,44 @@ CDCReadFrom(d, fromSnap) ==
 Phase1(changes) ==
     {c \in changes : c.type /= "update_preimage"}
 
+(***************************************************************************)
+(* M3 buffer-entry helpers: the slice-cursor chain.                         *)
+(*                                                                         *)
+(* buffered[d] is a sequence of entries [rows, cov]. The coverage rule     *)
+(* (log-consumer-proposal.md §6.2): an entry's cov is the highest cursor   *)
+(* value its flush may persist — computed as (min snapshot over rows in    *)
+(* LATER entries) - 1, with the last entry carrying the unit's hi. Hence   *)
+(* the load-bearing property: no row in a later entry has snap <= an       *)
+(* earlier entry's cov, so a prefix commit never advances the cursor past  *)
+(* undelivered rows. An entry's OWN rows may exceed its cov (merged-file   *)
+(* straddle slices) — those rows' delivery is certified by a later entry.  *)
+(***************************************************************************)
+
+\* All buffered records for a destination, flattened from the entry chain.
+BufferRows(d) == UNION {buffered[d][k].rows : k \in 1..Len(buffered[d])}
+
+\* Queue depth for the BufferCap guard: buffered + in-flight record count
+\* (cardinality abstracts bytes — see BufferRead's comment).
+QueueSize(d) == Cardinality(BufferRows(d)) + Cardinality(inflight[d])
+
+\* The coverage watermark the next entry must meet or exceed: the chain's
+\* current tail cov, or the persisted cursor when the buffer is empty.
+LastCov(d) ==
+    IF Len(buffered[d]) > 0 THEN buffered[d][Len(buffered[d])].cov ELSE cursors[d]
+
+MinSnap(S) == CHOOSE m \in {c.snap : c \in S} : \A s \in {c.snap : c \in S} : m <= s
+
+MaxSnap(S) == CHOOSE m \in {c.snap : c \in S} : \A s \in {c.snap : c \in S} : m >= s
+
+\* Entries dropped at FlushCommit when fully covered by the commit's
+\* through. (See the FlushCommit comment for the phantom chain this
+\* closes.)
+DropCoveredPrefix(seq, T) ==
+    LET covered == {k \in 0..Len(seq) :
+                      \A j \in 1..k : seq[j].hi <= T}
+        n == CHOOSE k \in covered : \A m \in covered : m <= k
+    IN SubSeq(seq, n + 1, Len(seq))
+
 \* Phase 2: Conflict resolution by rowid. Runs at FLUSH time on the union
 \* of all buffered reads — cross-read conflicts (insert read in one poll,
 \* its delete read in a later poll, both still buffered) resolve exactly
@@ -297,25 +360,75 @@ Phase3Apply(d, resolved) ==
 BufferRead(d, i) ==
     /\ DestOwner[d] = i
     /\ bufferedThrough[d] < srcSnap
-    /\ Cardinality(buffered[d]) + Cardinality(inflight[d]) < BufferCap
-    /\ buffered' = [buffered EXCEPT ![d] = @ \cup Phase1(CDCReadFrom(d, bufferedThrough[d]))]
+    /\ QueueSize(d) < BufferCap
+    /\ LET changes == Phase1(CDCReadFrom(d, bufferedThrough[d]))
+       IN  /\ \/ /\ changes = {}
+                 \* Nothing routed to d: position-only advance, no entry.
+                 /\ buffered' = buffered
+              \/ /\ changes /= {}
+                 \* Either one entry covering the unit, or a two-slice
+                 \* split with the slice-cursor rule: cov(e1) = (min snap
+                 \* of e2) - 1, e2 carries the unit hi.
+                 \*
+                 \* SPLITS ARE SNAPSHOT-CONTIGUOUS, not arbitrary subsets:
+                 \* TLC's counterexample (an arbitrary split landed the
+                 \* snap-3 delete in an earlier-flushed slice than its
+                 \* snap-1 insert — the no-op delete healed nothing and
+                 \* the insert became a permanent phantom). Within one
+                 \* unit, a same-rowid insert/delete pair must flush in
+                 \* snapshot order (the tombstone rule only heals the
+                 \* later-flushed direction), which snap-contiguous splits
+                 \* guarantee. append_only has no conflicting pairs and is
+                 \* safe under any slice order; full_cdc slicing must be
+                 \* snapshot-ordered. Both slices land in one BufferRead
+                 \* (the poll thread / per-destination in-flight read
+                 \* guard keeps buffer writes ordered).
+                 /\ \/ buffered' = [buffered EXCEPT ![d] =
+                            Append(@, [rows |-> changes, cov |-> srcSnap,
+                                       hi |-> MaxSnap(changes)])]
+                    \/ \E t \in {c.snap : c \in changes} :
+                         LET e1 == {c \in changes : c.snap <= t}
+                             e2 == {c \in changes : c.snap > t}
+                         IN  /\ e1 /= {} /\ e2 /= {}
+                             /\ buffered' = [buffered EXCEPT ![d] =
+                                    Append(Append(@,
+                                        [rows |-> e1, cov |-> MinSnap(e2) - 1,
+                                         hi |-> MaxSnap(e1)]),
+                                        [rows |-> e2, cov |-> srcSnap,
+                                         hi |-> MaxSnap(e2)])]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = srcSnap]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
                    flushing, inflight, inflightThrough, opCount>>
 
-\* Start a flush: swap the buffer out (worker takes a snapshot of the
-\* accumulated changes + the position they cover; the live buffer resets).
-\* Also fires for empty buffers whose read position is ahead of the
-\* persisted cursor — that persists cursor advancement for destinations
-\* that had no routed rows (the lazy idle-destination persist).
+\* Start a flush: swap a nonempty PREFIX of the entry chain out (the M3
+\* slice semantics; k = Len is a full swap). The cursor persists the
+\* prefix's coverage watermark: cov(k) for a partial swap (rows left behind
+\* are covered by the suffix chain) and bufferedThrough[d] for a full swap
+\* (the position may be ahead of the tail cov via idle position-only
+\* advances — those ranges are empty FOR THIS DESTINATION by construction
+\* of the read path, so persisting position is sound; main.py advances
+\* position without an entry only when the unit routed zero rows to d).
+\* Also fires for an empty buffer whose read position is ahead of the
+\* persisted cursor — the lazy idle-destination persist.
 FlushStart(d, i) ==
     /\ DestOwner[d] = i
     /\ ~flushing[d]
-    /\ buffered[d] /= {} \/ bufferedThrough[d] > cursors[d]
-    /\ flushing' = [flushing EXCEPT ![d] = TRUE]
-    /\ inflight' = [inflight EXCEPT ![d] = buffered[d]]
-    /\ inflightThrough' = [inflightThrough EXCEPT ![d] = bufferedThrough[d]]
-    /\ buffered' = [buffered EXCEPT ![d] = {}]
+    /\ \/ /\ Len(buffered[d]) > 0
+          /\ \E k \in 1..Len(buffered[d]) :
+                /\ flushing' = [flushing EXCEPT ![d] = TRUE]
+                /\ inflight' = [inflight EXCEPT ![d] =
+                        UNION {buffered[d][j].rows : j \in 1..k}]
+                /\ inflightThrough' = [inflightThrough EXCEPT ![d] =
+                        IF k = Len(buffered[d])
+                        THEN bufferedThrough[d]
+                        ELSE buffered[d][k].cov]
+                /\ buffered' = [buffered EXCEPT ![d] = SubSeq(buffered[d], k + 1, Len(buffered[d]))]
+       \/ /\ buffered[d] = <<>>
+          /\ bufferedThrough[d] > cursors[d]
+          /\ flushing' = [flushing EXCEPT ![d] = TRUE]
+          /\ inflight' = [inflight EXCEPT ![d] = {}]
+          /\ inflightThrough' = [inflightThrough EXCEPT ![d] = bufferedThrough[d]]
+          /\ UNCHANGED buffered
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
                    bufferedThrough, opCount>>
 
@@ -326,7 +439,14 @@ FlushCommit(d, i) ==
     /\ DestOwner[d] = i
     /\ flushing[d]
     /\ dstRows' = [dstRows EXCEPT ![d] = Phase3Apply(d, Phase2(inflight[d]))]
-    /\ cursors' = [cursors EXCEPT ![d] = inflightThrough[d]]
+    \* M3: max() with the current cursor, not assignment — the PG upsert's
+    \* monotonicity guard (state.py advance_cursor; delivery.py:853). A
+    \* prefix flush of a REPLAYED chain (pause/rewind raced a zombie commit)
+    \* carries cov < cursor and must not regress it. Pre-M3 this was a
+    \* plain assignment because inflightThrough = bufferedThrough >=
+    \* cursors held by BufferPositionBound; prefix slices break that
+    \* argument, so the guard is now explicit (and modeled as load-bearing).
+    /\ cursors' = [cursors EXCEPT ![d] = IF @ < inflightThrough[d] THEN inflightThrough[d] ELSE @]
     \* Position restore (delivery._flush success path): a PauseDest that
     \* raced this flush rewound bufferedThrough below inflightThrough; the
     \* flush SUCCEEDED, so leaving the position behind would re-read a
@@ -334,10 +454,22 @@ FlushCommit(d, i) ==
     \* (bufferedThrough >= inflightThrough always).
     /\ bufferedThrough' = [bufferedThrough EXCEPT
                              ![d] = IF @ < inflightThrough[d] THEN inflightThrough[d] ELSE @]
+    \* M3: drop still-buffered entries FULLY covered by this commit
+    \* (hi <= inflightThrough). Normally a no-op — entries buffered after
+    \* FlushStart cover ranges past inflightThrough. The live case: a
+    \* pause/discard rewound the position mid-flush and the replay re-
+    \* buffered rows the zombie's commit already resolved. Without the
+    \* drop, a later prefix flush can split a re-buffered conflicting pair
+    \* across a crash boundary and leave a permanent phantom (TLC witness:
+    \* BufferRead, FlushStart, PauseDest, BufferRead, FlushCommit,
+    \* FlushStart, CrashDuringFlush). Stale replay data is redundant by
+    \* construction; dropping it is the pause's controlled-crash semantics
+    \* completed late.
+    /\ buffered' = [buffered EXCEPT ![d] = DropCoveredPrefix(@, inflightThrough[d])]
     /\ flushing' = [flushing EXCEPT ![d] = FALSE]
     /\ inflight' = [inflight EXCEPT ![d] = {}]
     /\ inflightThrough' = [inflightThrough EXCEPT ![d] = 0]
-    /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, buffered, opCount>>
+    /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, opCount>>
 
 \* Flush fails: the destination transaction rolls back (ASSUMPTION 4), the
 \* in-flight set is discarded, AND the live buffer is discarded with the
@@ -352,7 +484,7 @@ FlushFail(d, i) ==
     /\ flushing' = [flushing EXCEPT ![d] = FALSE]
     /\ inflight' = [inflight EXCEPT ![d] = {}]
     /\ inflightThrough' = [inflightThrough EXCEPT ![d] = 0]
-    /\ buffered' = [buffered EXCEPT ![d] = {}]
+    /\ buffered' = [buffered EXCEPT ![d] = <<>>]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = cursors[d]]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
                    opCount>>
@@ -372,8 +504,8 @@ FlushFail(d, i) ==
 \* the crash-recovery re-read, which is why resume is gap-free.
 PauseDest(d, i) ==
     /\ DestOwner[d] = i
-    /\ buffered[d] /= {} \/ bufferedThrough[d] > cursors[d]
-    /\ buffered' = [buffered EXCEPT ![d] = {}]
+    /\ Len(buffered[d]) > 0 \/ bufferedThrough[d] > cursors[d]
+    /\ buffered' = [buffered EXCEPT ![d] = <<>>]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = cursors[d]]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, dstRows, cursors,
                    flushing, inflight, inflightThrough, opCount>>
@@ -393,7 +525,7 @@ CrashDuringFlush(d, i) ==
     /\ DestOwner[d] = i
     /\ flushing[d]
     /\ dstRows' = [dstRows EXCEPT ![d] = Phase3Apply(d, Phase2(inflight[d]))]
-    /\ buffered' = [e \in Dests |-> {}]
+    /\ buffered' = [e \in Dests |-> <<>>]
     /\ bufferedThrough' = [e \in Dests |-> cursors[e]]
     /\ flushing' = [e \in Dests |-> FALSE]
     /\ inflight' = [e \in Dests |-> {}]
@@ -416,7 +548,7 @@ FlushCommitNoCursor(d, i) ==
     /\ flushing' = [flushing EXCEPT ![d] = FALSE]
     /\ inflight' = [inflight EXCEPT ![d] = {}]
     /\ inflightThrough' = [inflightThrough EXCEPT ![d] = 0]
-    /\ buffered' = [buffered EXCEPT ![d] = {}]
+    /\ buffered' = [buffered EXCEPT ![d] = <<>>]
     /\ bufferedThrough' = [bufferedThrough EXCEPT ![d] = cursors[d]]
     /\ UNCHANGED <<srcRows, srcSnap, nextRowid, cdcLog, cursors, opCount>>
 
@@ -427,8 +559,8 @@ FlushCommitNoCursor(d, i) ==
 \* that losing buffers can never violate safety — re-reads from persisted
 \* cursors re-cover everything that was buffered.
 ProcessCrash ==
-    /\ \E d \in Dests : buffered[d] /= {} \/ bufferedThrough[d] > cursors[d] \/ flushing[d]
-    /\ buffered' = [d \in Dests |-> {}]
+    /\ \E d \in Dests : Len(buffered[d]) > 0 \/ bufferedThrough[d] > cursors[d] \/ flushing[d]
+    /\ buffered' = [d \in Dests |-> <<>>]
     /\ bufferedThrough' = [d \in Dests |-> cursors[d]]
     /\ flushing' = [d \in Dests |-> FALSE]
     /\ inflight' = [d \in Dests |-> {}]
@@ -448,7 +580,7 @@ SeedDestination(d, i) ==
     /\ DestOwner[d] = i
     /\ cursors[d] = 0             \* only seed new destinations
     /\ ~flushing[d]
-    /\ buffered[d] = {}
+    /\ buffered[d] = <<>>
     /\ srcSnap > 0                \* source has data
     \* Seed also lands data on the destination, so the same projection
     \* applies (viaduck's seed path shares the write mechanism).
@@ -469,14 +601,14 @@ CrashAfterSeed(d, i) ==
     /\ DestOwner[d] = i
     /\ cursors[d] = 0
     /\ ~flushing[d]
-    /\ buffered[d] = {}
+    /\ buffered[d] = <<>>
     /\ srcSnap > 0
     \* Seed also lands data on the destination, so the same projection
     \* applies (viaduck's seed path shares the write mechanism).
     /\ LET seedRows == {[key |-> r.key, rv |-> r.rv, val |-> ValProj[d, r.val]] :
                           r \in {s \in srcRows : s.rv = RoutingMap[d]}}
        IN dstRows' = [dstRows EXCEPT ![d] = seedRows]
-    /\ buffered' = [e \in Dests |-> {}]
+    /\ buffered' = [e \in Dests |-> <<>>]
     /\ bufferedThrough' = [e \in Dests |-> cursors[e]]
     /\ flushing' = [e \in Dests |-> FALSE]
     /\ inflight' = [e \in Dests |-> {}]
@@ -497,7 +629,7 @@ CrashAfterSeed(d, i) ==
 (***************************************************************************)
 
 AllCleanAndCurrent ==
-    \A d \in Dests : cursors[d] = srcSnap /\ buffered[d] = {} /\ ~flushing[d]
+    \A d \in Dests : cursors[d] = srcSnap /\ buffered[d] = <<>> /\ ~flushing[d]
 
 \* Eventual consistency: destinations exactly match source partitions
 \* AFTER the per-destination projection is applied. Key and rv pass through
@@ -549,6 +681,27 @@ FlushStateConsistency ==
     \A d \in Dests :
         ~flushing[d] => (inflight[d] = {} /\ inflightThrough[d] = 0)
 
+\* M3: the slice-cursor chain's load-bearing structure (proposal §6.2).
+\* For every destination's buffer sequence:
+\*   (a) covs are non-decreasing along the chain;
+\*   (b) NO row in a later entry has snap <= an earlier entry's cov —
+\*       the property that lets FlushStart persist cov(k) for a prefix
+\*       without ever advancing the durable cursor past undelivered rows.
+\* (There is deliberately NO "cov >= cursor" clause: a pause/rewind raced
+\* by a zombie commit re-buffers an already-covered range, and such replay
+\* entries legitimately carry cov < cursor — cursor monotonicity is
+\* enforced by FlushCommit's max() guard, not by the chain.)
+\* EventualConsistency catches a coverage bug end-to-end at quiescence;
+\* this invariant catches it structurally at the moment of buffering.
+EntryCoverageInvariant ==
+    \A d \in Dests :
+        \A i \in 1..Len(buffered[d]) :
+            /\ i < Len(buffered[d]) =>
+                    buffered[d][i].cov <= buffered[d][i + 1].cov
+            /\ \A j \in i + 1..Len(buffered[d]) :
+                \A r \in buffered[d][j].rows :
+                    r.snap > buffered[d][i].cov
+
 (***************************************************************************)
 (* Specification                                                           *)
 (***************************************************************************)
@@ -560,7 +713,7 @@ Init ==
     /\ cdcLog = {}
     /\ dstRows = [d \in Dests |-> {}]
     /\ cursors = [d \in Dests |-> 0]
-    /\ buffered = [d \in Dests |-> {}]
+    /\ buffered = [d \in Dests |-> <<>>]
     /\ bufferedThrough = [d \in Dests |-> 0]
     /\ flushing = [d \in Dests |-> FALSE]
     /\ inflight = [d \in Dests |-> {}]

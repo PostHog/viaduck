@@ -112,7 +112,7 @@ jvars == <<vars, joinSnap, missedDeleteKeys>>
 \* bufferedThrough >= cursors, so "<=" is "=" here.)
 IsCleanDest(d) ==
     /\ ~flushing[d]
-    /\ buffered[d] = {}
+    /\ buffered[d] = <<>>
     /\ bufferedThrough[d] = cursors[d]
 
 (***************************************************************************)
