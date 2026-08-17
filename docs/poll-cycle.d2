@@ -7,8 +7,8 @@ load: "Load cursors from\n_viaduck_state" { shape: step }
 group: "Cluster destinations\nby read position" { shape: step }
 
 mode: "key_columns\nconfigured?" { shape: diamond }
-cdc_changes: "unit read: feed SQL\n+ parquet (start, end,\nfilter_expr)" { shape: step }
-cdc_insert: "unit read: feed SQL\n+ parquet (start, end,\nfilter_expr)" { shape: step }
+cdc_changes: "table_changes(\nstart, end,\nfilter_expr)\nextension path" { shape: step }
+cdc_insert: "unit read: feed SQL\n+ parquet (start, end,\nfilter_expr)\n(table_insertions fallback)" { shape: step }
 
 empty: "Empty\nchangeset?" { shape: diamond }
 

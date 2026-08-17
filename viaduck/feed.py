@@ -300,46 +300,72 @@ class FeedReader:
         tid = self._table_id(pg, namespace, table_name)
         lo1 = after_snapshot + 1
         rows = pg.execute(
-            f"SELECT begin_snapshot, record_count, file_size_bytes "
+            f"SELECT begin_snapshot, partial_max, record_count, file_size_bytes "
             f'FROM "{self._meta_schema}".ducklake_data_file '
             f"WHERE table_id = %s AND begin_snapshot <= %s "
             f"AND (begin_snapshot >= %s OR (partial_max IS NOT NULL AND partial_max >= %s)) "
             f"ORDER BY begin_snapshot, data_file_id",
             (tid, head, lo1, lo1),
         ).fetchall()
-        # Inline rows count toward the budget but carry no record_count.
-        inline_count = 0
+        # Inline rows count toward the budget but carry no record_count —
+        # group them per begin_snapshot so they budget exactly like file
+        # groups (an all-inline range must not become an unbounded unit).
         registry = pg.execute(
             f'SELECT table_name FROM "{self._meta_schema}".ducklake_inlined_data_tables WHERE table_id = %s',
             (tid,),
         ).fetchall()
+        inline_groups: list[tuple[int, int, int, None]] = []  # (begin, count, bytes=0, no partial_max)
         for (store,) in registry:
             store = store.replace('"', '""')
-            row = pg.execute(
-                f'SELECT COUNT(*) FROM "{self._meta_schema}"."{store}" '
-                f"WHERE begin_snapshot > %s AND begin_snapshot <= %s",
-                (after_snapshot, head),
-            ).fetchone()
-            inline_count += int(row[0]) if row else 0
+            inline_groups.extend(
+                (int(b), int(c), 0, None)
+                for b, c in pg.execute(
+                    f'SELECT begin_snapshot, COUNT(*) FROM "{self._meta_schema}"."{store}" '
+                    f"WHERE begin_snapshot > %s AND begin_snapshot <= %s GROUP BY begin_snapshot",
+                    (after_snapshot, head),
+                ).fetchall()
+            )
+        oversized = sum(1 for r in rows if int(r[2]) > max_rows or int(r[3]) > max_bytes)
+        if oversized:
+            log.warning(
+                "plan_unit: %d file(s) individually exceed the unit budget (a single file is "
+                "read whole — the bound resumes next unit)",
+                oversized,
+            )
 
-        total_rows = inline_count
+        # Unified (begin, rows, bytes, partial_max) stream ordered by begin.
+        entries = sorted(
+            [(int(r[0]), int(r[2]), int(r[3]), int(r[1]) if r[1] is not None else None) for r in rows] + inline_groups,
+            key=lambda e: e[0],
+        )
+        total_rows = 0
         total_bytes = 0
         hi = head
-        if not rows:
-            # File-less range (all-inline, or empty): the row/byte budgets
-            # can't bite, but the span cap still bounds the unit.
-            hi = min(head, after_snapshot + max_span)
-            return hi
-        cur_begin = None
-        for begin, record_count, size_bytes in rows:
+        cur_begin: int | None = None
+        cur_pmax: int | None = None
+        for begin, record_count, size_bytes, partial_max in entries:
             if cur_begin is not None and begin != cur_begin:
-                # Boundary check BEFORE starting a new snapshot group.
-                if total_rows >= max_rows or total_bytes >= max_bytes or begin > after_snapshot + max_span:
+                if begin > after_snapshot + max_span:
+                    # Span trip: end at the cap boundary (a content-free tail
+                    # is fine — file/inline selection is range-based).
+                    hi = min(head, after_snapshot + max_span)
+                    break
+                if total_rows >= max_rows or total_bytes >= max_bytes:
+                    # Row/byte trip: end at the previous group boundary so
+                    # the unit stays snapshot-atomic.
                     hi = cur_begin
                     break
             cur_begin = begin
-            total_rows += int(record_count)
-            total_bytes += int(size_bytes)
+            if partial_max is not None:
+                cur_pmax = partial_max
+            total_rows += record_count
+            total_bytes += size_bytes
+        if hi <= after_snapshot:
+            # The budget tripped ON a straddle group whose begin predates the
+            # cursor (a merged file selected via partial_max): ending the unit
+            # there plans a reversed/empty range that can never advance. End
+            # at the straddle's coverage boundary instead.
+            hi = min(head, max(after_snapshot + 1, cur_pmax or 0))
         # Span cap also applies when the row/byte budgets never trip.
         return min(hi, after_snapshot + max_span)
 

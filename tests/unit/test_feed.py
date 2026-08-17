@@ -354,3 +354,60 @@ class TestRunLevelFeedGate:
             _validate_feed_mode(cfg)
         cfg.routing.mode = "append_only"
         _validate_feed_mode(cfg)  # no raise
+
+
+class TestPlanUnit:
+    def _reader(self, file_rows, inline_groups=()):
+        """FeedReader mock-backed for plan_unit: file_rows are
+        (begin, partial_max, record_count, size_bytes); inline_groups are
+        (begin, count)."""
+        pg = _mock_pg()
+
+        def execute(sql, params=None):
+            cur = MagicMock()
+            if "information_schema.tables" in sql or "ducklake_metadata" in sql:
+                return _mock_pg().execute(sql, params)
+            if "ducklake_schema" in sql and "table_id" in sql:
+                cur.fetchone.return_value = (16,)
+            elif "ducklake_inlined_data_tables" in sql:
+                cur.fetchall.return_value = [("store1",)] if inline_groups else []
+            elif "GROUP BY begin_snapshot" in sql:
+                cur.fetchall.return_value = list(inline_groups)
+            elif "ducklake_data_file" in sql:
+                cur.fetchall.return_value = list(file_rows)
+            return cur
+
+        pg.execute.side_effect = execute
+        pg.closed = False
+        r = FeedReader(postgres_uri="postgresql://x", catalog_name="lake", data_path="s3://b/")
+        r._conn = pg
+        return r
+
+    def test_budget_trips_at_group_boundary(self):
+        # Three 30k-row groups; budget 50k → unit covers the first group only.
+        r = self._reader([(10, None, 30_000, 100), (20, None, 30_000, 100), (30, None, 30_000, 100)])
+        assert r.plan_unit(MagicMock(), 5, 100, max_rows=50_000) == 20
+
+    def test_budget_never_trips_returns_head_capped_by_span(self):
+        r = self._reader([(10, None, 100, 100), (20, None, 100, 100)])
+        assert r.plan_unit(MagicMock(), 5, 100, max_rows=50_000, max_span=10) == 15
+
+    def test_straddle_group_never_reverses_hi(self):
+        """A merged file with begin < cursor selected via partial_max: when the
+        budget trips at the NEXT group, ending the unit at the straddle's old
+        begin would plan a reversed range that can never advance (the Copilot
+        wedge). hi lands on the straddle's coverage boundary instead."""
+        r = self._reader([(2, 50, 60_000, 100), (60, None, 100, 100)])  # straddle + a later group
+        hi = r.plan_unit(MagicMock(), 40, 100, max_rows=10_000)
+        assert hi > 40
+        assert hi == 50  # ends at the straddle's coverage boundary, never below the cursor
+
+    def test_inline_only_range_is_row_bounded(self):
+        """An all-inline range must not bypass the row budget (Copilot:
+        inline_limit x span rows would otherwise materialize in one unit)."""
+        r = self._reader([], inline_groups=[(10, 30_000), (20, 30_000), (30, 30_000)])
+        assert r.plan_unit(MagicMock(), 5, 100, max_rows=50_000) == 20
+
+    def test_empty_range_advances_by_span(self):
+        r = self._reader([], inline_groups=[])
+        assert r.plan_unit(MagicMock(), 5, 100, max_span=10) == 15

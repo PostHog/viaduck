@@ -1685,7 +1685,7 @@ def _poll_cycle(
                         )
                     )
                 )
-                futures[future] = (lo, readable)
+                futures[future] = (lo, hi, readable)
             # Barrier per cycle: read results are applied HERE on the poll
             # thread as each unit COMPLETES (as_completed — a slow lagging
             # unit never head-of-line-blocks a completed head cluster's
@@ -1710,7 +1710,7 @@ def _poll_cycle(
                     # skips THIS cluster this cycle — nothing fleet-wide.
                     # Source-connection death still exits via snapshot_bounds
                     # at the top of the cycle.
-                    lo, members = futures[future]
+                    lo, unit_hi, members = futures[future]
                     try:
                         rows, hi = future.result()
                     except Exception as exc:
@@ -1726,7 +1726,7 @@ def _poll_cycle(
                                 planned = feed_reader.plan_read(
                                     src_table,
                                     lo,
-                                    min(lo + cfg.poll.read_unit_max_span, current_id),
+                                    unit_hi,  # retry exactly (lo, unit_hi] — never widen a budgeted unit
                                     filter_expr=router.build_filter_expr(
                                         [dest_configs[d].routing_value for d in members]
                                     ),
@@ -1740,7 +1740,7 @@ def _poll_cycle(
                                 )
                                 if rows is None:
                                     rows = pa.table({})
-                                hi = min(lo + cfg.poll.read_unit_max_span, current_id)
+                                hi = unit_hi
                             except Exception:
                                 log.exception("CDC unit re-plan failed for cluster at %d", lo)
                                 metrics.errors_total.labels(type="cdc_read", destination="").inc()
