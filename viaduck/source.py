@@ -277,6 +277,9 @@ def open_read_connection(props: dict[str, str], name: str = "read"):
     merged = with_connection_defaults(props, name=name)
     safe, _ext = split_extension_settings(merged)
     conn = duckdb.connect()
+    # INSTALL is a no-op when the extension is already present (the prod
+    # image pre-installs it; CI/dev venvs may not have it yet).
+    conn.execute("INSTALL httpfs")
     conn.execute("LOAD httpfs")
     for key, value in safe.items():
         conn.execute(f"SET {key} = '{str(value).replace(chr(39), chr(39) * 2)}'")
