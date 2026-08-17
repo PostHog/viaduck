@@ -719,7 +719,10 @@ def run(cfg: config.ViaduckConfig) -> None:
     if cfg.source.cdc_reader == "direct":
         _validate_feed_mode(cfg)
         feed_reader = feed.FeedReader(
-            postgres_uri=cfg.source.postgres_uri,
+            # The chart's SOURCE_POSTGRES_URI is DuckDB-ATTACH format
+            # (postgres:host=…) which psycopg rejects verbatim — same
+            # translation the StateManager already gets (review F2).
+            postgres_uri=config._to_libpq_conninfo(cfg.source.postgres_uri),
             catalog_name=cfg.source.name,
             data_path=cfg.source.data_path,
         )
@@ -1353,12 +1356,18 @@ def _read_unit(
     attribution to slice on.
     """
     if planned is not None:
+        t0 = time.monotonic()
         rows = feed.execute_read(read_conn, planned)
         if rows is None:
             # A re-planned unit can come back empty (flushed/compacted
             # away between plan and execute) — the empty path advances
             # positions in _apply_unit.
             rows = pa.table({})
+        # Metric continuity with the extension path (which observes these
+        # inside read_cdc): the loop path must not darken the dashboards
+        # on flag-flip (review O1).
+        metrics.cdc_read_seconds.observe(time.monotonic() - t0)
+        metrics.cdc_rows_read_total.inc(rows.num_rows)
         log.info("CDC unit →%d: %d rows (feed)", hi, rows.num_rows)
         return rows, hi
     routing_values = [dest_configs[d].routing_value for d in members]
@@ -1449,9 +1458,11 @@ def _apply_unit(
         routed_ids = set()
         for rv, batch in routed.items():
             dest_id = rv_to_dest[rv]
-            routed_ids.add(dest_id)
             if batch.num_rows > 0:
                 delivery.buffer(dest_id, batch, hi, epoch=epochs[dest_id])
+                # Mark routed only when rows actually landed: an empty batch
+                # must not suppress the position advance below (review F4).
+                routed_ids.add(dest_id)
         for d in members:
             if d not in routed_ids:
                 delivery.advance_position(d, hi, epoch=epochs[d])
@@ -1464,7 +1475,6 @@ def _apply_unit(
     routed_ids = set()
     for rv, batch in routed.items():
         dest_id = rv_to_dest[rv]
-        routed_ids.add(dest_id)
         if batch.num_rows == 0:
             continue
         has_snaps = feed.SNAP_COL in batch.column_names
@@ -1488,6 +1498,10 @@ def _apply_unit(
             # Legacy extension read: no per-row attribution — whole-unit
             # entry (chunk-equivalent semantics).
             delivery.buffer(dest_id, batch, hi, epoch=epochs[dest_id])
+        # Mark routed only when rows actually landed (or the member was
+        # soundly advanced): an empty post-mask batch must not suppress the
+        # advance path (review F4).
+        routed_ids.add(dest_id)
     for d in members:
         if d not in routed_ids:
             delivery.advance_position(d, hi, epoch=epochs[d])
@@ -1600,22 +1614,24 @@ def _poll_cycle(
                 # Legacy/full_cdc reads can't mask (no per-row snapshot), so
                 # they cluster by exact position (span_cap=0) or they'd
                 # re-deliver (lo, pos_member] on every read.
-                positions,
+                # Cluster over READABLE (not-at-cap) members' positions ONLY:
+                # a wedged member's frozen position must not become a
+                # cluster's lo — the unit would re-plan the same span every
+                # cycle and pin every peer within span-cap indefinitely
+                # (review F1; §5 "pace never bounded by peers").
+                {d: p for d, p in positions.items() if not delivery.should_pause_reads_for(d)},
                 read_ids,
                 span_cap=cfg.poll.read_unit_max_span if (feed_reader is not None and not full_cdc) else 0,
             )
+            metrics.read_clusters.set(len(clusters))
             futures: dict = {}
             for lo, members in clusters:
                 if lo >= current_id:
                     continue  # this cluster has already read through head
-                # Per-destination read guards: at-cap members are excluded
-                # (their position freezes; they rejoin when their flush
-                # drains) — and the barrier below means no destination has
-                # two reads outstanding across cycles (tla/ViaduckReads.tla
-                # witnesses why that matters the day the barrier goes away).
-                readable = [d for d in members if not delivery.should_pause_reads_for(d)]
-                if not readable:
-                    continue
+                # The barrier below means no destination has two reads
+                # outstanding across cycles (tla/ViaduckReads.tla witnesses
+                # why that matters the day the barrier goes away).
+                readable = members
                 # Plan on the POLL thread (catalog SQL on the FeedReader's
                 # psycopg connection is single-threaded; the pool never
                 # plans). Planning failures are contained per cluster like
@@ -1640,7 +1656,13 @@ def _poll_cycle(
                             with_snapshot=True,
                         )
                     else:
-                        hi = min(lo + cfg.poll.read_unit_max_span, current_id)
+                        # Legacy fallback unit: the retired scheduler read <= 4 x
+                        # 120 = 480 snapshots per group per cycle. The legacy unit
+                        # keeps that pacing (one 480-snapshot extension read is
+                        # cheaper than four 120s) so flag-off catch-up behavior is
+                        # unchanged regardless of read_unit_max_span.
+                        legacy_span = min(cfg.poll.read_unit_max_span, 480)
+                        hi = min(lo + legacy_span, current_id)
                         planned = None
                 except Exception:
                     log.exception("CDC unit planning failed for cluster at %d; skipping it this cycle", lo)
@@ -1686,6 +1708,7 @@ def _poll_cycle(
                     )
                 )
                 futures[future] = (lo, hi, readable)
+            metrics.read_pool_inflight.set(len(futures))
             # Barrier per cycle: read results are applied HERE on the poll
             # thread as each unit COMPLETES (as_completed — a slow lagging
             # unit never head-of-line-blocks a completed head cluster's
@@ -1695,13 +1718,19 @@ def _poll_cycle(
                 label=f"CDC read barrier ({len(futures)} units)",
                 pre_progress_label="reading",
             )
+            remaining_units = 0
             try:
                 # Completion order under a real pool (as_completed);
                 # dispatch order on the inline (test) path.
                 if read_pool is not None:
                     from concurrent.futures import as_completed
 
-                    pending = as_completed(futures)
+                    # Overall barrier budget: per-unit timeout x unit count —
+                    # a wedged S3 GET must fail contained, never hang the
+                    # poll thread behind a heartbeat-green liveness probe
+                    # for hours (review O2).
+                    barrier_timeout = cfg.poll.read_unit_timeout_seconds * max(1, len(futures))
+                    pending = as_completed(futures, timeout=barrier_timeout)
                 else:
                     pending = list(futures)
                 for future in pending:
@@ -1709,10 +1738,20 @@ def _poll_cycle(
                     # containment's successor): a read/route/apply failure
                     # skips THIS cluster this cycle — nothing fleet-wide.
                     # Source-connection death still exits via snapshot_bounds
-                    # at the top of the cycle.
+                    # at the top of the cycle. The as_completed iterator's
+                    # own TimeoutError (overall barrier budget) propagates out
+                    # of the loop into the except below.
                     lo, unit_hi, members = futures[future]
                     try:
-                        rows, hi = future.result()
+                        rows, hi = (
+                            future.result(timeout=cfg.poll.read_unit_timeout_seconds)
+                            if read_pool is not None
+                            else future.result()
+                        )
+                    except TimeoutError:
+                        log.exception("CDC unit at %d exceeded read_unit_timeout_seconds; skipping it this cycle", lo)
+                        metrics.errors_total.labels(type="cdc_read", destination="").inc()
+                        continue
                     except Exception as exc:
                         # Plan/execute skew (a listed file vanished between
                         # plan and GET): re-plan once on the poll thread and
@@ -1777,8 +1816,15 @@ def _poll_cycle(
                             lo,
                         )
                         metrics.errors_total.labels(type="routing", destination="").inc()
+            except TimeoutError:
+                # The overall barrier budget expired with units outstanding:
+                # count and skip them (they retry next cycle from their
+                # frozen positions — at-least-once holds).
+                log.exception("CDC read barrier timed out with %d unit(s) outstanding", remaining_units)
+                metrics.errors_total.labels(type="cdc_read", destination="").inc(remaining_units)
             finally:
                 _hb.set()
+                metrics.read_pool_inflight.set(0)
 
     # Evaluate flush triggers (FlushStart) — also persists position-only
 

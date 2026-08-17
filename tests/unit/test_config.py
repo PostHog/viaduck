@@ -1029,6 +1029,16 @@ def test_slow_consumer_knob_loader_passthrough(tmp_path: Path):
     assert cfg.delivery.flush_circuit_max_seconds == 300.0
 
 
+def test_deleted_poll_knobs_refused_loudly(tmp_path: Path):
+    """The retired scheduler's knobs must refuse loudly (a stale chart
+    carrying them must not silently get defaults — deploy coupling B1)."""
+    for dead in ("cdc_chunk_snapshots", "cycle_time_budget_seconds"):
+        p = tmp_path / f"dead-{dead}.yaml"
+        p.write_text(MINIMAL_YAML + f"\npoll:\n  {dead}: 120\n")
+        with pytest.raises(ConfigError, match=dead):
+            load(p)
+
+
 def test_destination_buffer_max_bytes_loader(tmp_path: Path):
     raw = MINIMAL_YAML.replace(
         "postgres_uri_env: DEST_QW_PG",
@@ -1091,3 +1101,15 @@ def test_memory_validation_rejects(tmp_path: Path, snippet: str):
     p.write_text(MINIMAL_YAML + "\nmemory:\n" + snippet + "\n")
     with pytest.raises(ConfigError):
         load(p)
+
+
+def test_to_libpq_conninfo_translation():
+    """The chart's SOURCE_POSTGRES_URI is DuckDB-ATTACH format; psycopg
+    rejects it verbatim (review F2 — the feed must translate like the
+    StateManager does)."""
+    from viaduck.config import _to_libpq_conninfo
+
+    assert _to_libpq_conninfo("postgres:host=h port=5432 dbname=d user=u") == "host=h port=5432 dbname=d user=u"
+    assert _to_libpq_conninfo("postgresql://u@h/d") == "postgresql://u@h/d"
+    assert _to_libpq_conninfo("postgres://u@h/d") == "postgres://u@h/d"
+    assert _to_libpq_conninfo("host=h dbname=d") == "host=h dbname=d"

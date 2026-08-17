@@ -372,6 +372,11 @@ class PollConfig:
     # Parallel read pool size (bare duckdb connections; one in-flight read
     # per destination regardless — tla/ViaduckReads.tla).
     read_workers: int = 8
+    # Per-unit read wall-clock ceiling. A wedged read (S3 stall, slow catalog)
+    # fails contained and retries next cycle — without it the barrier can
+    # hang the poll thread behind a heartbeat-green liveness probe for hours
+    # (review O2).
+    read_unit_timeout_seconds: float = 300.0
 
     def __post_init__(self):
         if self.read_unit_max_rows < 1:
@@ -382,6 +387,8 @@ class PollConfig:
             raise ConfigError(f"poll.read_unit_max_bytes must be >= 1, got {self.read_unit_max_bytes}")
         if self.read_workers < 1:
             raise ConfigError(f"poll.read_workers must be >= 1, got {self.read_workers}")
+        if self.read_unit_timeout_seconds <= 0:
+            raise ConfigError(f"poll.read_unit_timeout_seconds must be > 0, got {self.read_unit_timeout_seconds}")
 
 
 @dataclass(frozen=True)
@@ -1013,6 +1020,7 @@ def load(path: str | Path) -> ViaduckConfig:
         ),
         read_unit_max_span=_validate_int(poll_raw.get("read_unit_max_span", 10_000), "poll.read_unit_max_span"),
         read_workers=_validate_int(poll_raw.get("read_workers", 8), "poll.read_workers"),
+        read_unit_timeout_seconds=float(poll_raw.get("read_unit_timeout_seconds", 300.0)),
     )
 
     server_raw = raw.get("server", {})

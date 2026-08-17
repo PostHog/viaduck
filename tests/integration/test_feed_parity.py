@@ -767,6 +767,7 @@ class TestPollCycleWithFeed:
         cfg.poll.read_unit_max_bytes = 256 * 1024 * 1024
         cfg.poll.read_unit_max_span = 10_000
         cfg.poll.read_workers = 4
+        cfg.poll.read_unit_timeout_seconds = 300.0
         cfg.destinations = []
         dest_a = MagicMock(id="dest-a", routing_value="2")
         dest_b = MagicMock(id="dest-b", routing_value="7")
@@ -866,6 +867,7 @@ class TestPollCycleFanInAndSlicing:
         cfg.poll.read_unit_max_bytes = 256 * 1024 * 1024
         cfg.poll.read_unit_max_span = 10_000
         cfg.poll.read_workers = 2
+        cfg.poll.read_unit_timeout_seconds = 300.0
         dest_a = MagicMock(id="dest-a", routing_value="2")
         dest_b = MagicMock(id="dest-b", routing_value="7")
         cfg.destinations = [dest_a, dest_b]

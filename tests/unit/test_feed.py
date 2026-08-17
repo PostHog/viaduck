@@ -137,18 +137,21 @@ class TestRead:
         table = _make_table()
         out = reader.read(table, duck, 10, 10)
         assert out.num_rows == 0
-        # No catalog work at all beyond verification.
-        assert not any("ducklake_data_file" in str(c) for c in pg.execute.call_args_list)
+        # No catalog work at all beyond verification (the pg_indexes probe
+        # only MENTIONS the table name in its filter — match the real query).
+        assert not any('FROM "public".ducklake_data_file' in str(c) for c in pg.execute.call_args_list)
 
     def test_selection_predicate_matches_extension(self):
         reader, duck, pg = self._read_setup(file_rows=[])
         reader.read(_make_table(), duck, 100, 200, filter_expr="team_id IN ('2')")
         calls = [str(c) for c in pg.execute.call_args_list]
-        file_query = next(c for c in calls if "ducklake_data_file" in c)
+        file_query = next(c for c in calls if 'FROM "public".ducklake_data_file' in c)
         assert "begin_snapshot <= " in file_query
         assert "partial_max IS NOT NULL" in file_query
         # params: (table_id, hi, lo+1, lo+1)
-        params = next(c.args[1] for c in pg.execute.call_args_list if "ducklake_data_file" in str(c) and c.args[1])
+        params = next(
+            c.args[1] for c in pg.execute.call_args_list if 'FROM "public".ducklake_data_file' in str(c) and c.args[1]
+        )
         assert params == (16, 200, 101, 101)
 
     def test_repeatable_read_wraps_catalog_queries(self):
@@ -230,7 +233,7 @@ class TestRead:
         out = reader.read(_make_table(), duck, 100, 200)
         assert out.num_rows == 1
         # The catalog was queried twice (original plan + one re-plan).
-        file_queries = [c for c in pg.execute.call_args_list if "ducklake_data_file" in str(c)]
+        file_queries = [c for c in pg.execute.call_args_list if 'FROM "public".ducklake_data_file' in str(c)]
         assert len(file_queries) == 2
 
     def test_replan_failure_propagates(self):

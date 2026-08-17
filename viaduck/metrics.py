@@ -67,6 +67,20 @@ _cdc_feed_replans_total = Counter(
     "Feed reads re-planned after a listed file vanished (plan/execute skew)",
     ["pipeline"],
 )
+# The absorbing-regime detector (log-consumer-proposal.md §8): distinct
+# read-unit clusters per poll cycle. At head-converged this is 1; a growth
+# trend means cursor scatter is forming — THE regression alarm for the new
+# read loop (its predecessor was the timeboxed-cycles counter).
+_read_clusters = Gauge(
+    "viaduck_read_clusters",
+    "Distinct read-unit clusters dispatched this poll cycle",
+    ["pipeline"],
+)
+_read_pool_inflight = Gauge(
+    "viaduck_read_pool_inflight",
+    "Unit reads dispatched but not yet applied (barrier occupancy)",
+    ["pipeline"],
+)
 # Source columns viaduck refuses to replicate because pyducklake cannot
 # represent their DuckDB type (e.g. VARIANT, which also cannot cross the
 # DuckDB→Arrow boundary as of duckdb 1.5.5). Incremented once per excluded
@@ -428,6 +442,8 @@ cdc_feed_query_seconds = _cdc_feed_query_seconds
 cdc_feed_files_total = _cdc_feed_files_total
 cdc_feed_inlined_rows_total = _cdc_feed_inlined_rows_total
 cdc_feed_replans_total = _cdc_feed_replans_total
+read_clusters = _read_clusters
+read_pool_inflight = _read_pool_inflight
 source_columns_excluded_total = _source_columns_excluded_total
 source_snapshot_id = _source_snapshot_id
 
@@ -504,6 +520,7 @@ def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
     global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id
     global cdc_feed_query_seconds, cdc_feed_files_total, cdc_feed_inlined_rows_total, cdc_feed_replans_total
+    global read_clusters, read_pool_inflight
     global self_recycles_total
     global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
@@ -584,6 +601,8 @@ def init(pipeline: str):
     cdc_feed_files_total = _cdc_feed_files_total.labels(pipeline=pipeline)
     cdc_feed_inlined_rows_total = _cdc_feed_inlined_rows_total.labels(pipeline=pipeline)
     cdc_feed_replans_total = _cdc_feed_replans_total.labels(pipeline=pipeline)
+    read_clusters = _read_clusters.labels(pipeline=pipeline)
+    read_pool_inflight = _read_pool_inflight.labels(pipeline=pipeline)
     source_columns_excluded_total = _AutoPipelineLabels(_source_columns_excluded_total, pipeline)
     source_snapshot_id = _source_snapshot_id.labels(pipeline=pipeline)
     delivery_buffer_total_bytes = _delivery_buffer_total_bytes.labels(pipeline=pipeline)

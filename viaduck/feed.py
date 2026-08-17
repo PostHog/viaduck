@@ -227,6 +227,20 @@ class FeedReader:
         ).fetchone()
         if row and row[0]:
             self._data_path = row[0]
+        # Index-presence probe: the feed's range query is index-only with
+        # viaduck_data_file_range and a seq-scan without it (22M-row table).
+        # Missing index = loud WARN, not a failure (correctness unaffected).
+        idx = conn.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = %s AND tablename = 'ducklake_data_file' "
+            "AND indexname = 'viaduck_data_file_range'",
+            (self._meta_schema,),
+        ).fetchone()
+        if idx is None:
+            log.warning(
+                "Feed index viaduck_data_file_range is MISSING on %s.ducklake_data_file — catalog reads "
+                "seq-scan until it exists (cdc-mark-2.md / log-consumer-proposal.md §9.1)",
+                self._meta_schema,
+            )
         self._verified = True
         log.info(
             "Feed reader verified catalog %s (metadata schema %s, version %s)",

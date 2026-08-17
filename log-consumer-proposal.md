@@ -619,13 +619,21 @@ review record; do not rediscover it.
 
 ## 12. Milestones (one engineer; corrected per review)
 
+**Status 2026-08-16: M1–M4 landed on branch `jakob/log-consumer`** (feed
+reader + golden suite + TLA replacement + unit-based read loop, all
+adversarially reviewed per milestone; the shipped-system pair-split
+phantom fix is in). Remaining: the shadow (M5), cutover (M6), deletion
+pass (M7), and the team-2 cliff track (M8) — the shadow needs prod access
+(the events_nrt type-matrix diff, the minio S3 drill, the DBA index
+window).
+
 | # | Milestone | Effort (est.) |
 |---|---|---|
 | 0 | Index build DBA window + spikes (§11.1/3/4) | calendar-bound; start day 0 |
-| 1 | Feed reader (§6.1) | 2–3d |
-| 2 | Golden parity suite (the §6.1 fixture matrix) | 2–3d |
-| 3 | TLA replacement, spec-first (§6.6) | 2–3d |
-| 4 | Read-loop + delivery surgery (§6.2–6.4) | 3–4d |
+| 1 | Feed reader (§6.1) — **LANDED** | 2–3d |
+| 2 | Golden parity suite (the §6.1 fixture matrix) — **LANDED** | 2–3d |
+| 3 | TLA replacement, spec-first (§6.6) — **LANDED** | 2–3d |
+| 4 | Read-loop + delivery surgery (§6.2–6.4) — **LANDED** | 3–4d |
 | 5 | Shadow build + 24–48h dual-read soak (§9.5) | 1d + wall clock |
 | 6 | Rehearsal (synthetic tenant, fencing, audit) + fleet cutover + rollback drill | 1–2d |
 | 7 | Deletion pass: old read path, **106 of 175 test_main.py tests reference the deleted machinery**, README/AGENT.md/docs/dashboards | 2–3d |
