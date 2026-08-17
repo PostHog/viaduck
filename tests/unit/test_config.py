@@ -722,8 +722,7 @@ def test_log_summary_one_line_per_field_not_grouped(config_file, caplog):
         "config: delivery.flush_deadline_seconds=",
         "config: delivery.flush_circuit_failures=",
         "config: poll.interval_seconds=",
-        "config: poll.cdc_chunk_snapshots=",
-        "config: poll.cycle_time_budget_seconds=",
+        "config: poll.read_unit max_rows=",
         "config: instance.partition.mode=",
         "config: state.table=",
         "config: state.schema=",
@@ -996,7 +995,9 @@ def test_slow_consumer_knob_defaults():
     assert d.flush_circuit_failures == 3
     assert d.flush_circuit_max_seconds == 900.0
     p = PollConfig()
-    assert p.cycle_time_budget_seconds == 0.0  # 0 = derive 0.8x interval at poll time
+    assert p.read_unit_max_rows == 50_000
+    assert p.read_unit_max_span == 10_000
+    assert p.read_workers == 8
 
 
 def test_slow_consumer_knob_validation():
@@ -1013,7 +1014,7 @@ def test_slow_consumer_knob_validation():
 def test_slow_consumer_knob_loader_passthrough(tmp_path: Path):
     raw = MINIMAL_YAML + (
         "\npoll:\n"
-        "  cycle_time_budget_seconds: 3.5\n"
+        "  read_unit_max_rows: 40000\n"
         "delivery:\n"
         "  flush_deadline_seconds: 240.0\n"
         "  flush_circuit_failures: 5\n"
@@ -1022,10 +1023,20 @@ def test_slow_consumer_knob_loader_passthrough(tmp_path: Path):
     p = tmp_path / "slowknobs.yaml"
     p.write_text(raw)
     cfg = load(p)
-    assert cfg.poll.cycle_time_budget_seconds == 3.5
+    assert cfg.poll.read_unit_max_rows == 40_000
     assert cfg.delivery.flush_deadline_seconds == 240.0
     assert cfg.delivery.flush_circuit_failures == 5
     assert cfg.delivery.flush_circuit_max_seconds == 300.0
+
+
+def test_deleted_poll_knobs_refused_loudly(tmp_path: Path):
+    """The retired scheduler's knobs must refuse loudly (a stale chart
+    carrying them must not silently get defaults — deploy coupling B1)."""
+    for dead in ("cdc_chunk_snapshots", "cycle_time_budget_seconds"):
+        p = tmp_path / f"dead-{dead}.yaml"
+        p.write_text(MINIMAL_YAML + f"\npoll:\n  {dead}: 120\n")
+        with pytest.raises(ConfigError, match=dead):
+            load(p)
 
 
 def test_destination_buffer_max_bytes_loader(tmp_path: Path):
@@ -1090,3 +1101,15 @@ def test_memory_validation_rejects(tmp_path: Path, snippet: str):
     p.write_text(MINIMAL_YAML + "\nmemory:\n" + snippet + "\n")
     with pytest.raises(ConfigError):
         load(p)
+
+
+def test_to_libpq_conninfo_translation():
+    """The chart's SOURCE_POSTGRES_URI is DuckDB-ATTACH format; psycopg
+    rejects it verbatim (review F2 — the feed must translate like the
+    StateManager does)."""
+    from viaduck.config import _to_libpq_conninfo
+
+    assert _to_libpq_conninfo("postgres:host=h port=5432 dbname=d user=u") == "host=h port=5432 dbname=d user=u"
+    assert _to_libpq_conninfo("postgresql://u@h/d") == "postgresql://u@h/d"
+    assert _to_libpq_conninfo("postgres://u@h/d") == "postgres://u@h/d"
+    assert _to_libpq_conninfo("host=h dbname=d") == "host=h dbname=d"

@@ -4,11 +4,11 @@ start: "Poll Cycle Start" { shape: oval }
 snapshot: "current_snapshot()" { shape: step }
 no_snap: "No snapshot?\nSleep & retry" { shape: diamond }
 load: "Load cursors from\n_viaduck_state" { shape: step }
-group: "Group destinations\nby last_snapshot_id" { shape: step }
+group: "Cluster destinations\nby read position" { shape: step }
 
 mode: "key_columns\nconfigured?" { shape: diamond }
-cdc_changes: "table_changes(\nstart, end,\nfilter_expr)" { shape: step }
-cdc_insert: "table_insertions(\nstart, end,\nfilter_expr)" { shape: step }
+cdc_changes: "table_changes(\nstart, end,\nfilter_expr)\nextension path" { shape: step }
+cdc_insert: "unit read: feed SQL\n+ parquet (start, end,\nfilter_expr)\n(table_insertions fallback)" { shape: step }
 
 empty: "Empty\nchangeset?" { shape: diamond }
 
@@ -32,7 +32,7 @@ snapshot -> no_snap
 no_snap -> done: "yes"
 no_snap -> load: "no"
 load -> group
-group -> mode: "for each snapshot group"
+group -> mode: "for each position cluster"
 
 mode -> cdc_changes: "yes (full CDC)"
 mode -> cdc_insert: "no (append-only)"

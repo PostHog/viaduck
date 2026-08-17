@@ -108,8 +108,8 @@ Each poll cycle ([`main.py:_poll_cycle`](viaduck/main.py)):
 
 1. **Snapshot check** — `current_snapshot()` on the source table. If no snapshots exist, sleep and retry.
 2. **Read plan** — atomic snapshot of each destination's in-memory read position + epoch from the delivery manager ([`delivery.py:read_plan`](viaduck/delivery.py)). Positions start at the persisted cursors and advance in memory as reads land.
-3. **Group by position** — destinations at the same position share a single CDC read ([`main.py:_group_by_cursor`](viaduck/main.py)).
-4. **CDC read** — full CDC mode: `table_changes` (inserts, deletes, update pre/post images); append-only mode: `table_insertions`. The range is half-open `(position, current]` — the position snapshot was already delivered ([`source.py`](viaduck/source.py)). Routing values are pushed down as a SQL `IN` filter. Reads are **chunked** (`poll.cdc_chunk_snapshots` snapshots per read, default 100) with a per-cycle round-robin cap of 4 chunks per group, so one deeply-lagging group can never starve the others. The cycle itself is **time-boxed** (`poll.cycle_time_budget_seconds`, default 0.8 × interval): once the budget trips, unreached groups defer to the next cycle and resume first via a rotating offset — K lagging groups can never stretch a cycle past the interval and slow flush evaluation for everyone. Destinations at their per-destination buffer cap are excluded from each chunk's filter and their position frozen — backpressure is per-destination, not global.
+3. **Cluster by position** — destinations at (or near) the same position share one read-unit read, masked per destination ([`main.py:_position_clusters`](viaduck/main.py)).
+4. **CDC read** — full CDC mode: `table_changes` (inserts, deletes, update pre/post images); append-only mode reads via the **direct-SQL feed** (`source.cdc_reader: direct` — indexed catalog queries + stock parquet scans; the extension's `table_insertions` remains the fallback). The range is half-open `(position, current]` — the position snapshot was already delivered ([`source.py`](viaduck/source.py)). Routing values are pushed down as a SQL `IN` filter. Reads are **row/byte/span-bounded units** (`poll.read_unit_max_rows`/`read_unit_max_bytes`/`read_unit_max_span`), planned against the catalog so the unit lands under the destination commit cliff by construction. Destinations whose positions fit one unit span share the read (cluster fan-in, masked per destination by position); distinct clusters read in parallel on the read pool (`poll.read_workers`). Destinations at their per-destination buffer cap are excluded from the unit's filter and their position frozen — backpressure is per-destination, not global.
 5. **Phase 1: Preimage Resolution** *(full CDC only)* — pair `update_preimage` with `update_postimage` rows by `rowid` (Arrow hash join). Cross-tenant mutations convert the preimage to a delete on the old destination; same-tenant preimages drop; orphaned preimages convert to deletes ([`main.py:_resolve_preimages`](viaduck/main.py)).
 6. **Route** — `split_and_count()` partitions the Arrow table by routing value in a single vectorized pass ([`router.py:split_and_count`](viaduck/router.py)).
 7. **Buffer** — routed batches accumulate in per-destination buffers; the read position advances in memory. Destinations with no routed rows advance position only — zero writes for idle destinations ([`delivery.py:buffer`](viaduck/delivery.py)).
@@ -252,8 +252,9 @@ defaults:
 
 poll:
   interval_seconds: 5                       # how often to poll for new snapshots
-  cdc_chunk_snapshots: 100                  # snapshots per CDC read chunk (bounds read size + flush unit during catch-up)
-  # cycle_time_budget_seconds: 0            # per-cycle wall budget for group reads (0 = derive: 0.8 x interval; <0 = unbounded)
+  read_unit_max_rows: 50000               # rows per CDC read unit (bounds read size + flush unit during catch-up)
+  # read_unit_max_span: 10000             # snapshots per read unit, max
+  # read_workers: 8                       # parallel read-pool connections (direct feed)
 
 state:
   table: "viaduck_state"                    # Postgres cursor table

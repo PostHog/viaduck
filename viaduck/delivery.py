@@ -61,15 +61,19 @@ _ADAPT_GROWTH_MIN_FILL = 0.7
 
 @dataclass
 class _Buffer:
-    # (table, through_snapshot) per buffered CDC chunk: the through value
-    # is what flush-batch SLICING needs — a partial swap's cursor must
-    # advance exactly to the last included chunk's through, never to the
-    # live read position (which covers chunks left behind).
-    # INVARIANT (slice-cursor correctness and the TLA refinement both
-    # stand on it): entries are strictly ascending by through — the poll
-    # thread is the only writer, chunk_end is monotone per group, and
-    # every position REWIND clears the buffer and bumps the epoch.
-    entries: list[tuple[pa.Table, int]] = field(default_factory=list)
+    # (table, cov, hi) per buffered read/slice entry. `cov` is the coverage
+    # watermark a partial swap may persist: the slice-cursor rule (tla/
+    # Viaduck.tla, EntryCoverageInvariant) guarantees no row in a LATER
+    # entry has snapshot <= an earlier entry's cov, so the durable cursor
+    # never passes undelivered data. `hi` is the entry's own max snapshot
+    # (hi > cov is the merged-file straddle shape) — the commit-time replay
+    # drop keys on hi, never on cov. For legacy chunk-contiguous entries
+    # cov == hi == chunk end.
+    # INVARIANT: entries are non-decreasing by cov (equality is reachable
+    # at unit boundaries and when a slice's later-min lands at lo+1) —
+    # the poll thread is the only writer and every position REWIND clears
+    # the buffer and bumps the epoch.
+    entries: list[tuple[pa.Table, int, int]] = field(default_factory=list)
     rows: int = 0
     bytes: int = 0
     first_buffered_at: float | None = None  # monotonic; None when empty
@@ -428,7 +432,9 @@ class DeliveryManager:
         with self._lock:
             return {d: (self._position[d], self._epoch[d]) for d in self._position if d in self._active}
 
-    def buffer(self, dest_id: str, table: pa.Table, through_snapshot: int, epoch: int | None = None) -> None:
+    def buffer(
+        self, dest_id: str, table: pa.Table, through_snapshot: int, epoch: int | None = None, hi: int | None = None
+    ) -> None:
         """Accumulate a routed, Phase-1-resolved batch (BufferRead).
 
         `epoch` is the value captured by read_plan() before the CDC read;
@@ -446,7 +452,7 @@ class DeliveryManager:
                 )
                 return
             buf = self._buffers[dest_id]
-            buf.entries.append((table, through_snapshot))
+            buf.entries.append((table, through_snapshot, hi if hi is not None else through_snapshot))
             buf.rows += table.num_rows
             buf.bytes += table.nbytes
             self._buffered_rows_total[dest_id] += table.num_rows
@@ -552,7 +558,7 @@ class DeliveryManager:
                 # Flush-batch slicing: one swap takes at most
                 # flush_batch_max_rows AND at most the adaptive per-dest
                 # byte target, cut at CHUNK boundaries (a single oversize
-                # chunk still goes whole — cdc_chunk_snapshots bounds
+                # entry still goes whole — poll.read_unit_max_rows bounds
                 # that). Without the rows cap, a slow flush lets the
                 # buffer pile up and the next swap takes everything — the
                 # feedback loop that produced 170-440K-row batches and
@@ -572,7 +578,7 @@ class DeliveryManager:
                     taken_rows = 0
                     taken_bytes = 0
                     take = 0
-                    for tbl, _through in buf.entries:
+                    for tbl, _cov, _hi in buf.entries:
                         if take > 0 and (
                             (cap > 0 and taken_rows + tbl.num_rows > cap)
                             or (byte_cap > 0 and taken_bytes + tbl.nbytes > byte_cap)
@@ -583,7 +589,7 @@ class DeliveryManager:
                         take += 1
                 sliced = buf.entries[:take]
                 remainder = buf.entries[take:]
-                tables = [tbl for tbl, _ in sliced]
+                tables = [tbl for tbl, _cov, _hi in sliced]
                 if remainder:
                     # Cursor for a partial swap: the last included chunk's
                     # through — NOT the live position, which covers the
@@ -595,10 +601,10 @@ class DeliveryManager:
                     # persist-through-position behavior.
                     through = self._position[dest_id]
                 rem_buf = _Buffer()
-                for tbl, thr in remainder:
-                    rem_buf.entries.append((tbl, thr))
-                    rem_buf.rows += tbl.num_rows
-                    rem_buf.bytes += tbl.nbytes
+                for entry in remainder:
+                    rem_buf.entries.append(entry)
+                    rem_buf.rows += entry[0].num_rows
+                    rem_buf.bytes += entry[0].nbytes
                 if remainder:
                     rem_buf.first_buffered_at = buf.first_buffered_at
                     rem_buf.sliced_remainder = True
@@ -861,6 +867,50 @@ class DeliveryManager:
                 if self._position[dest_id] < through:
                     self._position[dest_id] = through
                     self._epoch[dest_id] += 1
+                # Pair-split phantom fix (TLA witness in tla/Viaduck.tla:
+                # BufferRead, FlushStart, PauseDest, BufferRead, FlushCommit,
+                # FlushStart, CrashDuringFlush): the rewind above plus a
+                # racing zombie commit can leave REPLAYED entries in the
+                # buffer whose ranges this commit already covered. A later
+                # sliced flush can split a re-buffered conflicting pair
+                # (insert in one slice, its delete in a later slice) across
+                # a crash boundary: the insert commits, the delete's slice
+                # is dropped, and the cursor — already past it — never
+                # re-reads it: a permanent phantom row. Drop the covered
+                # prefix of the live buffer now: entries with
+                # through <= this commit's through are redundant replays by
+                # construction (the commit covered their range), and
+                # dropping them is the pause's controlled-crash semantics
+                # completed late. The drop keys on the entry's `hi` (its own
+                # max snapshot), per the model's DropCoveredPrefix — for
+                # contiguous units hi == cov; straddle entries (hi > cov)
+                # are NOT droppable by cov, and the model proves why.
+                buf = self._buffers[dest_id]
+                if buf.entries:
+                    drop = 0
+                    for _tbl, _cov, entry_hi in buf.entries:
+                        if entry_hi > through:
+                            break
+                        drop += 1
+                    if drop:
+                        dropped_rows = sum(t.num_rows for t, _, _ in buf.entries[:drop])
+                        buf.entries = buf.entries[drop:]
+                        buf.rows -= dropped_rows
+                        buf.bytes = sum(t.nbytes for t, _, _ in buf.entries)
+                        if not buf.entries:
+                            buf.first_buffered_at = None
+                            buf.sliced_remainder = False
+                        metrics.delivery_buffer_rows.labels(destination=dest_id).set(buf.rows)
+                        metrics.delivery_buffer_bytes.labels(destination=dest_id).set(buf.bytes)
+                        metrics.delivery_covered_replays_dropped_total.labels(destination=dest_id).inc(drop)
+                        log.info(
+                            "Dropped %d covered replay entries (%d rows) for %s after flush through %d "
+                            "(pause/zombie race — the commit covered their ranges)",
+                            drop,
+                            dropped_rows,
+                            dest_id,
+                            through,
+                        )
                 self._rows_replicated[dest_id] = cumulative
                 # Clear the error only when this flush is at/ahead of the
                 # cursor. A zombie flush (through < flushed — a retention

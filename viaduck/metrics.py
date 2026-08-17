@@ -40,6 +40,47 @@ _cdc_rows_read_total = Counter(
     "Total rows read from source via CDC",
     ["pipeline"],
 )
+# Direct-SQL feed (cdc_reader=direct; log-consumer-proposal.md §6.1).
+# surface: catalog (psycopg metadata queries) vs parquet (duckdb data plane) —
+# the split that makes the extension bypass measurable.
+_cdc_feed_query_seconds = Histogram(
+    "viaduck_cdc_feed_query_seconds",
+    "Direct-SQL feed read latency by surface",
+    ["pipeline", "surface"],
+)
+_cdc_feed_files_total = Counter(
+    "viaduck_cdc_feed_files_total",
+    "Data files enumerated by the direct-SQL feed",
+    ["pipeline"],
+)
+_cdc_feed_inlined_rows_total = Counter(
+    "viaduck_cdc_feed_inlined_rows_total",
+    "Rows read from ducklake inline stores by the direct-SQL feed",
+    ["pipeline"],
+)
+# Plan/execute-skew re-plans (a listed file vanished between catalog read and
+# parquet GET — merge/expiry race). Nonzero is expected occasionally during
+# compaction; a sustained rate means the re-plan loop is fighting the
+# compactor and the alert belongs on the flush path, not here.
+_cdc_feed_replans_total = Counter(
+    "viaduck_cdc_feed_replans_total",
+    "Feed reads re-planned after a listed file vanished (plan/execute skew)",
+    ["pipeline"],
+)
+# The absorbing-regime detector (log-consumer-proposal.md §8): distinct
+# read-unit clusters per poll cycle. At head-converged this is 1; a growth
+# trend means cursor scatter is forming — THE regression alarm for the new
+# read loop (its predecessor was the timeboxed-cycles counter).
+_read_clusters = Gauge(
+    "viaduck_read_clusters",
+    "Distinct read-unit clusters dispatched this poll cycle",
+    ["pipeline"],
+)
+_read_pool_inflight = Gauge(
+    "viaduck_read_pool_inflight",
+    "Unit reads dispatched but not yet applied (barrier occupancy)",
+    ["pipeline"],
+)
 # Source columns viaduck refuses to replicate because pyducklake cannot
 # represent their DuckDB type (e.g. VARIANT, which also cannot cross the
 # DuckDB→Arrow boundary as of duckdb 1.5.5). Incremented once per excluded
@@ -229,16 +270,6 @@ _delivery_flush_deadlines_total = Counter(
     "Flushes aborted by the overall flush deadline (retry loop exceeded delivery.flush_deadline_seconds)",
     ["pipeline", "destination"],
 )
-_poll_cycle_timeboxed_total = Counter(
-    "viaduck_poll_cycle_timeboxed_total",
-    "Poll cycles that hit the cycle time budget with cursor groups deferred to the next cycle",
-    ["pipeline"],
-)
-_cdc_snapshots_skipped_total = Counter(
-    "viaduck_cdc_snapshots_skipped_total",
-    "Source snapshots fast-forwarded by the skip-scan probe (no changes to the CDC table) without a CDC read",
-    ["pipeline"],
-)
 _destination_lifecycle_state = Gauge(
     "viaduck_destination_lifecycle_state",
     "1 for the destination's current lifecycle state (active|paused|draining|retired); see viaduck/lifecycle.py",
@@ -345,6 +376,14 @@ _delivery_buffers_dropped_total = Counter(
     "Buffers discarded after a failed flush (range will be re-read)",
     ["pipeline", "destination"],
 )
+# Pair-split phantom fix: entries dropped at flush-commit because the
+# commit already covered their range (pause/zombie replay leftovers).
+# Nonzero is the visible trace of that race having fired.
+_delivery_covered_replays_dropped_total = Counter(
+    "viaduck_delivery_covered_replays_dropped_total",
+    "Buffered replay entries dropped at flush commit (already covered by it)",
+    ["pipeline", "destination"],
+)
 
 # Partition-spec outcomes from `_ensure_partition_spec` (destination.py).
 # Operators need to verify across N destinations after a deploy that
@@ -399,6 +438,12 @@ polls_total = _polls_total
 self_recycles_total = _self_recycles_total
 cdc_read_seconds = _cdc_read_seconds
 cdc_rows_read_total = _cdc_rows_read_total
+cdc_feed_query_seconds = _cdc_feed_query_seconds
+cdc_feed_files_total = _cdc_feed_files_total
+cdc_feed_inlined_rows_total = _cdc_feed_inlined_rows_total
+cdc_feed_replans_total = _cdc_feed_replans_total
+read_clusters = _read_clusters
+read_pool_inflight = _read_pool_inflight
 source_columns_excluded_total = _source_columns_excluded_total
 source_snapshot_id = _source_snapshot_id
 
@@ -432,12 +477,11 @@ delivery_buffer_total_bytes = _delivery_buffer_total_bytes
 delivery_flushes_total = _delivery_flushes_total
 delivery_flush_seconds = _delivery_flush_seconds
 delivery_buffers_dropped_total = _delivery_buffers_dropped_total
+delivery_covered_replays_dropped_total = _delivery_covered_replays_dropped_total
 delivery_reads_paused = _delivery_reads_paused
 delivery_circuit_open = _delivery_circuit_open
 delivery_circuit_opens_total = _delivery_circuit_opens_total
 delivery_flush_deadlines_total = _delivery_flush_deadlines_total
-poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total
-cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total
 destination_lifecycle_state = _destination_lifecycle_state
 lifecycle_discarded_rows_total = _lifecycle_discarded_rows_total
 retention_clamp_total = _retention_clamp_total
@@ -474,7 +518,9 @@ def set_destination_lifecycle(dest_id: str, state: str, all_states) -> None:
 
 def init(pipeline: str):
     """Bind all metrics to a pipeline label. Must be called once at startup."""
-    global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id, cdc_snapshots_skipped_total
+    global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id
+    global cdc_feed_query_seconds, cdc_feed_files_total, cdc_feed_inlined_rows_total, cdc_feed_replans_total
+    global read_clusters, read_pool_inflight
     global self_recycles_total
     global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
@@ -488,9 +534,9 @@ def init(pipeline: str):
     global cdc_tombstones_emitted_total
     global delivery_buffer_rows, delivery_buffer_bytes, delivery_buffer_total_bytes
     global delivery_flushes_total, delivery_flush_seconds, delivery_buffers_dropped_total
+    global delivery_covered_replays_dropped_total
     global delivery_reads_paused, destination_lifecycle_state, lifecycle_discarded_rows_total
     global delivery_circuit_open, delivery_circuit_opens_total, delivery_flush_deadlines_total
-    global poll_cycle_timeboxed_total
     global retention_clamp_total, secret_cache_stale_fallback_total
     global discovery_synced, discovery_config_generation, discovery_last_success_timestamp_seconds
     global discovery_poll_failures_total, discovery_broken_entries_total
@@ -508,6 +554,7 @@ def init(pipeline: str):
     delivery_flushes_total = _AutoPipelineLabels(_delivery_flushes_total, pipeline)
     delivery_flush_seconds = _AutoPipelineLabels(_delivery_flush_seconds, pipeline)
     delivery_buffers_dropped_total = _AutoPipelineLabels(_delivery_buffers_dropped_total, pipeline)
+    delivery_covered_replays_dropped_total = _AutoPipelineLabels(_delivery_covered_replays_dropped_total, pipeline)
     delivery_reads_paused = _AutoPipelineLabels(_delivery_reads_paused, pipeline)
     delivery_circuit_open = _AutoPipelineLabels(_delivery_circuit_open, pipeline)
     delivery_circuit_opens_total = _AutoPipelineLabels(_delivery_circuit_opens_total, pipeline)
@@ -548,10 +595,14 @@ def init(pipeline: str):
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
     self_recycles_total = _self_recycles_total.labels(pipeline=pipeline)
-    poll_cycle_timeboxed_total = _poll_cycle_timeboxed_total.labels(pipeline=pipeline)
-    cdc_snapshots_skipped_total = _cdc_snapshots_skipped_total.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
+    cdc_feed_query_seconds = _AutoPipelineLabels(_cdc_feed_query_seconds, pipeline)
+    cdc_feed_files_total = _cdc_feed_files_total.labels(pipeline=pipeline)
+    cdc_feed_inlined_rows_total = _cdc_feed_inlined_rows_total.labels(pipeline=pipeline)
+    cdc_feed_replans_total = _cdc_feed_replans_total.labels(pipeline=pipeline)
+    read_clusters = _read_clusters.labels(pipeline=pipeline)
+    read_pool_inflight = _read_pool_inflight.labels(pipeline=pipeline)
     source_columns_excluded_total = _AutoPipelineLabels(_source_columns_excluded_total, pipeline)
     source_snapshot_id = _source_snapshot_id.labels(pipeline=pipeline)
     delivery_buffer_total_bytes = _delivery_buffer_total_bytes.labels(pipeline=pipeline)

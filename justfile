@@ -208,6 +208,16 @@ tlc-reshard:
 tlc-reshard-unguarded:
     cd tla && tlc Reshard.tla -config ReshardUnguarded.cfg -workers auto
 
+# M4 reader-pool guard (two-phase reads): guarded run must PASS.
+tlc-reads:
+    cd tla && tlc ViaduckReads.tla -config ViaduckReads.cfg -workers auto
+
+# Negative proof: the UNGUARDED dispatch must FAIL with a ReadOrderSafety
+# violation — if this ever passes, the in-flight read guard stopped being
+# load-bearing (or the model did).
+tlc-reads-unguarded:
+    cd tla && tlc ViaduckReads.tla -config ViaduckReadsUnguarded.cfg -workers auto
+
 # Run TLA+ model checker with verbose output (shows state count per depth)
 [group('verify')]
 tlc-verbose:

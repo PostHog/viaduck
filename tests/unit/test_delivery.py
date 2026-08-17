@@ -1730,3 +1730,58 @@ def test_startup_warn_counts_assigned_overrides_only(caplog):
     msg = warn.getMessage()
     assert "6000" in msg  # cap_sum = 5000 (d1 override) + 1000 (d2 default)
     assert "(1 override(s) + default 1000 x 1)" in msg
+
+
+def test_flush_commit_drops_covered_replay_entries():
+    """The pair-split phantom chain (TLA witness in tla/Viaduck.tla):
+    full-swap flush in flight -> pause rewinds position -> replay re-buffers
+    the same range -> zombie commits -> the covered replay entries must be
+    dropped, or a later sliced flush can split a conflicting pair across a
+    crash boundary into a permanent phantom."""
+    import threading
+
+    mgr, sm, pool = _manager(("d1",), flush_max_rows=1)
+    apply_gate = threading.Event()
+
+    def gated_append(_pool, _dest, batch, **_kw):
+        apply_gate.wait(10)
+        return batch.num_rows
+
+    ins = pa.table({"company": ["acme"], "value": [1]})
+    del_ = pa.table({"company": ["acme"], "value": [2]})
+    later = pa.table({"company": ["acme"], "value": [3]})
+
+    with patch("viaduck.delivery.append_only", side_effect=gated_append):
+        # 1. Buffer the pair; flush takes the full swap (through=20).
+        mgr.buffer("d1", ins, 10, epoch=0)
+        mgr.buffer("d1", del_, 20, epoch=0)
+        assert mgr.maybe_flush() == 1
+        # In flight now; _flush is parked inside apply.
+        import time
+
+        for _ in range(100):
+            if "d1" in mgr.inflight_ids():
+                break
+            time.sleep(0.01)
+
+        # 2. Pause: position rewinds to cursor (0), epoch bumped.
+        mgr.discard_buffer("d1")
+        _, epoch = mgr.read_plan()["d1"]
+
+        # 3. Replay re-buffers the pair + one entry PAST the zombie's range.
+        mgr.buffer("d1", ins, 10, epoch=epoch)
+        mgr.buffer("d1", del_, 20, epoch=epoch)
+        mgr.buffer("d1", later, 30, epoch=epoch)
+        assert mgr._buffers["d1"].rows == 3
+
+        # 4. Zombie commits.
+        apply_gate.set()
+        assert mgr.wait_idle(10)
+
+    # Covered replay entries (through <= 20) dropped; the post-range entry
+    # survives. Positions/cursors are at the zombie's through.
+    buf = mgr._buffers["d1"]
+    assert [t.num_rows for t, _, _ in buf.entries] == [1]
+    assert buf.entries[0][1] == 30
+    assert buf.rows == 1
+    assert mgr._flushed["d1"] == 20
