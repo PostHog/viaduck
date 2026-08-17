@@ -74,6 +74,25 @@ from viaduck.state import StateManager
 log = logging.getLogger(__name__)
 
 
+def _build_feed_reader(cfg) -> feed.FeedReader | None:
+    """Construct the direct-SQL feed reader when source.cdc_reader=direct.
+
+    The chart's SOURCE_POSTGRES_URI is DuckDB-ATTACH format
+    (postgres:host=…) which psycopg rejects verbatim — same translation the
+    StateManager already gets (review F2)."""
+    if cfg.source.cdc_reader != "direct":
+        return None
+    _validate_feed_mode(cfg)
+    reader = feed.FeedReader(
+        postgres_uri=config._to_libpq_conninfo(cfg.source.postgres_uri),
+        catalog_name=cfg.source.name,
+        data_path=cfg.source.data_path,
+    )
+    reader.verify_catalog()
+    log.info("Direct-SQL feed reader enabled for source %s", cfg.source.name)
+    return reader
+
+
 def _validate_feed_mode(cfg) -> None:
     """source.cdc_reader=direct requires append_only: the feed implements
     table_insertions semantics only (no delete stream). Startup refuses the
@@ -715,19 +734,7 @@ def run(cfg: config.ViaduckConfig) -> None:
     # and preimage resolution have no feed implementation (fail loudly at
     # startup rather than silently reading inserts-only). The extension path
     # stays as the rollback while the flag exists.
-    feed_reader = None
-    if cfg.source.cdc_reader == "direct":
-        _validate_feed_mode(cfg)
-        feed_reader = feed.FeedReader(
-            # The chart's SOURCE_POSTGRES_URI is DuckDB-ATTACH format
-            # (postgres:host=…) which psycopg rejects verbatim — same
-            # translation the StateManager already gets (review F2).
-            postgres_uri=config._to_libpq_conninfo(cfg.source.postgres_uri),
-            catalog_name=cfg.source.name,
-            data_path=cfg.source.data_path,
-        )
-        feed_reader.verify_catalog()
-        log.info("Direct-SQL feed reader enabled for source %s", cfg.source.name)
+    feed_reader = _build_feed_reader(cfg)
 
     # Read pool: the feed's parallel data plane. Legacy extension mode stays
     # serial on the source connection (the extension path is one query slot).

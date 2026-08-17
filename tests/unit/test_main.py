@@ -17,6 +17,7 @@ from viaduck.apply import (
     append_only,
 )
 from viaduck.main import (
+    _build_feed_reader,
     _clamp_expired_cursors,
     _derive_dest_status,
     _fmt_duration,
@@ -216,6 +217,33 @@ def test_poll_cycle_feed_reader_dispatch():
     assert feed_reader.plan_unit.call_args.args[1] == 5
     assert feed_reader.plan_unit.call_args.args[2] == 10
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
+
+
+def test_build_feed_reader_translates_attach_format_uri():
+    """The chart secret is DuckDB-ATTACH format (postgres:host=…); the feed's
+    psycopg needs libpq conninfo. Pins the translation at the construction
+    site (review F2) — the helper-level test alone doesn't pin this wiring."""
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+    cfg.source.cdc_reader = "direct"
+    cfg.source.postgres_uri = "postgres:host=rds.example port=5432 dbname=megaduck user=m password=pw"
+    cfg.source.name = "megaduck"
+    cfg.source.data_path = "s3://bucket/path"
+    cfg.routing.mode = "append_only"
+
+    with patch("viaduck.main.feed.FeedReader") as cls:
+        reader = _build_feed_reader(cfg)
+
+    assert reader is cls.return_value
+    assert cls.call_args.kwargs["postgres_uri"] == "host=rds.example port=5432 dbname=megaduck user=m password=pw"
+    assert cls.call_args.kwargs["catalog_name"] == "megaduck"
+    assert cls.call_args.kwargs["data_path"] == "s3://bucket/path"
+    cls.return_value.verify_catalog.assert_called_once_with()
+
+
+def test_build_feed_reader_none_on_extension_mode():
+    cfg = _make_cfg([("dest-1", "quacksworth")])
+    cfg.source.cdc_reader = "ducklake"
+    assert _build_feed_reader(cfg) is None
 
 
 def test_poll_cycle_feed_reader_refused_in_full_cdc():
