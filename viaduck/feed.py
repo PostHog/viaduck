@@ -728,7 +728,14 @@ def execute_read(conn, plan: _PlannedRead) -> pa.Table | None:
     for begin, paths in plan.plain_groups:
         if not paths:
             continue
-        snap_col = f", {int(begin)} AS {_SNAP_OUT}" if plan.with_snapshot else ""
+        # CAST is load-bearing: DuckDB types a bare literal that fits in
+        # 32 bits as INTEGER, so without it plain parts carry an int32
+        # attribution column while merged-file parts carry the physical
+        # BIGINT column — and concat_tables refuses to unify the widths.
+        # Only a unit mixing plain + merged files hits the mismatch,
+        # which is why this survived until a compaction commit landed
+        # inside an active read range (prod wedge, 2026-08-18).
+        snap_col = f", CAST({int(begin)} AS BIGINT) AS {_SNAP_OUT}" if plan.with_snapshot else ""
         sql = f"SELECT {proj_sql}{snap_col} FROM parquet_scan({_path_list_sql(paths)})"
         if plan.filter_expr:
             sql += f" WHERE {plan.filter_expr}"
@@ -736,14 +743,14 @@ def execute_read(conn, plan: _PlannedRead) -> pa.Table | None:
     if plan.partial_unfiltered:
         # Contained merged files need no filter; attribution still
         # available via the physical column when requested.
-        phys = f", {_PHYSICAL_SNAPSHOT_COL} AS {_SNAP_OUT}" if plan.with_snapshot else ""
+        phys = f", CAST({_PHYSICAL_SNAPSHOT_COL} AS BIGINT) AS {_SNAP_OUT}" if plan.with_snapshot else ""
         sql = f"SELECT {proj_sql}{phys} FROM parquet_scan({_path_list_sql(plan.partial_unfiltered)})"
         if plan.filter_expr:
             sql += f" WHERE {plan.filter_expr}"
         parts.append(_align_temporal_types(conn.execute(sql).to_arrow_table(), plan.target_schema))
     if plan.partial_filtered:
         paths_sql = _path_list_sql(plan.partial_filtered)
-        inner_snap = f"{_PHYSICAL_SNAPSHOT_COL} AS {_SNAP_OUT}"
+        inner_snap = f"CAST({_PHYSICAL_SNAPSHOT_COL} AS BIGINT) AS {_SNAP_OUT}"
         sql = (
             f"SELECT {proj_sql}{snap_select} FROM ("
             f"SELECT *, {inner_snap} FROM parquet_scan({paths_sql})) "
