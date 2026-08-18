@@ -414,3 +414,47 @@ class TestPlanUnit:
     def test_empty_range_advances_by_span(self):
         r = self._reader([], inline_groups=[])
         assert r.plan_unit(MagicMock(), 5, 100, max_span=10) == 15
+
+
+class TestExecuteReadSnapTypeUnity:
+    """Prod wedge 2026-08-18: a unit mixing a plain file (attribution via
+    an injected literal — DuckDB types a 32-bit-fitting literal INTEGER)
+    with a compaction-merged file (attribution via the physical BIGINT
+    column) produced int32 vs int64 __viaduck_snap parts, and
+    pa.concat_tables refused to unify them. Every read wedged at the
+    first compaction commit inside an active range. Pins int64 at all
+    three construction sites, through the real execute_read with real
+    parquet files (duckdb is NOT mocked here — the literal typing is the
+    bug)."""
+
+    def test_mixed_plain_and_merged_parts_concat_as_int64(self, tmp_path):
+        duckdb = pytest.importorskip("duckdb")
+        conn = duckdb.connect()
+        plain = str(tmp_path / "plain.parquet")
+        merged = str(tmp_path / "merged.parquet")
+        straddle = str(tmp_path / "straddle.parquet")
+        conn.execute(f"COPY (SELECT 1::BIGINT AS v) TO '{plain}' (FORMAT PARQUET)")
+        conn.execute(
+            "COPY (SELECT 2::BIGINT AS v, 24911300::BIGINT AS _ducklake_internal_snapshot_id) "
+            f"TO '{merged}' (FORMAT PARQUET)"
+        )
+        conn.execute(
+            "COPY (SELECT 3::BIGINT AS v, 24911310::BIGINT AS _ducklake_internal_snapshot_id) "
+            f"TO '{straddle}' (FORMAT PARQUET)"
+        )
+        plan = feed._PlannedRead(
+            plain_groups=[(24911293, [plain])],
+            partial_unfiltered=[merged],
+            partial_filtered=[straddle],
+            inline_rows=[],
+            after_snapshot=24911290,
+            end_snapshot=24911400,
+            data_columns=("v",),
+            filter_expr=None,
+            with_snapshot=True,
+            target_schema=pa.schema([("v", pa.int64())]),
+        )
+        out = feed.execute_read(conn, plan)
+        assert out.num_rows == 3
+        assert out.schema.field("__viaduck_snap").type == pa.int64()
+        assert sorted(out.column("__viaduck_snap").to_pylist()) == [24911293, 24911300, 24911310]
