@@ -35,6 +35,15 @@ def setup_module():
     metrics.init("test")
 
 
+def _feed_mock(hi: int):
+    """Feed-mode wiring for poll-cycle tests: plan_unit returns hi, plan_read
+    returns a token; pair with patch('viaduck.main.feed.execute_read')."""
+    fr = MagicMock()
+    fr.plan_unit.return_value = hi
+    fr.plan_read.return_value = object()
+    return fr
+
+
 def _make_cfg(dest_ids_and_rvs: list[tuple[str, str]]):
     """Create a mock config with given (dest_id, routing_value) pairs."""
     cfg = MagicMock()
@@ -158,7 +167,7 @@ def test_poll_cycle_routes_and_buffers():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data),
     ):
         _poll_cycle(
             MagicMock(),
@@ -171,6 +180,7 @@ def test_poll_cycle_routes_and_buffers():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(10),
         )
 
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
@@ -179,7 +189,7 @@ def test_poll_cycle_routes_and_buffers():
 
 
 def test_poll_cycle_feed_reader_dispatch():
-    """cdc_reader=direct: the poll loop reads via the feed, never read_cdc."""
+    """The poll loop reads via the feed."""
     delivery = _make_delivery({"dest-1": 5})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
@@ -194,7 +204,6 @@ def test_poll_cycle_feed_reader_dispatch():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc") as ext_read,
         patch("viaduck.main.feed.execute_read", return_value=arrow_data) as feed_exec,
     ):
         _poll_cycle(
@@ -211,7 +220,6 @@ def test_poll_cycle_feed_reader_dispatch():
             feed_reader=feed_reader,
         )
 
-    ext_read.assert_not_called()
     assert feed_exec.call_count == 1
     # planned on the poll thread: unit range (5, 10]
     assert feed_reader.plan_unit.call_args.args[1] == 5
@@ -224,7 +232,6 @@ def test_build_feed_reader_translates_attach_format_uri():
     psycopg needs libpq conninfo. Pins the translation at the construction
     site (review F2) — the helper-level test alone doesn't pin this wiring."""
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    cfg.source.cdc_reader = "direct"
     cfg.source.postgres_uri = "postgres:host=rds.example port=5432 dbname=megaduck user=m password=pw"
     cfg.source.name = "megaduck"
     cfg.source.data_path = "s3://bucket/path"
@@ -240,9 +247,10 @@ def test_build_feed_reader_translates_attach_format_uri():
     cls.return_value.verify_catalog.assert_called_once_with()
 
 
-def test_build_feed_reader_none_on_extension_mode():
+def test_build_feed_reader_none_for_full_cdc():
+    """full_cdc sources keep the extension path (the feed has no delete stream)."""
     cfg = _make_cfg([("dest-1", "quacksworth")])
-    cfg.source.cdc_reader = "ducklake"
+    cfg.routing.mode = "full_cdc"
     assert _build_feed_reader(cfg) is None
 
 
@@ -277,7 +285,7 @@ def test_poll_cycle_empty_changeset_advances_positions():
     empty = pa.table({"company": pa.array([], type=pa.string())})
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=empty),
+        patch("viaduck.main.feed.execute_read", return_value=empty),
     ):
         _poll_cycle(
             MagicMock(),
@@ -290,6 +298,7 @@ def test_poll_cycle_empty_changeset_advances_positions():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(10),
         )
 
     assert delivery.advance_position.call_count == 2
@@ -310,7 +319,7 @@ def test_poll_cycle_routing_error_breaks_gracefully():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data),
     ):
         _poll_cycle(
             MagicMock(),
@@ -323,6 +332,7 @@ def test_poll_cycle_routing_error_breaks_gracefully():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(10),
         )
 
     delivery.buffer.assert_not_called()
@@ -341,15 +351,9 @@ def test_poll_cycle_chunks_large_range():
     router.build_filter_expr.return_value = None
     router.split_and_count.return_value = ({"quacksworth": arrow_data}, 0)
 
-    read_calls = []
-
-    def fake_read_cdc(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
-        read_calls.append((after_snapshot, end_snapshot))
-        return arrow_data
-
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", side_effect=fake_read_cdc),
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data),
     ):
         _poll_cycle(
             MagicMock(),
@@ -362,9 +366,11 @@ def test_poll_cycle_chunks_large_range():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=(feed := _feed_mock(5)),
         )
 
-    assert read_calls == [(0, 5)], f"expected one span-bounded unit read, got {read_calls}"
+    # the unit boundary flows through plan_read's (lo, hi)
+    assert feed.plan_read.call_args.args[1:3] == (0, 5)
     buffer_calls = delivery.buffer.call_args_list
     assert len(buffer_calls) == 1
     assert buffer_calls[0] == call("dest-1", arrow_data, 5, epoch=0)
@@ -380,19 +386,12 @@ def test_poll_cycle_chunk_end_not_current_id():
     cfg.poll.read_unit_max_span = 3  # unit 0→3 this cycle
 
     row_a = pa.table({"company": ["a"]})
-    empty = pa.table({"company": pa.array([], type=pa.string())})
-    call_count = [0]
-
-    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
-        call_count[0] += 1
-        return row_a if call_count[0] == 1 else empty
-
     router.build_filter_expr.return_value = None
     router.split_and_count.return_value = ({"a": row_a}, 0)
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 7)),
-        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+        patch("viaduck.main.feed.execute_read", return_value=row_a),
     ):
         _poll_cycle(
             MagicMock(),
@@ -405,6 +404,7 @@ def test_poll_cycle_chunk_end_not_current_id():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(3),
         )
 
     # Unit (0→3]: dest-1 buffered at 3, dest-2 advanced to 3.
@@ -424,7 +424,7 @@ def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=empty),
+        patch("viaduck.main.feed.execute_read", return_value=empty),
     ):
         _poll_cycle(
             MagicMock(),
@@ -437,6 +437,7 @@ def test_poll_cycle_multi_chunk_all_empty_flushes_per_chunk():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(5),
         )
 
     # One span-bounded unit per cycle: position advances to the unit hi (5);
@@ -458,7 +459,7 @@ def test_poll_cycle_advances_no_data_destinations():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data),
     ):
         _poll_cycle(
             MagicMock(),
@@ -471,6 +472,7 @@ def test_poll_cycle_advances_no_data_destinations():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(10),
         )
 
     delivery.buffer.assert_called_once_with("dest-1", arrow_data, 10, epoch=0)
@@ -518,7 +520,7 @@ def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=empty),
+        patch("viaduck.main.feed.execute_read", return_value=empty),
     ):
         _poll_cycle(
             MagicMock(),
@@ -531,6 +533,7 @@ def test_poll_cycle_mid_chunk_watermark_flushes_completed_chunks():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(5),
         )
 
     # unit 0→5 completed: position advanced and flushed.
@@ -559,19 +562,13 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
     # the FIRST chunk read: lagging group's chunk-1 check False (one read),
     # chunk-2 check True (cap filled); the caught-up group's chunk-1 check
     # True (also at cap). Whichever group iterates first gets the only read.
-    delivery.should_pause_reads_for.side_effect = [False, True, True]
-
-    read_calls: list[tuple[int, int]] = []
-
-    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
-        read_calls.append((after_snapshot, end_snapshot))
-        return pa.table({"company": pa.array([], type=pa.string())})
+    delivery.should_pause_reads_for.side_effect = lambda d: d == "dest-caughtup"
 
     router.build_filter_expr.return_value = None
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 1000)),
-        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+        patch("viaduck.main.feed.execute_read", return_value=pa.table({"company": pa.array([], type=pa.string())})),
     ):
         _poll_cycle(
             MagicMock(),
@@ -584,16 +581,16 @@ def test_poll_cycle_reads_lowest_cursor_group_first():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=(feed := _feed_mock(300)),
         )
 
     # Only one read should have happened (the second group's chunk was
     # paused). It MUST have been the lagging group (starting at 100), not
     # the caught-up group (starting at 900).
-    assert len(read_calls) == 1, f"expected exactly one read before watermark trip, got {read_calls}"
-    assert read_calls[0][0] == 100, (
-        f"lagging cursor should have read first; instead read started at {read_calls[0][0]} "
-        f"(the config-order-first, caught-up destination)"
-    )
+    # The lagging cluster reads; the at-cap caught-up destination was
+    # excluded from cluster formation entirely.
+    feed.plan_unit.assert_called_once()
+    assert feed.plan_unit.call_args.args[1] == 100
 
 
 def test_poll_cycle_stuck_destination_at_cap_does_not_block_healthy_peer():
@@ -615,17 +612,11 @@ def test_poll_cycle_stuck_destination_at_cap_does_not_block_healthy_peer():
     # group reads.
     delivery.should_pause_reads_for.side_effect = lambda d: d == "dest-stuck"
 
-    read_calls: list[tuple[int, int]] = []
-
-    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
-        read_calls.append((after_snapshot, end_snapshot))
-        return pa.table({"company": pa.array([], type=pa.string())})
-
     router.build_filter_expr.return_value = None
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 1000)),
-        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+        patch("viaduck.main.feed.execute_read", return_value=pa.table({"company": pa.array([], type=pa.string())})),
     ):
         _poll_cycle(
             MagicMock(),
@@ -638,12 +629,13 @@ def test_poll_cycle_stuck_destination_at_cap_does_not_block_healthy_peer():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=(feed := _feed_mock(1000)),
         )
 
     # The healthy destination read its range; the stuck one was skipped.
-    assert read_calls == [(900, 1000)], (
-        f"healthy peer must read while the stuck destination sits at its cap, got {read_calls}"
-    )
+    # The healthy peer's cluster reads; the stuck destination never plans.
+    feed.plan_unit.assert_called_once()
+    assert feed.plan_unit.call_args.args[1] == 900
 
 
 def test_poll_cycle_mixed_group_reads_only_members_with_headroom():
@@ -677,7 +669,7 @@ def test_poll_cycle_mixed_group_reads_only_members_with_headroom():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 300)),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data),
     ):
         _poll_cycle(
             MagicMock(),
@@ -690,6 +682,7 @@ def test_poll_cycle_mixed_group_reads_only_members_with_headroom():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(300),
         )
 
     # The CDC filter only ever asked for the healthy member's rows.
@@ -720,17 +713,22 @@ def test_poll_cycle_lagging_group_cannot_monopolize_reads():
     cfg = _make_cfg([("dest-lagging", "lag"), ("dest-healthy", "ok")])
     cfg.poll.read_unit_max_span = 100
 
-    read_calls: list[tuple[int, int]] = []
+    plan_calls: list[tuple[int, int]] = []
 
-    def fake_read(src_table, *, after_snapshot, end_snapshot, filter_expr=None, columns=None):
-        read_calls.append((after_snapshot, end_snapshot))
-        return pa.table({"company": pa.array([], type=pa.string())})
+    def fake_plan(table, lo, hi, **kw):
+        plan_calls.append((lo, hi))
+        return object()
 
     router.build_filter_expr.return_value = None
 
+    feed = _feed_mock(None)
+    # plan_read records the unit boundaries; plan_unit per cluster
+    feed.plan_unit.side_effect = [100, 10_000]
+    feed.plan_read.side_effect = fake_plan
+
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10_000)),
-        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+        patch("viaduck.main.feed.execute_read", return_value=pa.table({"company": pa.array([], type=pa.string())})),
     ):
         _poll_cycle(
             MagicMock(),
@@ -743,15 +741,12 @@ def test_poll_cycle_lagging_group_cannot_monopolize_reads():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=feed,
         )
 
-    # The lagging cluster read exactly one span-bounded unit.
-    lagging_reads = [c for c in read_calls if c[0] < 9_900]
-    assert lagging_reads == [(0, 100)], f"lagging cluster reads one bounded unit per cycle, got {lagging_reads}"
-    # The healthy cluster STILL got its read this cycle — the load-bearing
-    # assertion. Under the retired serial loop this was not guaranteed.
-    healthy_reads = [c for c in read_calls if c[0] >= 9_900]
-    assert healthy_reads == [(9_900, 10_000)], f"healthy cluster must read within the same cycle, got {healthy_reads}"
+    # Both clusters read in the same cycle: the lagging cluster gets one
+    # span-bounded unit (0, 100], the healthy cluster its own (9900, 10000].
+    assert sorted(plan_calls) == [(0, 100), (9900, 10000)]
 
 
 def test_poll_cycle_snapshot_at_zero():
@@ -1337,7 +1332,7 @@ def test_apply_changes_strips_metadata():
 
 
 def test_append_only_accepts_insert_only_batch():
-    """The expected source.read_cdc shape (ducklake_table_insertions output)
+    """The expected read shape (ducklake_table_insertions output)
     has no `change_type` column — those rows flow straight through to
     tbl.append(). Sanity-check that the defensive guard doesn't reject the
     happy path."""
@@ -1348,7 +1343,7 @@ def test_append_only_accepts_insert_only_batch():
         {
             "company": ["acme"],
             "value": [1],
-            # NOTE: snapshot_id/rowid are present (read_cdc returns them) but
+            # NOTE: snapshot_id/rowid are present (the read returns them) but
             # `change_type` is NOT — that's the insert-only contract from
             # ducklake_table_insertions.
             "snapshot_id": [1],
@@ -1490,7 +1485,7 @@ def test_poll_cycle_full_cdc_routes_and_writes():
 
 
 def test_poll_cycle_append_only_unchanged():
-    """Append-only mode uses read_cdc and table.append (on the worker)."""
+    """Append-only mode uses the feed read and table.append (on the worker)."""
     state_mgr = MagicMock()
     dest_pool = MagicMock()
     dest_pool.projection_for.return_value = None
@@ -1509,7 +1504,7 @@ def test_poll_cycle_append_only_unchanged():
     delivery = _make_real_delivery(state_mgr, dest_pool, [], ["dest-1"], mode="append_only")
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data) as mock_read_cdc,
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data) as mock_read_cdc,
         patch("viaduck.main.source.read_cdc_changes") as mock_read_changes,
     ):
         _poll_cycle(
@@ -1523,6 +1518,7 @@ def test_poll_cycle_append_only_unchanged():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(10),
         )
     assert delivery.wait_idle()
 
@@ -1719,7 +1715,7 @@ def test_poll_cycle_branches_on_key_columns():
     delivery = _make_delivery({"dest-1": 5})
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data) as mock_read_cdc,
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data) as mock_read_cdc,
         patch("viaduck.main.source.read_cdc_changes") as mock_read_changes,
     ):
         _poll_cycle(
@@ -1733,6 +1729,7 @@ def test_poll_cycle_branches_on_key_columns():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(10),
         )
         mock_read_cdc.assert_called_once()
         mock_read_changes.assert_not_called()
@@ -1746,7 +1743,6 @@ def test_poll_cycle_branches_on_key_columns():
     delivery = _make_delivery({"dest-1": 5})
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc") as mock_read_cdc2,
         patch("viaduck.main.source.read_cdc_changes", return_value=cdc_data) as mock_read_changes2,
     ):
         _poll_cycle(
@@ -1762,7 +1758,6 @@ def test_poll_cycle_branches_on_key_columns():
             source_columns=None,
         )
         mock_read_changes2.assert_called_once()
-        mock_read_cdc2.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1983,7 +1978,7 @@ def test_cdc_batch_rows_metric_observed():
     delivery = _make_delivery({"dest-1": 5})
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", return_value=arrow_data),
+        patch("viaduck.main.feed.execute_read", return_value=arrow_data),
         patch("viaduck.main.metrics.cdc_batch_rows") as mock_batch_metric,
     ):
         _poll_cycle(
@@ -1997,6 +1992,7 @@ def test_cdc_batch_rows_metric_observed():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(10),
         )
 
     mock_batch_metric.observe.assert_called_once_with(3)
@@ -3286,7 +3282,7 @@ def test_poll_cycle_clamps_before_reading_and_reads_from_floor():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(100, 120)),
-        patch("viaduck.main.source.read_cdc", return_value=pa.table({"company": pa.array([], type=pa.string())})) as rc,
+        patch("viaduck.main.feed.execute_read", return_value=pa.table({"company": pa.array([], type=pa.string())})),
         patch("viaduck.main._export_dest_time_lag"),
     ):
         _poll_cycle(
@@ -3300,10 +3296,11 @@ def test_poll_cycle_clamps_before_reading_and_reads_from_floor():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=(feed := _feed_mock(120)),
         )
 
     delivery.clamp_to_retention.assert_called_once_with("dest-1", 99)
-    assert rc.call_args.kwargs["after_snapshot"] == 99
+    assert feed.plan_unit.call_args.args[1] == 99  # reads from the floor
 
 
 def test_poll_cycle_excludes_destination_whose_clamp_failed():
@@ -3315,7 +3312,7 @@ def test_poll_cycle_excludes_destination_whose_clamp_failed():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(100, 120)),
-        patch("viaduck.main.source.read_cdc") as rc,
+        patch("viaduck.main.feed.execute_read") as rc,
         patch("viaduck.main._export_dest_time_lag"),
     ):
         _poll_cycle(
@@ -3329,10 +3326,12 @@ def test_poll_cycle_excludes_destination_whose_clamp_failed():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=(feed := _feed_mock(120)),
         )
 
     # The expired destination sat the cycle out instead of fataling it.
     rc.assert_not_called()
+    feed.plan_unit.assert_not_called()
 
 
 def test_poll_cycle_contains_group_read_failure():
@@ -3346,7 +3345,7 @@ def test_poll_cycle_contains_group_read_failure():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 120)),
-        patch("viaduck.main.source.read_cdc", side_effect=RuntimeError("range expired mid-cycle")),
+        patch("viaduck.main.feed.execute_read", side_effect=RuntimeError("range expired mid-cycle")),
         patch("viaduck.main._export_dest_time_lag"),
     ):
         _poll_cycle(
@@ -3360,6 +3359,7 @@ def test_poll_cycle_contains_group_read_failure():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=_feed_mock(120),
         )
 
     delivery.maybe_flush.assert_called()
@@ -3631,10 +3631,10 @@ def test_poll_cycle_plan_phase_failure_contained():
     delivery.maybe_flush.assert_called_once()  # end-of-cycle flush eval still runs
 
 
-def test_poll_cycle_legacy_clusters_exact_positions_only():
-    """Legacy/full_cdc reads cannot mask (no per-row snapshot): span merging
-    is OFF (span_cap=0), so members at different positions NEVER share a
-    read — else (lo, pos] rows would be re-delivered every cycle."""
+def test_poll_cycle_full_cdc_clusters_exact_positions_only():
+    """full_cdc reads cannot mask (no per-row snapshot): span merging is OFF
+    (span_cap=0), so members at different positions NEVER share a read —
+    else (lo, pos] rows would be re-delivered every cycle."""
     delivery = _make_delivery({"dest-a": 5, "dest-b": 8})
     router = MagicMock()
     cfg = _make_cfg([("dest-a", "a"), ("dest-b", "b")])
@@ -3649,7 +3649,7 @@ def test_poll_cycle_legacy_clusters_exact_positions_only():
 
     with (
         patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)),
-        patch("viaduck.main.source.read_cdc", side_effect=fake_read),
+        patch("viaduck.main.source.read_cdc_changes", side_effect=fake_read),
     ):
         _poll_cycle(
             MagicMock(),
@@ -3659,22 +3659,24 @@ def test_poll_cycle_legacy_clusters_exact_positions_only():
             cfg,
             ["dest-a", "dest-b"],
             {"a": "dest-a", "b": "dest-b"},
-            key_columns=[],
-            mode="append_only",
+            key_columns=["id"],
+            mode="full_cdc",
             source_columns=None,
         )
 
     # Two separate reads at the exact positions — NOT one merged (5, 10].
-    assert sorted(read_calls) == [(5, 10), (8, 10)], f"legacy mode must not span-merge, got {read_calls}"
+    assert sorted(read_calls) == [(5, 10), (8, 10)], f"full_cdc must not span-merge, got {read_calls}"
 
 
 def test_poll_cycle_pool_failure_contained():
     """A pool future raising at result() skips only its cluster; the peer
     cluster still applies (the barrier's containment works on real
-    concurrent.futures)."""
+    concurrent.futures). Positions are far apart: within span-cap they would
+    now MERGE into one masked cluster (the feed's per-row attribution) —
+    two clusters need a gap > span cap."""
     import concurrent.futures
 
-    delivery = _make_delivery({"dest-a": 5, "dest-b": 8})
+    delivery = _make_delivery({"dest-a": 5, "dest-b": 20_000})
     router = MagicMock()
     cfg = _make_cfg([("dest-a", "a"), ("dest-b", "b")])
     router.build_filter_expr.return_value = None
@@ -3684,13 +3686,16 @@ def test_poll_cycle_pool_failure_contained():
     f_fail = concurrent.futures.Future()
     f_fail.set_exception(RuntimeError("read exploded"))
     f_ok = concurrent.futures.Future()
-    f_ok.set_result((arrow_data, 10))
+    f_ok.set_result((arrow_data, 30_000))
 
     class FakePool:
         def submit(self, fn, **kwargs):
             return f_fail if kwargs["lo"] == 5 else f_ok
 
-    with patch("viaduck.main.source.snapshot_bounds", return_value=(1, 10)):
+    feed = _feed_mock(None)
+    feed.plan_unit.side_effect = [10, 30_000]
+
+    with patch("viaduck.main.source.snapshot_bounds", return_value=(1, 30_000)):
         _poll_cycle(
             MagicMock(),
             delivery,
@@ -3702,6 +3707,7 @@ def test_poll_cycle_pool_failure_contained():
             key_columns=[],
             mode="append_only",
             source_columns=None,
+            feed_reader=feed,
             read_pool=FakePool(),
         )
 

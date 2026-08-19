@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 
-import duckdb
 import pyarrow as pa
 import pytest
 from pyducklake import Catalog, Schema
@@ -23,7 +22,6 @@ from viaduck import metrics
 from viaduck.source import (
     current_snapshot_id,
     load_table,
-    read_cdc,
     read_cdc_changes,
     replicated_column_names,
     strip_meta,
@@ -90,18 +88,9 @@ def test_cdc_reads_survive_variant_column(source_catalog, variant_table):
     columns = replicated_column_names(table)
     head = current_snapshot_id(table)
 
-    # Unprojected read is the fleet-wide silent stall: VARIANT cannot cross
-    # the DuckDB→Arrow boundary. Canary assertion — if duckdb gains VARIANT
-    # Arrow export, this test tells us the workaround is optional. The error
-    # surfaces as duckdb.NotImplementedException or pyarrow-wrapped OSError
-    # depending on which side of the boundary trips first.
-    with pytest.raises((duckdb.NotImplementedException, OSError), match="Unsupported Arrow type VARIANT"):
-        read_cdc(table, after_snapshot=0, end_snapshot=head)
-
-    result = read_cdc(table, after_snapshot=0, end_snapshot=head, columns=columns)
-    assert result.column_names == list(columns)
-    assert sorted(result.column("event_id").to_pylist()) == [1, 2]
-
+    # The append path reads through the feed with the pinned projection, so
+    # a VARIANT column is simply never projected (load_table excludes it,
+    # pinned above). The full_cdc path keeps the extension read:
     changes = read_cdc_changes(table, after_snapshot=0, end_snapshot=head, columns=columns)
     assert set(columns) < set(changes.column_names)  # meta columns prepended
     assert "properties_variant" not in changes.column_names

@@ -314,7 +314,7 @@ def load_table(catalog: Catalog, table_name: str, *, required_columns: tuple[str
     quote (the forced read projection cannot escape it), or a schema left
     empty all raise instead of degrading silently. The filtered schema flows
     everywhere downstream — destination creation, projection plans — and
-    read_cdc/read_cdc_changes project explicit columns from it, so an
+    read_cdc_changes projects explicit columns from it, so an
     excluded (or post-startup) source column is never read and cannot stall
     CDC. Raises NoSuchTableError if the table doesn't exist.
     """
@@ -522,59 +522,6 @@ def earliest_snapshot_id(table: Table) -> int | None:
     return int(row[0])
 
 
-def read_cdc(
-    table: Table,
-    after_snapshot: int,
-    end_snapshot: int,
-    *,
-    filter_expr: str | None = None,
-    columns: tuple[str, ...] | None = None,
-) -> pa.Table:
-    """Read CDC insertions in the range (after_snapshot, end_snapshot].
-
-    after_snapshot is the last already-delivered snapshot and is EXCLUDED:
-    ducklake's table_insertions is inclusive on both bounds, and re-reading
-    the cursor snapshot pairs a re-read insert with its later delete in
-    conflict resolution — both cancel and the delete is lost (phantom row).
-
-    Uses table_insertions with optional filter pushdown for efficiency.
-    For append-only mode (no key_columns).
-
-    `columns` (from replicated_column_names) makes the projection explicit
-    instead of SELECT * — a source column added after startup is then
-    invisible rather than a read failure (VARIANT cannot export to Arrow)
-    or a destination-append binder error.
-    """
-    t0 = time.monotonic()
-
-    kwargs: dict = {
-        "start_snapshot": after_snapshot + 1,
-        "end_snapshot": end_snapshot,
-    }
-    if filter_expr is not None:
-        kwargs["filter_expr"] = filter_expr
-    if columns is not None:
-        kwargs["columns"] = columns
-
-    changeset: ChangeSet = table.table_insertions(**kwargs)
-    result = changeset.to_arrow()
-
-    duration = time.monotonic() - t0
-    metrics.cdc_read_seconds.observe(duration)
-    metrics.cdc_rows_read_total.inc(result.num_rows)
-
-    log.debug(
-        "CDC read (insertions): snapshots (%d, %d], %d rows in %.3fs%s",
-        after_snapshot,
-        end_snapshot,
-        result.num_rows,
-        duration,
-        f" (filter: {filter_expr})" if filter_expr else "",
-    )
-
-    return result
-
-
 def read_cdc_changes(
     table: Table,
     after_snapshot: int,
@@ -586,14 +533,15 @@ def read_cdc_changes(
     """Read all CDC changes in the range (after_snapshot, end_snapshot].
 
     after_snapshot is the last already-delivered snapshot and is EXCLUDED
-    (see read_cdc for the phantom-row failure mode of an inclusive read).
+    (the inclusive-read phantom-row failure mode: re-reading the cursor
+    # snapshot pairs a re-read insert with its later delete — both cancel).
 
     Uses table_changes which includes inserts, deletes, and update pre/post images.
     The result contains metadata columns: change_type, snapshot_id, rowid.
     For full CDC mode (key_columns configured).
 
     `columns` covers the data columns only (pyducklake prepends the CDC meta
-    columns itself); see read_cdc for why the explicit projection matters.
+    columns itself).
     """
     t0 = time.monotonic()
 

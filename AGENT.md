@@ -188,7 +188,7 @@ Always run `just tlc` after spec changes.
 - **State on plain Postgres**: cursor advances must not create catalog snapshots (the snapshot treadmill); lives in a dedicated `viaduck` schema so it never pollutes the ducklake catalog's namespace; upserts carry a monotonicity guard
 - **LRU connection pool with lease pinning**: bounds memory at high fanout (default 100 open connections); eviction never closes a connection mid-transaction
 - **Per-destination error isolation**: one broken destination doesn't block others; a failed flush drops only that destination's buffers
-- **Clustered unit reads over the direct-SQL feed**: destinations at (or near) the same read position share one catalog-planned unit read (`poll.read_unit_max_rows`/`_max_span`/`_max_bytes`), masked per destination; clusters read in parallel on the read pool. The feed (`source.cdc_reader: direct`, viaduck/feed.py) reads the catalog with indexed psycopg SQL + stock parquet scans instead of the extension's changefeed (~2.4s/bind fixed cost → ~ms/unit).
+- **Clustered unit reads over the direct-SQL feed**: destinations at (or near) the same read position share one catalog-planned unit read (`poll.read_unit_max_rows`/`_max_span`/`_max_bytes`), masked per destination; clusters read in parallel on the read pool. The feed (viaduck/feed.py — unconditional for append_only) reads the catalog with indexed psycopg SQL + stock parquet scans instead of the extension's changefeed (~2.4s/bind fixed cost → ~ms/unit).
 - **Two-layer write retry**: DuckLake's internal retry (`ducklake_max_retry_count=20`, FLAT 25-50ms backoff — `ducklake_retry_backoff` MUST stay 1.0: DuckLake's sleep is `wait_ms × random × backoff^attempt` with the attempt index as an uncapped exponent, so any backoff >1 compounds over 20 attempts into minutes-to-hours sleeps) absorbs snapshot-id commit collisions with catalog-SQL-only retries; viaduck's outer loop (15 attempts, exp backoff capped 30s, ±50% jitter) handles real failures. OCC conflicts do NOT evict the pooled connection (eviction per retry leaked ~160MB native each). `SchemaProjectionError`/`RoutingError` are permanent and fail fast.
 - **Schema projection** (`schema_projection.py`): per-destination drops/reorder/safe-casts onto the destination's existing schema; build-time guards refuse key/routing-column mutation and NOT-NULL-violating casts; per-value cast fallback nulls unparseable values and alarms via `projection_cast_null_fallback_total`
 - **Scan-based seeding with REPLACE semantics**: new destinations bulk-load from a filtered source scan; a cursor-0 destination with leftover rows (crashed prior seed) is truncated first (`routing.seed_truncate`, default true). Configurable via `seed_mode` (default: `scan`)
@@ -216,8 +216,8 @@ Always run `just tlc` after spec changes.
 
 ## Testing
 
-- Unit tests: `tests/unit/` — mocked pyducklake, fast (506 tests)
-- Integration tests: `tests/integration/` — real pyducklake with local DuckDB; Postgres-backed state tests via testcontainers (75 tests)
+- Unit tests: `tests/unit/` — mocked pyducklake, fast (818 tests)
+- Integration tests: `tests/integration/` — real pyducklake with local DuckDB; Postgres-backed state tests via testcontainers (124 tests)
 - Performance tests: `tests/perf/` — router, phases, delete filter, end-to-end delivery fanout at 200/500/1000 destinations (11 benchmarks)
 - Soak: manual docker-compose kill sequence (SIGKILL + SIGTERM + convergence diff) — run for delivery-semantics changes
 

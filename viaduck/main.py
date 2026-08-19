@@ -75,14 +75,18 @@ log = logging.getLogger(__name__)
 
 
 def _build_feed_reader(cfg) -> feed.FeedReader | None:
-    """Construct the direct-SQL feed reader when source.cdc_reader=direct.
+    """Construct the direct-SQL feed reader. append_only sources always read
+    via the feed (the extension changefeed path is removed; the M4 cutover
+    ran it for days). full_cdc sources return None: the feed implements
+    table_insertions semantics only (no delete stream) — full_cdc keeps the
+    extension path.
 
     The chart's SOURCE_POSTGRES_URI is DuckDB-ATTACH format
     (postgres:host=…) which psycopg rejects verbatim — same translation the
     StateManager already gets (review F2)."""
-    if cfg.source.cdc_reader != "direct":
+    if cfg.routing.mode != "append_only":
+        log.info("full_cdc source %s: extension changefeed (the feed has no delete stream)", cfg.source.name)
         return None
-    _validate_feed_mode(cfg)
     reader = feed.FeedReader(
         postgres_uri=config._to_libpq_conninfo(cfg.source.postgres_uri),
         catalog_name=cfg.source.name,
@@ -91,17 +95,6 @@ def _build_feed_reader(cfg) -> feed.FeedReader | None:
     reader.verify_catalog()
     log.info("Direct-SQL feed reader enabled for source %s", cfg.source.name)
     return reader
-
-
-def _validate_feed_mode(cfg) -> None:
-    """source.cdc_reader=direct requires append_only: the feed implements
-    table_insertions semantics only (no delete stream). Startup refuses the
-    combination loudly rather than silently reading inserts-only."""
-    if cfg.routing.mode != "append_only":
-        raise ConfigError(
-            f"source.cdc_reader='direct' requires routing.mode='append_only', got {cfg.routing.mode!r}: "
-            "the feed implements table_insertions semantics only (no delete stream)"
-        )
 
 
 def _start_progress_heartbeat(
@@ -728,12 +721,11 @@ def run(cfg: config.ViaduckConfig) -> None:
     # None only when a column name embeds a double quote (legacy SELECT *).
     source_columns = source.replicated_column_names(src_table)
 
-    # Direct-SQL feed (source.cdc_reader=direct): bypasses the extension
-    # changefeed's per-bind cost (~2.4-3s/call fixed) with indexed catalog
-    # SQL + stock parquet scans. append_only only — full_cdc's delete stream
-    # and preimage resolution have no feed implementation (fail loudly at
-    # startup rather than silently reading inserts-only). The extension path
-    # stays as the rollback while the flag exists.
+    # Direct-SQL feed: bypasses the extension changefeed's per-bind cost
+    # (~2.4-3s/call fixed) with indexed catalog SQL + stock parquet scans.
+    # append_only only — full_cdc's delete stream and preimage resolution
+    # have no feed implementation (full_cdc sources get no reader and stay
+    # on the extension path).
     feed_reader = _build_feed_reader(cfg)
 
     # Read pool: the feed's parallel data plane. Legacy extension mode stays
@@ -1371,7 +1363,7 @@ def _read_unit(
             # positions in _apply_unit.
             rows = pa.table({})
         # Metric continuity with the extension path (which observes these
-        # inside read_cdc): the loop path must not darken the dashboards
+        # inside the retired extension read): the loop path must not darken the dashboards
         # on flag-flip (review O1).
         metrics.cdc_read_seconds.observe(time.monotonic() - t0)
         metrics.cdc_rows_read_total.inc(rows.num_rows)
@@ -1379,14 +1371,10 @@ def _read_unit(
         return rows, hi
     routing_values = [dest_configs[d].routing_value for d in members]
     filter_expr = router.build_filter_expr(routing_values)
-    if full_cdc:
-        rows = source.read_cdc_changes(
-            src_table, after_snapshot=lo, end_snapshot=hi, filter_expr=filter_expr, columns=source_columns
-        )
-    else:
-        rows = source.read_cdc(
-            src_table, after_snapshot=lo, end_snapshot=hi, filter_expr=filter_expr, columns=source_columns
-        )
+    assert full_cdc, "append_only without a planned unit is unreachable (the feed is unconditional)"
+    rows = source.read_cdc_changes(
+        src_table, after_snapshot=lo, end_snapshot=hi, filter_expr=filter_expr, columns=source_columns
+    )
     log.info("CDC unit %d→%d: %d rows (extension)", lo, hi, rows.num_rows)
     return rows, hi
 
@@ -1628,7 +1616,7 @@ def _poll_cycle(
                 # (review F1; §5 "pace never bounded by peers").
                 {d: p for d, p in positions.items() if not delivery.should_pause_reads_for(d)},
                 read_ids,
-                span_cap=cfg.poll.read_unit_max_span if (feed_reader is not None and not full_cdc) else 0,
+                span_cap=cfg.poll.read_unit_max_span if not full_cdc else 0,
             )
             metrics.read_clusters.set(len(clusters))
             futures: dict = {}
@@ -1645,7 +1633,7 @@ def _poll_cycle(
                 # read failures — a catalog blip skips one cluster for one
                 # cycle, never crashes the instance (review: M4-SWE #2).
                 try:
-                    if feed_reader is not None and not full_cdc:
+                    if not full_cdc:
                         hi = feed_reader.plan_unit(
                             src_table,
                             lo,
@@ -1663,19 +1651,18 @@ def _poll_cycle(
                             with_snapshot=True,
                         )
                     else:
-                        # Legacy fallback unit: the retired scheduler read <= 4 x
-                        # 120 = 480 snapshots per group per cycle. The legacy unit
-                        # keeps that pacing (one 480-snapshot extension read is
-                        # cheaper than four 120s) so flag-off catch-up behavior is
-                        # unchanged regardless of read_unit_max_span.
-                        legacy_span = min(cfg.poll.read_unit_max_span, 480)
-                        hi = min(lo + legacy_span, current_id)
+                        # full_cdc extension unit: span-bounded range read (the
+                        # extension path has no per-row attribution to budget
+                        # on; 480 preserves the retired scheduler's pacing of
+                        # <= 4 x 120 snapshots per group per cycle).
+                        span = min(cfg.poll.read_unit_max_span, 480)
+                        hi = min(lo + span, current_id)
                         planned = None
                 except Exception:
                     log.exception("CDC unit planning failed for cluster at %d; skipping it this cycle", lo)
                     metrics.errors_total.labels(type="cdc_read", destination="").inc()
                     continue
-                if feed_reader is not None and not full_cdc and planned is None:
+                if not full_cdc and planned is None:
                     # Empty unit: no read needed — advance positions directly.
                     for d in readable:
                         delivery.advance_position(d, hi, epoch=epochs[d])

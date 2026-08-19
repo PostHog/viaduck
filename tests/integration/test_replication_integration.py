@@ -17,7 +17,7 @@ from viaduck.apply import _apply_changes, _resolve_conflicts
 from viaduck.config import RoutingConfig, StateConfig
 from viaduck.main import _resolve_preimages, _seed_new_destinations
 from viaduck.router import Router
-from viaduck.source import META_COLUMNS, read_cdc, read_cdc_changes, strip_meta
+from viaduck.source import META_COLUMNS, read_cdc_changes, strip_meta
 from viaduck.state import StateManager
 
 pytestmark = pytest.mark.integration
@@ -108,7 +108,7 @@ def router():
 
 
 def test_append_only_round_trip(source_table, dest_table_a, dest_table_b, router):
-    """Insert rows into source, use read_cdc + routing + append to replicate."""
+    """Insert rows into source, use the CDC read + routing + append to replicate."""
     snap_before = source_table.current_snapshot()
     start = snap_before.snapshot_id if snap_before else 0
 
@@ -562,13 +562,13 @@ def test_read_cdc_changes_excludes_start_snapshot(source_table):
 def test_read_cdc_excludes_after_snapshot_append_only(source_table):
     """Append-only path: re-reading the cursor snapshot re-appends its rows
     verbatim — no Phase 2 to cancel and no upsert idempotence to mask it.
-    read_cdc must read (after_snapshot, end_snapshot]."""
+    the read must cover (after_snapshot, end_snapshot]."""
     source_table.append(_arrow_rows([1], ["acme"], [10]))
     first_snap = source_table.current_snapshot().snapshot_id
     source_table.append(_arrow_rows([2], ["acme"], [20]))
     second_snap = source_table.current_snapshot().snapshot_id
 
-    rows = read_cdc(source_table, after_snapshot=first_snap, end_snapshot=second_snap)
+    rows = source_table.table_insertions(start_snapshot=first_snap + 1, end_snapshot=second_snap).to_arrow()
     assert rows.column("event_id").to_pylist() == [2]
 
 

@@ -14,7 +14,7 @@ suite (tests/integration/test_feed_parity.py):
 
 - File selection is verbatim-equivalent to the extension's predicate
   (inclusive bounds; shifted +1 here for viaduck's exclusive-cursor
-  convention, matching read_cdc).
+  convention, matching the retired extension read).
 - Merged / inline-flushed files (partial_max NOT NULL) get the extension's
   two-sided per-row snapshot filter on the physical
   _ducklake_internal_snapshot_id column. The filter is applied ONLY under
@@ -112,7 +112,7 @@ def _is_missing_file_error(exc: Exception) -> bool:
 _ENCRYPTION_REFUSAL = (
     "Catalog {catalog!r} has ducklake_metadata.encrypted=true; the direct feed does not "
     "support encrypted catalogs (per-file encryption_key would need key-grouped "
-    "parquet_scan calls with encryption_config). Use cdc_reader=ducklake."
+    "parquet_scan calls with encryption_config). Refuse encrypted catalogs instead."
 )
 
 
@@ -395,7 +395,7 @@ class FeedReader:
         with_snapshot: bool = False,
     ) -> pa.Table:
         """Inserted rows in (after_snapshot, end_snapshot] for the filter's
-        routing values — the drop-in replacement for source.read_cdc.
+        routing values — the replacement for the retired extension read.
 
         `conn` is the source catalog's DuckDB connection (carries the S3
         credentials); used for parquet scans only. `with_snapshot` appends a
@@ -665,7 +665,7 @@ def _align_temporal_types(tbl: pa.Table, target: pa.Schema) -> pa.Table:
 
 
 def _projection_sql(columns: tuple[str, ...] | None) -> str:
-    """Explicit projection (see read_cdc: pins the read to the startup
+    """Explicit projection (pins the read to the startup
     schema). Identifiers are double-quoted with embedded quotes escaped —
     same convention as _read_inline's column list."""
     if columns is None:

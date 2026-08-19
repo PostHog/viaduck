@@ -689,7 +689,7 @@ def append_only(
 
     Precondition: the operator declared the source insert-only via
     `routing.mode=append_only`. The batch is expected to come from
-    `source.read_cdc` (which calls `ducklake_table_insertions`) and is
+    the feed (table_insertions semantics) and is
     therefore structurally insert-only — `ducklake_table_insertions` does
     NOT synthesize a `change_type` column, so the boundary check below
     treats the presence of that column as proof that the batch came from

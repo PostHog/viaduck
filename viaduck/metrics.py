@@ -40,7 +40,7 @@ _cdc_rows_read_total = Counter(
     "Total rows read from source via CDC",
     ["pipeline"],
 )
-# Direct-SQL feed (cdc_reader=direct; log-consumer-proposal.md §6.1).
+# Direct-SQL feed (unconditional for append_only; log-consumer-proposal.md §6.1).
 # surface: catalog (psycopg metadata queries) vs parquet (duckdb data plane) —
 # the split that makes the extension bypass measurable.
 _cdc_feed_query_seconds = Histogram(
