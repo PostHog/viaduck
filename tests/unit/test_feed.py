@@ -114,12 +114,23 @@ class TestRead:
             cur = MagicMock()
             if "information_schema.tables" in sql or "ducklake_metadata" in sql:
                 return _mock_pg().execute(sql, params)
-            if "ducklake_schema" in sql and "table_id" in sql:
+            if "ducklake_snapshot" in sql:  # floor guard: empty snapshot table
+                cur.fetchone.return_value = (None,)
+            elif "ducklake_schema" in sql and "table_id" in sql:
                 cur.fetchone.return_value = (16,)
             elif "ducklake_schema" in sql:  # path lookup: (t.path, t.rel, s.path, s.rel)
                 cur.fetchone.return_value = (None, None, None, None)
             elif "ducklake_inlined_data_tables" in sql:
                 cur.fetchall.return_value = list(inline_registry)
+            elif "information_schema.columns" in sql:
+                # per-store column probe: stores carry system cols + data cols
+                cur.fetchall.return_value = [
+                    ("row_id",),
+                    ("begin_snapshot",),
+                    ("end_snapshot",),
+                    ("team_id",),
+                    ("event",),
+                ]
             elif "ducklake_inlined_data_" in sql:
                 cur.fetchall.return_value = list(inline_rows or [])
             elif "ducklake_data_file" in sql:
@@ -133,7 +144,7 @@ class TestRead:
         return reader, duck, pg
 
     def test_empty_range_short_circuits(self):
-        reader, duck, pg = self._read_setup(file_rows=[(1, 5, None, 0, 10, "a.parquet", False, 100)])
+        reader, duck, pg = self._read_setup(file_rows=[(1, 5, None, 10, "a.parquet", False, 100)])
         table = _make_table()
         out = reader.read(table, duck, 10, 10)
         assert out.num_rows == 0
@@ -163,8 +174,8 @@ class TestRead:
 
     def test_plain_and_partial_files_split_and_filtered(self):
         files = [
-            (1, 101, None, 0, 10, "plain.parquet", False, 100),
-            (2, 50, 150, 0, 10, "merged.parquet", False, 100),
+            (1, 101, None, 10, "plain.parquet", False, 100),
+            (2, 50, 150, 10, "merged.parquet", False, 100),
         ]
         reader, duck, pg = self._read_setup(file_rows=files)
         reader.read(_make_table(), duck, 100, 200, filter_expr="team_id IN ('2')")
@@ -189,6 +200,81 @@ class TestRead:
         assert out.num_rows == 4
         assert out.column_names == ["team_id", "event"]
 
+    def test_inline_null_fill_for_older_store(self):
+        """Restart-behind-the-boundary: the projection pins the NEW column;
+        a store that predates it NULL-fills (additive). The SELECT must show
+        the NULL-fill explicitly — a silent column-list mistake here is a
+        schema-corruption bug, not a perf bug."""
+        pg = _mock_pg()
+
+        def execute(sql, params=None):
+            cur = MagicMock()
+            if "information_schema.tables" in sql or "ducklake_metadata" in sql:
+                return _mock_pg().execute(sql, params)
+            if "ducklake_snapshot" in sql:
+                cur.fetchone.return_value = (None,)
+            elif "ducklake_schema" in sql and "table_id" in sql:
+                cur.fetchone.return_value = (16,)
+            elif "ducklake_inlined_data_tables" in sql:
+                cur.fetchall.return_value = [("ducklake_inlined_data_16_1",)]
+            elif "information_schema.columns" in sql:
+                # the v1 store: no "extra" column
+                cur.fetchall.return_value = [
+                    ("row_id",),
+                    ("begin_snapshot",),
+                    ("end_snapshot",),
+                    ("team_id",),
+                    ("event",),
+                ]
+            elif "ducklake_inlined_data_" in sql:
+                cur.fetchall.return_value = [("2", "a", None)]  # projected NULL for extra
+            elif "ducklake_data_file" in sql:
+                cur.fetchall.return_value = []
+            return cur
+
+        pg.execute.side_effect = execute
+        reader = _make_reader(pg)
+        table = _make_table(columns=("team_id", "event", "extra"))
+        duck = MagicMock()
+        out = reader.read(table, duck, 99, 200)
+        sqls = [c.args[0] for c in pg.execute.call_args_list if "ducklake_inlined_data_16_1" in str(c)]
+        assert any('NULL AS "extra"' in s for s in sqls)
+        assert out.num_rows == 1
+
+    def test_inline_rename_signature_raises(self):
+        """Store has the OLD name, projection wants the NEW name (missing ∧
+        extra) — the rename signature. Loud failure, never silent NULLs."""
+        pg = _mock_pg()
+
+        def execute(sql, params=None):
+            cur = MagicMock()
+            if "information_schema.tables" in sql or "ducklake_metadata" in sql:
+                return _mock_pg().execute(sql, params)
+            if "ducklake_snapshot" in sql:
+                cur.fetchone.return_value = (None,)
+            elif "ducklake_schema" in sql and "table_id" in sql:
+                cur.fetchone.return_value = (16,)
+            elif "ducklake_inlined_data_tables" in sql:
+                cur.fetchall.return_value = [("ducklake_inlined_data_16_1",)]
+            elif "information_schema.columns" in sql:
+                cur.fetchall.return_value = [
+                    ("row_id",),
+                    ("begin_snapshot",),
+                    ("end_snapshot",),
+                    ("team_id",),
+                    ("event",),
+                ]
+            elif "ducklake_data_file" in sql:
+                cur.fetchall.return_value = []
+            return cur
+
+        pg.execute.side_effect = execute
+        reader = _make_reader(pg)
+        table = _make_table(columns=("team_id", "event_renamed"))
+        duck = MagicMock()
+        with pytest.raises(FeedError, match="non-additive"):
+            reader.read(table, duck, 99, 200)
+
     def test_no_files_and_no_inline_returns_empty_with_schema(self):
         reader, duck, pg = self._read_setup(file_rows=[])
         out = reader.read(_make_table(), duck, 100, 200, columns=("team_id", "event"))
@@ -202,9 +288,9 @@ class TestRead:
         materialization per row); only a true straddle (begin <= lo or
         partial_max > hi) gets it."""
         files = [
-            (1, 101, 150, 0, 10, "contained.parquet", False, 100),  # inside (100, 200]
-            (2, 90, 150, 0, 10, "low_straddle.parquet", False, 100),  # begin <= lo
-            (3, 150, 250, 0, 10, "high_straddle.parquet", False, 100),  # partial_max > hi
+            (1, 101, 150, 10, "contained.parquet", False, 100),  # inside (100, 200]
+            (2, 90, 150, 10, "low_straddle.parquet", False, 100),  # begin <= lo
+            (3, 150, 250, 10, "high_straddle.parquet", False, 100),  # partial_max > hi
         ]
         reader, duck, pg = self._read_setup(file_rows=files)
         reader.read(_make_table(), duck, 100, 200)
@@ -216,7 +302,7 @@ class TestRead:
         assert "contained.parquet" not in filtered
 
     def test_replan_once_on_vanished_file(self):
-        reader, duck, pg = self._read_setup(file_rows=[(1, 101, None, 0, 10, "a.parquet", False, 100)])
+        reader, duck, pg = self._read_setup(file_rows=[(1, 101, None, 10, "a.parquet", False, 100)])
         import duckdb
 
         calls = {"n": 0}
@@ -237,7 +323,7 @@ class TestRead:
         assert len(file_queries) == 2
 
     def test_replan_failure_propagates(self):
-        reader, duck, pg = self._read_setup(file_rows=[(1, 101, None, 0, 10, "a.parquet", False, 100)])
+        reader, duck, pg = self._read_setup(file_rows=[(1, 101, None, 10, "a.parquet", False, 100)])
         import duckdb
 
         duck.execute.side_effect = duckdb.IOException('No files found that match the pattern "a.parquet"')
@@ -246,7 +332,7 @@ class TestRead:
 
     def test_snap_alias_collision_refused(self):
         reader, duck, pg = self._read_setup(
-            file_rows=[(1, 90, 150, 0, 10, "m.parquet", False, 100)]  # low straddle → filtered path
+            file_rows=[(1, 90, 150, 10, "m.parquet", False, 100)]  # low straddle → filtered path
         )
         table = _make_table(columns=("team_id", "__viaduck_snap"))
         with pytest.raises(FeedError, match="collides"):
@@ -349,6 +435,50 @@ class TestRunLevelFeedGate:
             fr.return_value.verify_catalog.assert_called_once()
 
 
+class TestFloorGuard:
+    """The retention floor guard: a cursor below MIN(snapshot_id)-1 means the
+    expired prefix may have held this table's commits — refuse loudly rather
+    than silently skip (the wrapper advances the cursor WITH a loss note;
+    the planner never does it silently)."""
+
+    def _reader(self, min_snapshot):
+        pg = _mock_pg()
+
+        def execute(sql, params=None):
+            cur = MagicMock()
+            if "information_schema.tables" in sql or "ducklake_metadata" in sql:
+                return _mock_pg().execute(sql, params)
+            if "ducklake_snapshot" in sql:
+                cur.fetchone.return_value = (min_snapshot,)
+            elif "ducklake_schema" in sql and "table_id" in sql:
+                cur.fetchone.return_value = (16,)
+            elif "ducklake_inlined_data_tables" in sql:
+                cur.fetchall.return_value = []
+            elif "ducklake_data_file" in sql:
+                cur.fetchall.return_value = []
+            return cur
+
+        pg.execute.side_effect = execute
+        pg.closed = False
+        r = FeedReader(postgres_uri="postgresql://x", catalog_name="lake", data_path="s3://b/")
+        r._conn = pg
+        return r
+
+    def test_cursor_below_floor_refused(self):
+        r = self._reader(min_snapshot=500)
+        with pytest.raises(FeedError, match="retained snapshot floor"):
+            r.plan_unit(MagicMock(), 100, 1000)
+
+    def test_cursor_at_floor_edge_allowed(self):
+        # after = min-1: the range (min-1, hi] is fully retained.
+        r = self._reader(min_snapshot=500)
+        assert r.plan_unit(MagicMock(), 499, 1000) == 1000
+
+    def test_empty_snapshot_table_is_noop(self):
+        r = self._reader(min_snapshot=None)
+        assert r.plan_unit(MagicMock(), 0, 1000) == 1000
+
+
 class TestPlanUnit:
     def _reader(self, file_rows, inline_groups=()):
         """FeedReader mock-backed for plan_unit: file_rows are
@@ -360,7 +490,9 @@ class TestPlanUnit:
             cur = MagicMock()
             if "information_schema.tables" in sql or "ducklake_metadata" in sql:
                 return _mock_pg().execute(sql, params)
-            if "ducklake_schema" in sql and "table_id" in sql:
+            if "ducklake_snapshot" in sql:  # floor guard: empty snapshot table
+                cur.fetchone.return_value = (None,)
+            elif "ducklake_schema" in sql and "table_id" in sql:
                 cur.fetchone.return_value = (16,)
             elif "ducklake_inlined_data_tables" in sql:
                 cur.fetchall.return_value = [("store1",)] if inline_groups else []

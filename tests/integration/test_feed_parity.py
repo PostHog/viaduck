@@ -278,6 +278,51 @@ class TestInline:
         assert got == want
         assert (2, "i1", 1) in got and (7, "i2", 2) not in got
 
+    def test_inline_add_column_null_fill_parity(self, inline_catalog):
+        """Restart-behind-the-boundary for the inline leg: a reader pinning
+        the NEW column set reads ranges whose inline stores predate the ADD —
+        v1-store rows NULL-fill, and the result matches the extension's
+        field-id-mapped output exactly. (Distinguishing coverage for the
+        per-store projection rewrite — before it, this wedged on
+        UndefinedColumn.)"""
+        cat, _tbl, dsn = inline_catalog
+        conn = cat.connection
+        conn.execute("CREATE TABLE laked.main.inlined_evol (team_id BIGINT, event VARCHAR, value BIGINT)")
+        conn.execute("INSERT INTO laked.main.inlined_evol VALUES (2, 'old', 1)")
+        conn.execute("ALTER TABLE laked.main.inlined_evol ADD COLUMN extra BIGINT")
+        conn.execute("INSERT INTO laked.main.inlined_evol VALUES (2, 'new', 2, 42)")
+        tbl2 = cat.load_table("main.inlined_evol")
+        head = tbl2.current_snapshot().snapshot_id
+        r = FeedReader(postgres_uri=dsn, catalog_name="laked", data_path=cat._data_path)
+        try:
+            got = r.read(tbl2, conn, 0, head)
+        finally:
+            r.close()
+        ext = tbl2.table_insertions(start_snapshot=1, end_snapshot=head).to_arrow()
+        assert _rows(got) == _rows(ext)
+        assert got.column_names == ["team_id", "event", "value", "extra"]
+        # the v1 row carries a real typed NULL, not an absent column
+        old_row = next(r for r in got.to_pylist() if r["event"] == "old")
+        assert old_row["extra"] is None
+
+    def test_inline_rename_raises_with_rows_present(self, inline_catalog):
+        """The rename signature with rows in BOTH stores — the destructive
+        case must never silently NULL-fill."""
+        cat, _tbl, dsn = inline_catalog
+        conn = cat.connection
+        conn.execute("CREATE TABLE laked.main.inlined_ren (team_id BIGINT, event VARCHAR)")
+        conn.execute("INSERT INTO laked.main.inlined_ren VALUES (2, 'x')")
+        conn.execute("ALTER TABLE laked.main.inlined_ren RENAME COLUMN event TO event_renamed")
+        conn.execute("INSERT INTO laked.main.inlined_ren VALUES (2, 'y')")
+        tbl2 = cat.load_table("main.inlined_ren")
+        head = tbl2.current_snapshot().snapshot_id
+        r = FeedReader(postgres_uri=dsn, catalog_name="laked", data_path=cat._data_path)
+        try:
+            with pytest.raises(FeedError, match="non-additive"):
+                r.read(tbl2, conn, 0, head)
+        finally:
+            r.close()
+
     def test_flush_to_parquet_no_redelivery(self, inline_catalog):
         cat, tbl, dsn = inline_catalog
         r = FeedReader(postgres_uri=dsn, catalog_name="laked", data_path=cat._data_path)
@@ -429,7 +474,7 @@ class TestSchemaEvolution:
         import duckdb
         import psycopg
 
-        with pytest.raises((duckdb.Error, psycopg.Error)) as exc_info:
+        with pytest.raises((duckdb.Error, psycopg.Error, FeedError)) as exc_info:
             reader.read(tbl, catalog.connection, renamed_created, head)
         assert "event_renamed" in str(exc_info.value)
 
@@ -539,7 +584,7 @@ class TestMissingFileDrill:
             # still lists it, the second GET must fail, and the error
             # propagates (no silent skip).
             victim = file_rows[0]
-            path = fresh._resolve_path(victim[5], victim[6], *path_info)
+            path = fresh._resolve_path(victim[4], victim[5], *path_info)
             import os
 
             os.remove(path)

@@ -144,6 +144,9 @@ class FeedReader:
         # these too.
         self._table_id_cache: dict[tuple[str, str], int] = {}
         self._path_cache: dict[tuple[str, str], tuple[tuple[str | None, bool], tuple[str | None, bool]]] = {}
+        # Inline store column sets: stores are created per schema version and
+        # immutable thereafter, so this cache never invalidates.
+        self._inline_store_cols: dict[str, set[str]] = {}
         self._verified = False
 
     # ------------------------------------------------------------------ #
@@ -161,7 +164,15 @@ class FeedReader:
                 self._pg_uri,
                 autocommit=True,
                 connect_timeout=10,
-                options="-c statement_timeout=30000",
+                # prepare_threshold=None: psycopg3 otherwise auto-promotes
+                # to server-side prepared statements after 5 executions —
+                # fatal under pgbouncer transaction pooling (per-destination
+                # duckling fleet runs behind it).
+                prepare_threshold=None,
+                # idle_in_transaction_session_timeout: a wedged REPEATABLE
+                # READ snapshot pins the catalog's vacuum horizon; at N
+                # reader processes that failure arrives fast.
+                options="-c statement_timeout=30000 -c idle_in_transaction_session_timeout=60000",
             )
         return self._conn
 
@@ -290,6 +301,22 @@ class FeedReader:
         self._path_cache[key] = value
         return value
 
+    def _floor_guard(self, conn: psycopg.Connection, after_snapshot: int) -> None:
+        """Refuse to plan when the cursor is below the retained snapshot
+        floor: the range (after, min-1] may have contained commits for this
+        table that expire already deleted — reading on would be silent loss
+        (fleet `_clamp_expired_cursors` semantics; the conservative rule —
+        the expired range may have held only FOREIGN tables' commits, but
+        the caller must adjudicate that, not the planner). No-op when the
+        snapshot table is empty."""
+        row = conn.execute(f'SELECT MIN(snapshot_id) FROM "{self._meta_schema}".ducklake_snapshot').fetchone()
+        if row and row[0] is not None and after_snapshot < int(row[0]) - 1:
+            raise FeedError(
+                f"cursor {after_snapshot} is below the retained snapshot floor "
+                f"{int(row[0])}: the expired prefix may have contained undelivered "
+                "commits — refusing to plan (advance the cursor loudly instead)"
+            )
+
     def plan_unit(
         self,
         table: Table,
@@ -312,6 +339,7 @@ class FeedReader:
         namespace, table_name = table._identifier[0], table._identifier[1]
         pg = self._pg()
         tid = self._table_id(pg, namespace, table_name)
+        self._floor_guard(pg, after_snapshot)
         lo1 = after_snapshot + 1
         rows = pg.execute(
             f"SELECT begin_snapshot, partial_max, record_count, file_size_bytes "
@@ -501,7 +529,7 @@ class FeedReader:
         plain_by_begin: dict[int, list[str]] = {}
         partial_unfiltered: list[str] = []
         partial_filtered: list[str] = []
-        for _fid, begin, partial_max, _rid_start, _rc, path, path_is_relative, _size in file_rows:
+        for _fid, begin, partial_max, _rc, path, path_is_relative, _size in file_rows:
             resolved = self._resolve_path(path, path_is_relative, table_path, schema_path)
             if partial_max is None:
                 plain_by_begin.setdefault(begin, []).append(resolved)
@@ -558,10 +586,14 @@ class FeedReader:
         with pg.transaction():
             pg.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             tid = self._table_id(pg, namespace, table_name)
+            # In-transaction: closes the clamp's check-then-plan TOCTOU —
+            # an expire landing between the caller's floor check and this
+            # plan cannot silently skip the freshly expired prefix.
+            self._floor_guard(pg, after_snapshot)
             path_info = self._data_path_for(pg, namespace, table_name)
             lo1 = after_snapshot + 1
             file_rows = pg.execute(
-                f"SELECT data_file_id, begin_snapshot, partial_max, row_id_start, record_count, "
+                f"SELECT data_file_id, begin_snapshot, partial_max, record_count, "
                 f'path, path_is_relative, file_size_bytes FROM "{self._meta_schema}".ducklake_data_file '
                 f"WHERE table_id = %s AND begin_snapshot <= %s "
                 f"AND (begin_snapshot >= %s OR (partial_max IS NOT NULL AND partial_max >= %s)) "
@@ -596,19 +628,41 @@ class FeedReader:
             (table_id,),
         ).fetchall()
         rows: list[tuple] = []
-        # Data columns only — the store prepends row_id/begin/end_snapshot.
-        # Projection uses the CURRENT column list: multi-schema-version
-        # column mapping is a golden-suite concern (the branch is dormant in
-        # prod), and a mismatch raises loudly rather than drifting.
-        data_cols = ", ".join(f'"{c.replace(chr(34), chr(34) * 2)}"' for c in columns)
-        if with_snapshot:
-            data_cols += ", begin_snapshot"
-        # The routing filter applies here too — inline rows are rows, full
-        # stop. (Caught by the parity suite: unfiltered inline rows leak
-        # other tenants' data into the read.)
+        # Stores are created per schema version (ADD COLUMN registers a new
+        # one) and are immutable thereafter, so the per-store column set is
+        # cacheable. Projection is per-store: columns the store predates are
+        # NULL-filled (additive evolution; matches how old parquet files read
+        # for a boot-pinned new column). A store carrying columns OUTSIDE the
+        # projection means a non-additive change (rename/drop) — raise
+        # loudly, matching the file side's rename posture (no mapping_id
+        # story). Store system columns (row_id/begin/end_snapshot) are
+        # expected and excluded from the divergence check.
         filter_sql = f" AND ({filter_expr})" if filter_expr else ""
         for (store,) in registry:
             store = store.replace('"', '""')
+            store_cols = self._store_columns(conn, store)
+            missing = [c for c in columns if c not in store_cols]
+            extra = store_cols - set(columns) - {"row_id", "begin_snapshot", "end_snapshot"}
+            # missing ∧ extra = the rename signature (old name extra, new name
+            # absent) → raise loudly, matching the file side (no mapping_id
+            # story). Additive divergence is fine in both directions: a store
+            # predating the projection NULL-fills; a store newer than a pinned
+            # projection is simply projected narrow.
+            if missing and extra:
+                raise FeedError(
+                    f"inline store {store}: columns {missing} absent while {sorted(extra)} present — "
+                    "non-additive schema change (rename/drop) is unsupported"
+                )
+            data_cols = ", ".join(
+                (
+                    f'"{c.replace(chr(34), chr(34) * 2)}"'
+                    if c in store_cols
+                    else f'NULL AS "{c.replace(chr(34), chr(34) * 2)}"'
+                )
+                for c in columns
+            )
+            if with_snapshot:
+                data_cols += ", begin_snapshot"
             rows.extend(
                 conn.execute(
                     f'SELECT {data_cols} FROM "{self._meta_schema}"."{store}" '
@@ -617,6 +671,19 @@ class FeedReader:
                 ).fetchall()
             )
         return rows
+
+    def _store_columns(self, conn: psycopg.Connection, store: str) -> set[str]:
+        cached = self._inline_store_cols.get(store)
+        if cached is None:
+            cached = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+                    (self._meta_schema, store),
+                ).fetchall()
+            }
+            self._inline_store_cols[store] = cached
+        return cached
 
     def _resolve_path(
         self,
