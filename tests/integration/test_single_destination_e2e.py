@@ -408,6 +408,62 @@ class TestEndToEnd:
                 d._cursor_conn.close()
 
 
+class TestVariantSourceColumn:
+    """The production shape: events_nrt carries millpond's VARIANT dual-write
+    companions. The duckling must boot, read, and deliver as if they don't
+    exist (load_table's EXCLUDABLE_SOURCE_TYPES exclusion)."""
+
+    def test_boot_and_deliver_with_variant_column(self, env):
+        src, dst = env.src, env.dst
+        src.connection.execute(
+            "CREATE TABLE lake.main.events_v (team_id BIGINT, event VARCHAR, properties_variant VARIANT)"
+        )
+        src.connection.execute("INSERT INTO lake.main.events_v VALUES (2, 'a', {\"k\": 1}), (3, 'b', NULL)")
+
+        d = Duckling(env.cfg(source_table="main.events_v", dest_table="main.events_v"))
+        d.boot()
+        try:
+            assert "properties_variant" not in d.columns
+            d.poll_once()
+            out = dst.connection.execute("SELECT team_id, event FROM dst.main.events_v").fetchall()
+            assert out == [(2, "a")]
+            # the destination never gained the column
+            assert "properties_variant" not in d.dst_table.schema.column_names()
+        finally:
+            _close(d)
+
+    def test_variant_added_mid_stream(self, env):
+        """A VARIANT column added mid-stream: the running process never sees
+        it (boot-pinned projection), a restart excludes it again — no wedge
+        in either phase."""
+        src, dst = env.src, env.dst
+        _insert(src, [(2, "a")])
+
+        d = Duckling(env.cfg())
+        d.boot()
+        try:
+            src.connection.execute("ALTER TABLE lake.main.events ADD COLUMN properties_variant VARIANT")
+            src.connection.execute(
+                "INSERT INTO lake.main.events (team_id, event, properties_variant) VALUES (2, 'b', {\"k\": 1})"
+            )
+            d.poll_once()
+        finally:
+            _close(d)
+        assert _dest_rows(dst) == [(2, "a"), (2, "b")]
+
+        d2 = Duckling(env.cfg())
+        d2.boot()  # restart: load_table excludes the VARIANT again
+        try:
+            assert "properties_variant" not in d2.columns
+            src.connection.execute(
+                "INSERT INTO lake.main.events (team_id, event, properties_variant) VALUES (2, 'c', NULL)"
+            )
+            d2.poll_once()
+        finally:
+            _close(d2)
+        assert _dest_rows(dst) == [(2, "a"), (2, "b"), (2, "c")]
+
+
 class TestInlineServedAndPaged:
     def test_inline_rows_served_with_page(self, env):
         """Inlining drifting ON is not a correctness event (the feed's tested

@@ -216,8 +216,8 @@ Always run `just tlc` after spec changes.
 
 ## Testing
 
-- Unit tests: `tests/unit/` — mocked pyducklake, fast (COUNTS-REFRESH)
-- Integration tests: `tests/integration/` — real pyducklake with local DuckDB; Postgres-backed state tests via testcontainers (COUNTS-REFRESH)
+- Unit tests: `tests/unit/` — mocked pyducklake, fast (901 tests)
+- Integration tests: `tests/integration/` — real pyducklake with local DuckDB; Postgres-backed state tests via testcontainers (144 tests)
 - Performance tests: `tests/perf/` — router, phases, delete filter, end-to-end delivery fanout at 200/500/1000 destinations (11 benchmarks)
 - Soak: manual docker-compose kill sequence (SIGKILL + SIGTERM + convergence diff) — run for delivery-semantics changes
 - Flush-sizing load harness: `just load-up` + `just load-check` (docker-compose.load.yaml: 3K rows/s Zipf-skewed wide-row loadgen with a mid-run thin→hot burst stream, dest-1 catalog Postgres behind toxiproxy so `test/loadcheck.py` can inject a catalog-latency wave; 6 destinations on dest-2 are the uncontended control group). Asserts the adaptive flush controller's behavior locally — head flushes target-triggered at full-size batches (absolute rows/flush band: the crumb-cut detector), contended destinations halve, control doesn't move, the burst tenant migrates interval→target with bounded lag, zero errors, drains clean — instead of learning it from a prod deploy. Reads both target-gauge generations (`_rows` preferred, `_bytes` fallback).

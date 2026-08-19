@@ -349,6 +349,25 @@ def _inline_insert(catalog: Catalog, rows: list[tuple[int, str, int]]):
     vals = ", ".join(f"({t}, '{e}', {v})" for t, e, v in rows)
     catalog.connection.execute(f"INSERT INTO laked.main.inlined VALUES {vals}")
 
+    def test_variant_inline_plane(self, inline_catalog):
+        """VARIANT with inlining active: the inline store carries the variant
+        column, the feed's pinned projection reads inline rows without
+        touching it (mixed-plane correctness, not just parquet)."""
+        cat, _tbl, dsn = inline_catalog
+        conn = cat.connection
+        conn.execute(
+            "CREATE TABLE laked.main.inlined_variant (team_id BIGINT, event VARCHAR, properties_variant VARIANT)"
+        )
+        conn.execute("INSERT INTO laked.main.inlined_variant VALUES (2, 'i1', {\"k\": 9}), (7, 'i2', NULL)")
+        tbl2 = cat.load_table("main.inlined_variant")
+        head = tbl2.current_snapshot().snapshot_id
+        r = FeedReader(postgres_uri=dsn, catalog_name="laked", data_path=cat._data_path)
+        try:
+            got = r.read(tbl2, conn, 0, head, columns=("team_id", "event"))
+        finally:
+            r.close()
+        assert _rows(got) == collections.Counter({(2, "i1"): 1, (7, "i2"): 1})
+
 
 class TestForeignSnapshots:
     """Other tables' commits interleave (snapshot ids are global); the feed
@@ -429,6 +448,63 @@ class TestTypeFidelity:
         assert got == want
         # Non-vacuous: every fixture row present.
         assert sum(got.values()) == len(self.ROWS)
+
+
+class TestVariantFeed:
+    def test_variant_column_never_projected(self, reader, catalog):
+        """The production VARIANT shape on the feed path: the pinned
+        projection excludes the unrepresentable column (load_table's
+        EXCLUDABLE_SOURCE_TYPES), so the read never touches it — a source
+        with VARIANT columns must not stall or fail the feed."""
+        conn = catalog.connection
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute(
+                "CREATE TABLE lake.main.with_variant (team_id BIGINT, event VARCHAR, properties_variant VARIANT)"
+            )
+            created = _head_snapshot(catalog)
+            conn.execute("INSERT INTO lake.main.with_variant VALUES (2, 'a', {\"k\": 1}), (7, 'b', NULL)")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        # load_table excludes the VARIANT column (the fleet's behavior) —
+        # the feed reads the surviving projection.
+        from viaduck.source import load_table, replicated_column_names
+
+        tbl = load_table(catalog, "main.with_variant")
+        pinned = replicated_column_names(tbl)
+        assert "properties_variant" not in pinned
+        head = tbl.current_snapshot().snapshot_id
+        got = reader.read(tbl, catalog.connection, created, head, columns=pinned)
+        assert sorted(got.column("event").to_pylist()) == ["a", "b"]
+        assert "properties_variant" not in got.column_names
+
+    def test_variant_survives_merge(self, reader, catalog):
+        """A compaction merge rewrites variant-bearing files end-to-end; the
+        feed's pinned projection must read the merged output exactly. (The
+        merge runs through the extension's writer — this pins that its
+        output files keep the pinned columns readable, variant intact
+        notwithstanding.)"""
+        conn = catalog.connection
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0")
+        try:
+            conn.execute(
+                "CREATE TABLE lake.main.variant_merge (team_id BIGINT, event VARCHAR, properties_variant VARIANT)"
+            )
+            created = _head_snapshot(catalog)
+            conn.execute("INSERT INTO lake.main.variant_merge VALUES (2, 'm1', {\"k\": 1})")
+            conn.execute("INSERT INTO lake.main.variant_merge VALUES (2, 'm2', NULL), (7, 'm3', {\"k\": 3})")
+            conn.execute("CALL ducklake_merge_adjacent_files('lake')")
+        finally:
+            conn.execute("RESET ducklake_default_data_inlining_row_limit")
+        from viaduck.source import load_table, replicated_column_names
+
+        tbl = load_table(catalog, "main.variant_merge")
+        pinned = replicated_column_names(tbl)
+        head = tbl.current_snapshot().snapshot_id
+        got = reader.read(tbl, catalog.connection, created, head, columns=pinned)
+        want = tbl.table_insertions(start_snapshot=created + 1, end_snapshot=head, columns=pinned).to_arrow()
+        assert _rows(got) == _rows(want)
+        assert sum(_rows(got).values()) == 3
 
 
 class TestSchemaEvolution:
