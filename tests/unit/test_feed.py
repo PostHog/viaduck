@@ -7,7 +7,7 @@ catalog lives in tests/integration/test_feed_parity.py.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 import pytest
@@ -253,20 +253,6 @@ class TestRead:
             reader.read(table, duck, 100, 200)
 
 
-class TestConfigGate:
-    def test_cdc_reader_default(self):
-        from viaduck.config import SourceConfig
-
-        cfg = SourceConfig(name="s", postgres_uri_env="X", data_path="s3://b/", table="t")
-        assert cfg.cdc_reader == "ducklake"
-
-    def test_cdc_reader_invalid_refused(self):
-        from viaduck.config import ConfigError, SourceConfig
-
-        with pytest.raises(ConfigError, match="cdc_reader"):
-            SourceConfig(name="s", postgres_uri_env="X", data_path="s3://b/", table="t", cdc_reader="bogus")
-
-
 class TestProjectionSql:
     def test_quotes_escaped(self):
         assert feed._projection_sql(('we"ird', "plain")) == '"we""ird", "plain"'
@@ -347,16 +333,20 @@ class TestMissingFileMatcher:
 
 
 class TestRunLevelFeedGate:
-    def test_direct_requires_append_only(self):
-        from viaduck.config import ConfigError
-        from viaduck.main import _validate_feed_mode
+    def test_full_cdc_gets_no_feed_reader(self):
+        """Structural successor to the mode gate: full_cdc sources stay on
+        the extension changefeed (the feed has no delete stream);
+        append_only always reads the feed."""
+        from viaduck.main import _build_feed_reader
 
         cfg = MagicMock()
         cfg.routing.mode = "full_cdc"
-        with pytest.raises(ConfigError, match="append_only"):
-            _validate_feed_mode(cfg)
+        assert _build_feed_reader(cfg) is None
+
         cfg.routing.mode = "append_only"
-        _validate_feed_mode(cfg)  # no raise
+        with patch("viaduck.main.feed.FeedReader") as fr:
+            assert _build_feed_reader(cfg) is fr.return_value
+            fr.return_value.verify_catalog.assert_called_once()
 
 
 class TestPlanUnit:

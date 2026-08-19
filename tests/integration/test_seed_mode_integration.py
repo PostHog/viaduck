@@ -108,8 +108,6 @@ def test_latest_fresh_destination_starts_at_head(src, sm):
 
 def test_latest_events_before_startup_not_replicated(src, sm):
     """Rows inserted before initialization are invisible to latest-mode CDC."""
-    from viaduck.source import read_cdc
-
     _insert(src, [(1, 1)])
     head = _insert(src, [(2, 2)])
 
@@ -118,7 +116,8 @@ def test_latest_events_before_startup_not_replicated(src, sm):
     # Insert more rows after initialization
     snap_after = _insert(src, [(3, 1), (4, 2)])
 
-    changeset = read_cdc(src, after_snapshot=head, end_snapshot=snap_after)
+    # the feed's convention, direct: (after, end] = start_snapshot=cursor+1
+    changeset = src.table_insertions(start_snapshot=head + 1, end_snapshot=snap_after).to_arrow()
     assert len(changeset) == 2
     assert set(changeset["id"].to_pylist()) == {3, 4}
 
@@ -144,9 +143,7 @@ def test_earliest_fresh_destination_starts_at_min_minus_one(src, sm):
 
 
 def test_earliest_cdc_read_includes_min_snapshot(src):
-    """CDC from cursor=MIN-1 correctly starts at MIN (read_cdc adds +1)."""
-    from viaduck.source import read_cdc
-
+    """CDC from cursor=MIN-1 correctly starts at MIN (exclusive-lo)."""
     # Insert rows into already-initialized catalog (which has snapshots 0,1 from create)
     _insert(src, [(1, 1)])
     snap_b = _insert(src, [(2, 2)])
@@ -155,8 +152,8 @@ def test_earliest_cdc_read_includes_min_snapshot(src):
     assert min_snap is not None
     initial = min_snap - 1
 
-    # CDC from cursor=MIN-1 should see all user-inserted rows
-    changeset = read_cdc(src, after_snapshot=initial, end_snapshot=snap_b)
+    # CDC from cursor=MIN-1 should see all user-inserted rows (exclusive-lo)
+    changeset = src.table_insertions(start_snapshot=initial + 1, end_snapshot=snap_b).to_arrow()
     assert set(changeset["id"].to_pylist()) == {1, 2}
 
 

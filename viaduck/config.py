@@ -171,15 +171,10 @@ class SourceConfig:
     data_path: str
     table: str
     properties: dict[str, str] = field(default_factory=dict)
-    # CDC read API: "ducklake" (default) = the extension changefeed
-    # (ducklake_table_insertions); "direct" = the direct-SQL feed
-    # (viaduck/feed.py — indexed catalog queries + stock parquet scans;
-    # log-consumer-proposal.md §6.1). append_only pipelines only.
-    cdc_reader: str = "ducklake"
-
-    def __post_init__(self):
-        if self.cdc_reader not in ("ducklake", "direct"):
-            raise ConfigError(f"source.cdc_reader must be 'ducklake' or 'direct', got {self.cdc_reader!r}")
+    # CDC reads are always the direct-SQL feed (viaduck/feed.py) for
+    # append_only; full_cdc sources keep the extension changefeed (the feed
+    # has no delete stream). The retired source.cdc_reader knob is inert in
+    # configs that still render it (the loader tolerates unknown keys).
 
     @property
     def postgres_uri(self) -> str:
@@ -794,7 +789,6 @@ class ViaduckConfig:
         log.info("config: source.data_path=%r", self.source.data_path)
         log.info("config: source.table=%r", self.source.table)
         log.info("config: source.properties=%r", self.source.properties)
-        log.info("config: source.cdc_reader=%r", self.source.cdc_reader)
 
         log.info("config: routing.field=%r", self.routing.field)
         log.info("config: routing.mode=%r", self.routing.mode)
@@ -920,7 +914,6 @@ def load(path: str | Path) -> ViaduckConfig:
         data_path=_require_non_empty(src.get("data_path", ""), "source.data_path"),
         table=_require_non_empty(src.get("table", ""), "source.table"),
         properties=_validate_string_dict(src.get("properties", {}), "source.properties"),
-        cdc_reader=src.get("cdc_reader", "ducklake"),
     )
 
     # Routing

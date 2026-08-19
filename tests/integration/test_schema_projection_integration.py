@@ -8,7 +8,7 @@ Replicates exactly what the production switchover will look like:
     25 columns, timestamptz on 8 columns, no `captured_at`, partitioned by
     (year(timestamp), month(timestamp), day(timestamp)). This is what DLT
     backfills onto duckling-*.
-  - A realistic CDC batch produced by pyducklake's `read_cdc` (i.e., after
+  - A realistic CDC batch from the read path (i.e., after
     millpond has written the source rows).
   - viaduck's `append_only` path with `schema_projection_enabled=True`.
   - Post-write assertions on the destination table: row count, per-column

@@ -11,7 +11,6 @@ from viaduck import metrics
 from viaduck.source import (
     current_snapshot_id,
     earliest_snapshot_id,
-    read_cdc,
     read_cdc_changes,
     snapshot_times,
     strip_meta,
@@ -63,48 +62,6 @@ def test_earliest_snapshot_id_returns_min():
 def test_earliest_snapshot_id_returns_none_on_empty_catalog():
     table = _make_table_with_catalog("lake", None)
     assert earliest_snapshot_id(table) is None
-
-
-def test_read_cdc_calls_table_insertions():
-    table = MagicMock()
-    changeset = MagicMock()
-    arrow_table = pa.table({"id": [1, 2], "name": ["a", "b"]})
-    changeset.to_arrow.return_value = arrow_table
-    table.table_insertions.return_value = changeset
-
-    result = read_cdc(table, after_snapshot=0, end_snapshot=5)
-
-    # after_snapshot is exclusive (last delivered): reads (0, 5] -> pyducklake start 1
-    table.table_insertions.assert_called_once_with(start_snapshot=1, end_snapshot=5)
-    assert result.num_rows == 2
-
-
-def test_read_cdc_with_filter():
-    table = MagicMock()
-    changeset = MagicMock()
-    arrow_table = pa.table({"id": [1]})
-    changeset.to_arrow.return_value = arrow_table
-    table.table_insertions.return_value = changeset
-
-    result = read_cdc(table, after_snapshot=0, end_snapshot=5, filter_expr="team_id IN (123)")
-
-    table.table_insertions.assert_called_once_with(
-        start_snapshot=1,
-        end_snapshot=5,
-        filter_expr="team_id IN (123)",
-    )
-    assert result.num_rows == 1
-
-
-def test_read_cdc_empty_result():
-    table = MagicMock()
-    changeset = MagicMock()
-    arrow_table = pa.table({"id": pa.array([], type=pa.int64())})
-    changeset.to_arrow.return_value = arrow_table
-    table.table_insertions.return_value = changeset
-
-    result = read_cdc(table, after_snapshot=5, end_snapshot=5)
-    assert result.num_rows == 0
 
 
 def test_connect(tmp_path):
@@ -254,24 +211,6 @@ def test_read_cdc_changes_rowid_preservation():
 
     assert "rowid" in result.column_names
     assert result.column("rowid").to_pylist() == [100, 101]
-
-
-def test_read_cdc_unchanged():
-    """Backward compat: read_cdc still works (calls table_insertions)."""
-    table = MagicMock()
-    changeset = MagicMock()
-    arrow_table = pa.table({"id": [1, 2, 3]})
-    changeset.to_arrow.return_value = arrow_table
-    table.table_insertions.return_value = changeset
-
-    result = read_cdc(table, after_snapshot=0, end_snapshot=5)
-
-    table.table_insertions.assert_called_once_with(start_snapshot=1, end_snapshot=5)
-    table.table_changes.assert_not_called()
-    assert result.num_rows == 3
-
-
-# --- strip_meta tests ---
 
 
 def test_strip_meta_removes_columns():
