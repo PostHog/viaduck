@@ -728,8 +728,8 @@ def run(cfg: config.ViaduckConfig) -> None:
     # on the extension path).
     feed_reader = _build_feed_reader(cfg)
 
-    # Read pool: the feed's parallel data plane. Legacy extension mode stays
-    # serial on the source connection (the extension path is one query slot).
+    # Read pool: the feed's parallel data plane. full_cdc stays serial on the
+    # source connection (the extension path is one query slot).
     read_pool = None
     if feed_reader is not None:
         read_pool = _ReadPool(cfg.source.resolved_properties(), cfg.poll.read_workers)
@@ -1310,7 +1310,7 @@ def _position_clusters(positions: dict[str, int], read_ids, span_cap: int) -> li
     """Cluster ACTIVE destinations into read units: [(cluster_lo, members)],
     ascending by lo. span_cap > 0 (the feed's per-row snapshot attribution)
     merges positions within one budget span — the shared read is masked per
-    destination by its own position. span_cap = 0 (legacy extension reads
+    destination by its own position. span_cap = 0 (full_cdc extension reads
     carry no per-row snapshot) falls back to exact-position groups only.
     """
     by_pos: dict[int, list[str]] = {}
@@ -1350,7 +1350,7 @@ def _read_unit(
     read-pool thread: pure I/O, no shared state, no buffer writes (the poll
     thread applies results). Feed reads are pre-planned on the poll thread
     (`planned`) — the FeedReader's psycopg connection is single-threaded;
-    the pool never plans. The legacy extension path reads the span-bounded
+    the pool never plans. The full_cdc extension path reads the span-bounded
     range it is given (its chunk equivalent) since it has no per-row
     attribution to slice on.
     """
@@ -1490,7 +1490,7 @@ def _apply_unit(
             for sub, cov, sub_hi in _slice_batch(clean, snaps, pos, hi, unit_cfg.read_unit_max_rows):
                 delivery.buffer(dest_id, sub, cov, epoch=epochs[dest_id], hi=sub_hi)
         else:
-            # Legacy extension read: no per-row attribution — whole-unit
+            # full_cdc extension read: no per-row attribution — whole-unit
             # entry (chunk-equivalent semantics).
             delivery.buffer(dest_id, batch, hi, epoch=epochs[dest_id])
         # Mark routed only when rows actually landed (or the member was
@@ -1604,6 +1604,13 @@ def _poll_cycle(
             # cycle time budget: every unit is row/byte-bounded and every
             # cluster dispatches every cycle (the barrier), so nothing
             # starves.
+            if not full_cdc and feed_reader is None and any(pos < current_id for pos in positions.values()):
+                # Mirror guard (review M7-F1): append_only without the feed
+                # would AttributeError inside the per-cluster containment and
+                # stall the pipeline with green liveness — refuse at the
+                # boundary instead. Only when a read would actually be
+                # planned (an all-caught-up cycle has nothing to guard).
+                raise ConfigError("append_only requires a feed reader (built unconditionally in run())")
             clusters = _position_clusters(
                 # Span-merge clustering needs the per-row mask — feed only.
                 # Legacy/full_cdc reads can't mask (no per-row snapshot), so

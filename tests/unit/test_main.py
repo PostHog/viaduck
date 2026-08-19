@@ -341,7 +341,7 @@ def test_poll_cycle_routing_error_breaks_gracefully():
 
 def test_poll_cycle_chunks_large_range():
     """Range larger than read_unit_max_span is split across cycles: one
-    span-bounded unit per cycle (legacy extension path)."""
+    span-bounded unit per cycle."""
     delivery = _make_delivery({"dest-1": 0})
     router = MagicMock()
     cfg = _make_cfg([("dest-1", "quacksworth")])
@@ -369,8 +369,10 @@ def test_poll_cycle_chunks_large_range():
             feed_reader=(feed := _feed_mock(5)),
         )
 
-    # the unit boundary flows through plan_read's (lo, hi)
+    # the unit boundary flows through plan_read's (lo, hi), and the budgets
+    # reach plan_unit (a dropped max_span would silently unbound reads)
     assert feed.plan_read.call_args.args[1:3] == (0, 5)
+    assert feed.plan_unit.call_args.kwargs["max_span"] == 5
     buffer_calls = delivery.buffer.call_args_list
     assert len(buffer_calls) == 1
     assert buffer_calls[0] == call("dest-1", arrow_data, 5, epoch=0)
