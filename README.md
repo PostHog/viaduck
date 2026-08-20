@@ -1,6 +1,6 @@
 # Viaduck — DuckLake to DuckLake CDC Replication
 
-A standalone Python app that replicates data from a source DuckLake table to N destination DuckLake tables using CDC (Change Data Capture). Supports inserts, deletes, and updates. Single thread, single poll loop, no framework.
+A standalone Python app that replicates data from a source DuckLake table to N destination DuckLake tables using CDC (Change Data Capture). Supports inserts, deletes, and updates. One poll loop that plans and buffers, a parallel read pool (`poll.read_workers`) that reads, a flush worker pool (`delivery.workers`) that writes, plus an HTTP server thread and an optional discovery poller. No framework.
 
 **Contents:**
 [Naming](#naming) | [What](#what) | [Why](#why) | [Architecture](#architecture) | [Two Modes](#two-modes) | [Poll Cycle](#poll-cycle) | [CDC Operations](#cdc-operations-and-semantics) | [Failure Modes](#failure-modes) | [Configuration](#configuration) | [Schema Projection](#schema-projection) | [State Tracking](#state-tracking) | [Seeding](#new-destination-seeding) | [Connection Management](#connection-management) | [Horizontal Scaling](#horizontal-scaling) | [Metrics](#metrics) | [Setup](#setup) | [Development](#development) | [Formal Verification](#formal-verification-tla) | [Deployment](#deployment) | [Error Handling](#error-handling-and-retries)
@@ -25,12 +25,12 @@ Viaduck carries data across DuckLakes. The name is a portmanteau of *viaduct* an
 - Scan-based seeding for new destinations (no full history replay)
 - YAML config with env var indirection for credentials
 - Per-destination error isolation — one broken destination doesn't block others
-- LRU connection pool for high fanout (local bench: ~43 destinations/s flat through 1000 destinations)
+- LRU connection pool for high fanout (local bench: ~42 destinations/s flat through 1000 destinations)
 - Persistent cursor tracking on plain Postgres
 - Horizontal scaling via hash or explicit destination partitioning
-- 32 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
+- 65 Prometheus metrics, health checks (`/healthz`, `/readyz`), live status web UI
 - At-least-once delivery with documented failure modes
-- [TLA+ formally verified](tla/Viaduck.tla): 7 safety invariants checked across 19.9M states with NO crash conditioning — eventual consistency, phantom-freedom, no-data-loss, partition correctness, and buffer boundedness all hold through every modeled crash and failure window
+- [TLA+ formally verified](tla/Viaduck.tla): 8 safety invariants checked across 132M distinct states (~1.9B generated) with NO crash conditioning — eventual consistency, phantom-freedom, no-data-loss, partition correctness, and buffer boundedness all hold through every modeled crash and failure window; companion models cover membership epochs, the parallel-read guard, and reshard config swaps (see [Formal Verification](#formal-verification-tla))
 
 ## Why
 
@@ -42,11 +42,12 @@ Source: [`docs/overview.d2`](docs/overview.d2)
 
 ```
 poll thread (every interval_seconds):
-  current_snapshot() on source
-  group destinations by read position
-  for each group:
-    table_changes(after, current, filter_expr)  → CDC read (inserts + deletes + updates)
-    resolve preimages                            → handle cross-tenant migration
+  snapshot_bounds() on source
+  cluster destinations by read position
+  for each cluster (read units in parallel on the read pool):
+    read unit (position, hi]                     → direct-SQL feed (append-only)
+                                                   or table_changes (full CDC)
+    resolve preimages (full CDC)                 → handle cross-tenant migration
     split by routing field                       → Arrow routing
     buffer per destination                       → advance in-memory position
   evaluate flush triggers                        → submit eligible flushes to workers
@@ -58,7 +59,7 @@ flush worker (per destination, concurrent):
   advance_cursor()                               → persist to Postgres
 ```
 
-One poll thread reads and buffers; `delivery.workers` threads flush. DuckLake snapshots are the cursor. State lives on plain Postgres. Designed for high fanout (100s-1000s of destinations).
+One poll thread plans, routes, and buffers; `poll.read_workers` connections read units in parallel; `delivery.workers` threads flush. DuckLake snapshots are the cursor. State lives on plain Postgres. Designed for high fanout (100s-1000s of destinations).
 
 ## Architecture
 
@@ -76,11 +77,17 @@ Core modules:
 | [`delivery.py`](viaduck/delivery.py) | Per-destination buffers, flush triggers, flush worker pool | Buffered delivery |
 | [`apply.py`](viaduck/apply.py) | Phase 2 conflict resolution, Phase 3 atomic delete/upsert, write retry | Destination apply |
 | [`config.py`](viaduck/config.py) | YAML parsing, env var resolution, validation | Configuration |
-| [`source.py`](viaduck/source.py) | Source catalog connection, CDC reading (`table_changes` / `table_insertions`) | CDC |
+| [`source.py`](viaduck/source.py) | Source catalog connection, extension CDC reading (`table_changes`, full CDC mode) | CDC |
+| [`feed.py`](viaduck/feed.py) | Direct-SQL CDC feed (append-only mode): psycopg catalog planning + stock parquet scans | CDC |
 | [`router.py`](viaduck/router.py) | Arrow splitting by routing field | Routing |
 | [`schema_projection.py`](viaduck/schema_projection.py) | Per-destination column drops, ordering, and safe casts with build-time guards | Schema projection |
 | [`destination.py`](viaduck/destination.py) | LRU connection pool for destination catalogs, lease pinning | Connections |
 | [`state.py`](viaduck/state.py) | Per-destination cursors on plain Postgres | State tracking |
+| [`lifecycle.py`](viaduck/lifecycle.py) | Operator-intent destination states (active/paused/draining/retired) | Lifecycle |
+| [`discovery.py`](viaduck/discovery.py) | CP payload fetch/map/materialize, drift watcher | Discovery |
+| [`reconciler.py`](viaduck/reconciler.py) | Applies CP view changes live (`discovery.apply_enabled`) | Discovery |
+| [`registry.py`](viaduck/registry.py) | Runtime destination-config resolution (never the frozen startup cfg) | Discovery |
+| [`k8s_secrets.py`](viaduck/k8s_secrets.py) | TTL-cached Kubernetes Secret reads for discovered tenants | Discovery |
 | [`arrowutil.py`](viaduck/arrowutil.py) | Shared Arrow kernel helpers | Vectorization |
 | [`metrics.py`](viaduck/metrics.py) | Prometheus metric definitions | Observability |
 | [`server.py`](viaduck/server.py) | HTTP `/metrics`, `/healthz`, `/readyz`, status web UI | Health checks |
@@ -89,10 +96,12 @@ Core modules:
 
 Viaduck operates in one of two modes, selected by the **required** `routing.mode` field:
 
-| Mode | Config | CDC API | Destination writes | Use case |
-|------|--------|---------|-------------------|----------|
-| **Append-only** | `mode: append_only` + `key_columns: []` | `table_insertions()` | `append()` | Insert-only sources (events, append-only fact tables) |
-| **Full CDC** | `mode: full_cdc` + non-empty `key_columns` | `table_changes()` | `delete()` + `upsert()` | Sources that emit deletes/updates; the join columns are the upsert keys |
+| Mode | Config | CDC read path | Destination writes | Use case |
+|------|--------|---------------|-------------------|----------|
+| **Append-only** | `mode: append_only` + `key_columns: []` | Direct-SQL feed ([`feed.py`](viaduck/feed.py)): psycopg catalog planning + stock parquet scans, parallel on the read pool | `append()` | Insert-only sources (events, append-only fact tables) |
+| **Full CDC** | `mode: full_cdc` + non-empty `key_columns` | Extension changefeed (`ducklake_table_changes()`, [`source.py`](viaduck/source.py)) — the feed has no delete stream | `delete()` + `upsert()` | Sources that emit deletes/updates; the join columns are the upsert keys |
+
+The append-only extension read path (`table_insertions()`) was removed after the feed cutover; the retired `source.cdc_reader` knob is inert if a stale config still carries it.
 
 `routing.mode` is required (no default). Misconfiguration (`mode` unset, unknown value, `full_cdc` with empty `key_columns`, `append_only` with non-empty `key_columns`) fails fast at startup with an actionable `ConfigError` — earlier viaduck versions inferred the mode from `len(key_columns) > 0`, which silently flipped the entire pipeline shape when an operator typo'd or accidentally emptied the list.
 
@@ -106,14 +115,14 @@ CDC **reads** happen at poll cadence; destination **writes** happen at flush cad
 
 Each poll cycle ([`main.py:_poll_cycle`](viaduck/main.py)):
 
-1. **Snapshot check** — `current_snapshot()` on the source table. If no snapshots exist, sleep and retry.
+1. **Snapshot check** — `snapshot_bounds()` on the source table (one MIN/MAX statement yields the retention floor and the head). If no snapshots exist, sleep and retry.
 2. **Read plan** — atomic snapshot of each destination's in-memory read position + epoch from the delivery manager ([`delivery.py:read_plan`](viaduck/delivery.py)). Positions start at the persisted cursors and advance in memory as reads land.
 3. **Cluster by position** — destinations at (or near) the same position share one read-unit read, masked per destination ([`main.py:_position_clusters`](viaduck/main.py)).
-4. **CDC read** — full CDC mode: `table_changes` (inserts, deletes, update pre/post images); append-only mode reads via the **direct-SQL feed** (indexed catalog queries + stock parquet scans). The range is half-open `(position, current]` — the position snapshot was already delivered ([`source.py`](viaduck/source.py)). Routing values are pushed down as a SQL `IN` filter. Reads are **row/byte/span-bounded units** (`poll.read_unit_max_rows`/`read_unit_max_bytes`/`read_unit_max_span`), planned against the catalog so the unit lands under the destination commit cliff by construction. Destinations whose positions fit one unit span share the read (cluster fan-in, masked per destination by position); distinct clusters read in parallel on the read pool (`poll.read_workers`). Destinations at their per-destination buffer cap are excluded from the unit's filter and their position frozen — backpressure is per-destination, not global.
+4. **CDC read** — full CDC mode: `table_changes` (inserts, deletes, update pre/post images); append-only mode reads via the **direct-SQL feed** (indexed catalog queries + stock parquet scans). The range is half-open `(position, current]` — the position snapshot was already delivered ([`source.py`](viaduck/source.py)). Routing values are pushed down as a SQL `IN` filter. Reads are **row/byte/span-bounded units** (`poll.read_unit_max_rows`/`read_unit_max_bytes`/`read_unit_max_span`), planned against the catalog so the unit lands under the destination commit cliff by construction. Destinations whose positions fit one unit span share the read (cluster fan-in, masked per destination by position); distinct clusters read in parallel on the read pool (`poll.read_workers` bare DuckDB connections — feed path only; full CDC reads stay serial on the source connection and cluster by exact position). Each unit read is bounded by `poll.read_unit_timeout_seconds` (default 300s): a wedged read (S3 stall, slow catalog) fails contained and retries next cycle. Destinations at their per-destination buffer cap are excluded from the unit's filter and their position frozen — backpressure is per-destination, not global.
 5. **Phase 1: Preimage Resolution** *(full CDC only)* — pair `update_preimage` with `update_postimage` rows by `rowid` (Arrow hash join). Cross-tenant mutations convert the preimage to a delete on the old destination; same-tenant preimages drop; orphaned preimages convert to deletes ([`main.py:_resolve_preimages`](viaduck/main.py)).
 6. **Route** — `split_and_count()` partitions the Arrow table by routing value in a single vectorized pass ([`router.py:split_and_count`](viaduck/router.py)).
 7. **Buffer** — routed batches accumulate in per-destination buffers; the read position advances in memory. Destinations with no routed rows advance position only — zero writes for idle destinations ([`delivery.py:buffer`](viaduck/delivery.py)).
-8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ `flush_max_rows`, bytes ≥ `flush_max_bytes`, per-destination queue (buffered + in-flight) at its cap (trigger label `memory`), or shutdown. The per-destination cap is `buffer_total_max_bytes / N` by default, or `buffer_max_bytes_per_destination` explicitly. One flush takes at most `flush_batch_max_rows` rows (default 60K, sliced at chunk boundaries; the remainder drains immediately after — bounded append batches are what keep the fork's native layer out of its big-batch pathology). Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)) — unless the destination's **circuit breaker** is open (below).
+8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ `flush_max_rows`, bytes ≥ the destination's **adaptive flush target** (`delivery.flush_adaptive`, default on: an AIMD controller per destination that starts at `flush_max_bytes`, halves when a flush exceeds `flush_adaptive_high_seconds`, steps up `flush_adaptive_step_bytes` when a near-full flush beats `flush_adaptive_low_seconds`, floored at `flush_adaptive_min_bytes` — a commit-contended catalog gets small batches, an idle one gets full-size), per-destination queue (buffered + in-flight) at its cap (trigger label `memory`), or shutdown. The per-destination cap is `buffer_total_max_bytes / N` by default, or `buffer_max_bytes_per_destination` explicitly. One flush takes at most `flush_batch_max_rows` rows (default 60K, sliced at chunk boundaries; the remainder drains immediately after with trigger label `sliced` — bounded append batches are what keep the fork's native layer out of its big-batch pathology). Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)) — unless the destination's **circuit breaker** is open (below).
 9. **Lag metrics + status** — per-destination snapshot lag from the delivery manager's authoritative in-memory view.
 
 Each flush (worker thread, [`delivery.py:_flush`](viaduck/delivery.py)):
@@ -147,8 +156,8 @@ Two guards keep one sick destination from taxing the whole fleet on this shared 
 |----------|----------|--------|
 | No snapshots on source | Poll returns early, sleeps | [`test_poll_cycle_no_snapshots`](tests/unit/test_main.py) |
 | All destinations caught up | No CDC reads, no writes | [`test_poll_cycle_all_caught_up`](tests/unit/test_main.py) |
-| Empty changeset | Cursors advanced without writing | [`test_poll_cycle_empty_changeset_advances_cursors`](tests/unit/test_main.py) |
-| Destinations at different snapshots | Grouped CDC reads — one per distinct cursor position | [`test_group_by_cursor_mixed`](tests/unit/test_main.py) |
+| Empty changeset | Read positions advanced without writing (persisted on the flush cadence) | [`test_poll_cycle_empty_changeset_advances_positions`](tests/unit/test_main.py) |
+| Destinations at different snapshots | Clustered read units — positions within one unit span share a read (exact-position clusters in full CDC) | [`test_position_clusters_span_merge`](tests/unit/test_main.py), [`test_poll_cycle_full_cdc_clusters_exact_positions_only`](tests/unit/test_main.py) |
 | New destination (no prior state) | Initialized at snapshot 0, replays full history | [`test_state_integration`](tests/integration/test_state_integration.py) |
 | Rows with no matching destination | Counted as unrouted, metricked, silently dropped | [`test_split_string_no_match`](tests/unit/test_router.py) |
 | NULL values in routing column | Not routed, counted as unrouted | [`test_split_null_values_not_routed`](tests/unit/test_router.py) |
@@ -184,7 +193,7 @@ There is **no data loss path** — machine-checked, not just argued: every consi
 | Crash after destination commit, before cursor persist | Destination has data, cursor stale | At-least-once: range re-read and re-applied idempotently (full CDC); tombstones remove any since-deleted rows the crashed commit wrote. | Per-destination |
 | Cursor persist failure (PG down) | Destination commit already landed | 3 in-process retries ([`delivery.py:_advance_cursor_with_retry`](viaduck/delivery.py)); on exhaustion, same path as flush failure — range re-read, idempotent re-apply. | Per-destination |
 | Destination apply failure (full CDC) | Delete + upsert transaction rolled back | No partial state on destination. Buffer dropped, range re-read. | Per-destination |
-| SIGTERM with data buffered | Shutdown drain | `drain()` flushes everything buffered (trigger=shutdown), bounded by a 60s deadline; anything abandoned is re-read on restart. Note: the 60s deadline exceeds K8s's default 30s `terminationGracePeriodSeconds` — raise the grace period or expect SIGKILL to cut the drain short (safe, just re-read). | — |
+| SIGTERM with data buffered | Shutdown drain | `drain()` flushes everything buffered (trigger=shutdown), bounded by a 60s deadline; anything abandoned is re-read on restart. Note: the 60s deadline exceeds K8s's default 30s `terminationGracePeriodSeconds` — raise the grace period or expect SIGKILL to cut the drain short (safe, just re-read). The watermark self-recycle exit uses a 300s drain budget instead (no grace clock is ticking — see Deployment). | — |
 | Destination at its buffer cap | Backpressure (by design) | The destination's queue (buffer + in-flight) hit its per-destination cap: its buffer force-flushes (trigger=`memory`) and its CDC reads pause until the flush drains — `viaduck_delivery_reads_paused` gauges it. Healthy peers keep reading and flushing. | **Per-destination** |
 | Destination failing flushes repeatedly | Circuit breaker opens after `flush_circuit_failures` consecutive failures | Flush submissions pause behind an exponential backoff; reads continue under the buffer cap. A probe after each backoff closes the circuit on success. `viaduck_delivery_circuit_open` / `viaduck_delivery_circuit_opens_total` gauge/count it; logs WARN on open. | **Per-destination** |
 | Routing field missing from source | `RoutingError` halts group processing | Error metricked, logged. Requires config or schema fix. | All destinations in group |
@@ -192,7 +201,6 @@ There is **no data loss path** — machine-checked, not just argued: every consi
 
 ## Not Yet Supported
 
-- **Dynamic destination discovery** — destinations are defined statically in YAML. No runtime discovery from a DuckLake table.
 - **Schema evolution propagation** — source schema changes are not automatically applied to existing destination tables. Requires viaduck restart. Source reads project the explicit startup column set, so a column added upstream mid-stream is invisible (not an error) until restart; columns with types pyducklake cannot represent (e.g. DuckDB `VARIANT`, which cannot export to Arrow) are excluded at load with a warning and `viaduck_source_columns_excluded_total`.
 - **Exactly-once delivery** — at-least-once only. No deduplication layer.
 - **PostHog events integration** — operational events (flush failures, seeds, drains, halted destinations) emitted as PostHog events for product-side observability.
@@ -253,8 +261,10 @@ defaults:
 poll:
   interval_seconds: 5                       # how often to poll for new snapshots
   read_unit_max_rows: 50000               # rows per CDC read unit (bounds read size + flush unit during catch-up)
+  # read_unit_max_bytes: 268435456        # bytes per read unit (256 MiB)
   # read_unit_max_span: 10000             # snapshots per read unit, max
   # read_workers: 8                       # parallel read-pool connections (direct feed)
+  # read_unit_timeout_seconds: 300        # per-unit read wall-clock ceiling
 
 state:
   table: "viaduck_state"                    # Postgres cursor table
@@ -273,6 +283,17 @@ delivery:
   # flush_deadline_seconds: 0               # overall per-flush wall-clock bound (0 = derive: 2 x flush_interval)
   flush_circuit_failures: 3                 # consecutive failures before a destination's circuit breaker opens
   flush_circuit_max_seconds: 900            # cap on the circuit breaker's exponential resubmit backoff
+  # flush_adaptive: true                    # per-destination AIMD flush-size target (see Poll Cycle)
+  # flush_adaptive_low_seconds: 5           # faster than this + near-full batch → step the target up
+  # flush_adaptive_high_seconds: 30         # slower than this → halve the target
+  # flush_adaptive_step_bytes: 16777216     # +16 MiB per fast flush (capped at flush_max_bytes)
+  # flush_adaptive_min_bytes: 8388608       # target floor (8 MiB; effective floor is one CDC chunk)
+
+memory:
+  self_recycle_enabled: true                # watermark self-recycle (see Deployment)
+  # self_recycle_rss_gib: 0                 # absolute RSS watermark in GiB (0 = derive from fraction)
+  # self_recycle_rss_fraction: 0.75         # watermark as fraction of the cgroup memory limit
+  # self_recycle_min_uptime_seconds: 3600   # never recycle a young (catching-up) process
 
 server:
   port: 8000                                # metrics, health checks, status UI
@@ -364,7 +385,7 @@ A destination paused while it has never been seeded (cursor 0) skips seeding at 
 
 With `discovery.enabled`, viaduck polls the duckgres control plane's read-only endpoint (`GET /api/v1/warehouses`, authenticated with the scoped read-only secret via `discovery.auth_header_name` + `discovery.auth_token_env`) at startup and extends the static destination set: one destination per (warehouse, team), id `org-<org_id>-team-<team_id>`, routing value = team id, **table = the payload's `events_table` verbatim** (the CP owns naming; renames are not allowed upstream). Metadata-store passwords resolve via a direct Kubernetes Secret read with viaduck's ServiceAccount (`password_secret_ref` — RBAC into the tenant namespace, no secret copies, no plaintext payloads).
 
-Semantics: **additive, static wins, fixed set.** A static destination beats a discovered one on routing-value collision (cutover = delete the static entry). Discovered destinations initialize at the source head (`seed_mode`-independent: discovery starts the stream, never backfills) with convention defaults — schema projection on, `captured_at` dropped, `memory_limit` from `discovery.defaults`. The destination set is fixed at startup; a background poller detects drift (`viaduck_discovery_drift_destinations{kind}`) and a restart applies it. Fail-open at startup (CP unreachable → static-only + `viaduck_discovery_synced` 0); fail-safe per entry (`viaduck_discovery_broken_entries_total{reason}` — a broken tenant never takes down the rest; non-writable/resharding warehouses are skipped).
+Semantics: **additive, static wins, fixed set.** A static destination beats a discovered one on routing-value collision (cutover = delete the static entry). Discovered destinations initialize at the source head (`seed_mode`-independent: discovery starts the stream, never backfills) with convention defaults — schema projection on, `captured_at` dropped, `memory_limit` from `discovery.defaults`. The destination set is fixed at startup; a background poller detects drift (`viaduck_discovery_drift_destinations{kind}`) and a restart applies it — unless `discovery.apply_enabled: true` (default false), which activates the reconciler ([`reconciler.py`](viaduck/reconciler.py)): CP view changes apply live as start/stop/restart primitives, guarded by a stop debounce (`absent_stop_fetches` consecutive clean fetches before a running destination deactivates), a mass-stop floor (`stop_floor_fraction`), and a restart rate cap (`restart_min_interval_s`); deferred work is visible on `viaduck_reconciler_pending{reason}`. Fail-open at startup (CP unreachable → static-only + `viaduck_discovery_synced` 0); fail-safe per entry (`viaduck_discovery_broken_entries_total{reason}` — a broken tenant never takes down the rest; non-writable/resharding warehouses are skipped).
 
 Operational notes: use **https** for `discovery.url` where available — the payload directs which tenant Secret viaduck reads and which endpoint receives the resulting password in a libpq handshake, so an on-path spoof is a credential-exfiltration vector; the `allowed_endpoint_suffixes` (default `.ducklings.svc[.cluster.local]`) and `allowed_secret_namespaces` (default `ducklings`) allowlists are the defense-in-depth for exactly that. **Cutover** to discovery for a formerly-static tenant is gap-free only when the static destination's id already equals `org-<org_id>-team-<team_id>` (the cursor row carries over via `ON CONFLICT DO NOTHING`); otherwise the discovered twin initializes at head and the range between the static cursor and head is skipped. **Tenant password rotation** requires a viaduck restart (the Secret resolves once at startup). **Resharding**: when a startup org turns `writable=false` the drift watcher ERRORs — pause that org's destinations via the lifecycle table immediately (the fence-to-pause window is real exposure: flushes landing on the old store in that window advance the cursor but may not survive the cutover copy); after the reshard completes it surfaces as `changed` drift because the metadata endpoint moved — restart to pick up the new endpoint, then **un-pause** (the lifecycle state persists deliberately). Running on the old endpoint risks writing a decommissioned store. Under `instance.partition.mode: explicit`, discovered ids are never in the include list — use `hash` (or `all`) with discovery.
 
@@ -438,15 +459,18 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `lagging` | CDC reads are behind the source — data exists that viaduck has not yet read |
 | `error` | The last flush failed; the buffered range was dropped and will be re-read (see Error states) |
 
-32 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)):
+65 Prometheus metrics exposed on `GET /metrics` (port 8000). Pipeline label auto-injected ([`metrics.py`](viaduck/metrics.py)). The table lists the core pipeline set; the remaining families — direct-SQL feed (`viaduck_cdc_feed_*`), lifecycle (`viaduck_destination_lifecycle_state`, `viaduck_lifecycle_discarded_rows_total`), circuit breaker and flush deadline (`viaduck_delivery_circuit_*`, `viaduck_delivery_flush_deadlines_total`), and discovery/reconciler (`viaduck_discovery_*`, `viaduck_reconciler_pending`, `viaduck_secret_cache_stale_fallback_total`) — instrument the features described in their own sections:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `viaduck_polls_total` | Counter | — | Poll cycles executed |
 | `viaduck_cdc_read_seconds` | Histogram | — | Time to read CDC from source |
 | `viaduck_cdc_rows_read_total` | Counter | — | Total rows read from source |
-| `viaduck_cdc_batch_rows` | Histogram | — | Rows per CDC read (monitors batch sizes; large values indicate poll interval too slow) |
+| `viaduck_cdc_batch_rows` | Histogram | — | Rows per CDC read unit |
 | `viaduck_source_snapshot_id` | Gauge | — | Current source snapshot ID |
+| `viaduck_source_columns_excluded_total` | Counter | column, type | Source columns excluded from replication (unrepresentable types, e.g. VARIANT) |
+| `viaduck_read_clusters` | Gauge | — | Distinct read-unit clusters this cycle (1 at head-converged; growth = cursor scatter, the read-loop regression alarm) |
+| `viaduck_read_pool_inflight` | Gauge | — | Unit reads dispatched but not yet applied |
 | `viaduck_dest_write_seconds` | Histogram | destination | Time per destination write |
 | `viaduck_dest_rows_written_total` | Counter | destination | Rows appended (append-only mode) |
 | `viaduck_dest_rows_deleted_total` | Counter | destination | Rows deleted via CDC |
@@ -454,16 +478,22 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_dest_upsert_matched_total` | Counter | destination | Rows that matched existing rows during upsert (updates vs inserts) |
 | `viaduck_dest_last_snapshot_id` | Gauge | destination | Last replicated snapshot |
 | `viaduck_dest_lag_snapshots` | Gauge | destination | Snapshot lag per destination |
+| `viaduck_dest_time_lag_seconds` | Gauge | destination | Wall-clock age of the last flushed source snapshot (exact, no commit-rate assumption) |
+| `viaduck_dest_flush_target_bytes` | Gauge | destination | Adaptive per-destination flush-size target (pinned at the floor = commit-contended catalog) |
 | `viaduck_unrouted_rows_total` | Counter | — | Rows with no matching destination |
 | `viaduck_pool_open_connections` | Gauge | — | Open destination connections |
 | `viaduck_pool_evictions_total` | Counter | — | LRU evictions |
+| `viaduck_pool_force_evictions_total` | Counter | destination, reason | Write-retry force-evictions of a pooled catalog (`connection` / `instance_fatal`) |
 | `viaduck_pool_creates_total` | Counter | — | Connections created |
 | `viaduck_delivery_buffer_rows` | Gauge | destination | Rows buffered awaiting flush |
 | `viaduck_delivery_buffer_bytes` | Gauge | destination | Bytes buffered awaiting flush |
 | `viaduck_delivery_buffer_total_bytes` | Gauge | — | Total buffered + in-flight bytes (watermark input) |
-| `viaduck_delivery_flushes_total` | Counter | destination, trigger | Flushes by trigger (interval/rows/bytes/memory/shutdown) |
+| `viaduck_delivery_flushes_total` | Counter | destination, trigger | Flushes by trigger (interval/rows/bytes/memory/sliced/shutdown) |
 | `viaduck_delivery_flush_seconds` | Histogram | destination | Flush duration (data flushes only) |
 | `viaduck_delivery_buffers_dropped_total` | Counter | destination | Buffers dropped on flush failure |
+| `viaduck_delivery_covered_replays_dropped_total` | Counter | destination | Buffered replay entries dropped at flush commit (already covered by it) |
+| `viaduck_retention_clamp_total` | Counter | destination, outcome | Retention-edge cursor clamps (`lost` = unrecoverable, alert; `at_risk` = pending flush) |
+| `viaduck_self_recycles_total` | Counter | — | Clean watermark-triggered restarts (drain + exit 0 on RSS watermark) |
 | `viaduck_cdc_routing_mutations_total` | Counter | — | Cross-tenant routing value changes |
 | `viaduck_cdc_conflicts_resolved_total` | Counter | — | Rowid-level conflicts resolved in Phase 2 |
 | `viaduck_cdc_tombstones_emitted_total` | Counter | — | Deletes surviving from insert+delete pairs (write cost of phantom healing; churn signal) |
@@ -503,7 +533,7 @@ just test              # run unit tests
 just test-integration  # run integration tests (local DuckDB)
 just test-perf         # run performance benchmarks
 just test-perf-json    # benchmarks + JSON output to perf-results.json
-just ci                # full CI: lock-check, format, lint, tests, semgrep, Docker build
+just ci                # full CI: lock-check, format, lint, unit + integration tests, docs-check, semgrep, Docker build
 just docs              # render d2 diagrams to SVG
 just docs-check        # verify all README links are valid
 just up                # start docker-compose stack
@@ -541,6 +571,27 @@ The fanout benchmark is the honest end-to-end number: full-CDC flushes through t
 
 A [Grafana dashboard](grafana/dashboards/viaduck.json) covering the metrics is included. Available at `http://localhost:3000/d/viaduck/viaduck` when running `just up`.
 
+## Formal Verification (TLA+)
+
+The delivery semantics are machine-checked by a suite of TLC models under `tla/`. Every crash and failure transition is checked unconditionally — no crash conditioning.
+
+| Model | Checks | Result |
+|-------|--------|--------|
+| [`Viaduck.tla`](tla/Viaduck.tla) + `Viaduck.cfg` | The main model (full CDC): 8 safety invariants — EventualConsistency, NoPhantomWhenCurrent, NoDataLossWhenCurrent, CursorMonotonicity, PartitionCorrectness, BufferPositionBound, FlushStateConsistency, EntryCoverageInvariant — over buffered delivery, slice-cursor coverage, lifecycle pause/drain, seeding, and every modeled crash window | Complete search: ~1.9B states generated, 132,190,573 distinct — all hold |
+| `ViaduckAppend.cfg` | The same module with `AppendOnly = TRUE` (`routing.mode: append_only`): no deletes/updates, repeated keys, straddle slices | Same 8 invariants hold |
+| [`ViaduckJoin.tla`](tla/ViaduckJoin.tla) + `ViaduckJoin.cfg` | Membership epochs for CP-driven destinations (`DestStart` cursor jumps: join-at-head, retention-edge re-add). Base consistency invariants are re-scoped to post-join CDC activity; phantom-freedom stays global | 100.8M states — all hold |
+| [`ViaduckReads.tla`](tla/ViaduckReads.tla) + `ViaduckReads.cfg` / `ViaduckReadsUnguarded.cfg` | The per-destination in-flight read guard for the parallel read pool (`ReadOrderSafety`) | Guarded PASSES; unguarded correctly FAILS with the overlap counterexample — the negative proof that the guard is load-bearing |
+| [`Reshard.tla`](tla/Reshard.tla) + `Reshard.cfg` / `ReshardUnguarded.cfg` | The reconciler's config-swap quiesce gate (`NoStaleEndpointWrite`) | Guarded PASSES; unguarded correctly FAILS — same negative-proof pattern |
+
+```bash
+just tlc               # main model (long run)
+just tlc-join          # membership-epoch extension
+just tlc-reads         # read guard (tlc-reads-unguarded must FAIL)
+just tlc-reshard       # config-swap gate (tlc-reshard-unguarded must FAIL)
+```
+
+Known open issue (modeled out by construction, tracked in the spec header): DuckLake empirically reuses a rowid when an upsert re-creates a deleted key, violating the rowid-stability assumption — see the rowid-reuse bullet under Not Yet Supported.
+
 ## Deployment
 
 ```bash
@@ -550,6 +601,12 @@ kubectl apply -f k8s/deployment.yaml
 ```
 
 Viaduck runs as a K8s Deployment (not StatefulSet — no ordinal-based identity needed). For horizontal scaling, deploy multiple instances with different `instance.partition` configs. See [`k8s/deployment.yaml`](k8s/deployment.yaml) for manifests.
+
+### Watermark self-recycle
+
+Long-lived processes accrue untracked native memory in the ducklake extension (roughly proportional to catalog metadata volume, freed only on connection close). An OOM-kill mid-flight rewinds every destination to its durable cursor and scatters the cursor groups; a clean exit after a drain leaves cursors tight at the read position. So viaduck preempts the OOM: after `memory.self_recycle_min_uptime_seconds` (default 3600 — a post-restart catch-up legitimately runs hot), each poll cycle checks RSS against a watermark; on crossing it, the process finishes the cycle, drains with a 300s budget (longer than the SIGTERM drain — no grace clock is ticking), and exits 0 for an in-place kubelet restart (`restartPolicy: Always`). Signals: the `[SELF-RECYCLE]` WARN, `viaduck_self_recycles_total`, and the container's last-state `Completed`/exit 0 (vs `OOMKilled`/137).
+
+Knobs ([`config.py`](viaduck/config.py) `memory.*`): `self_recycle_enabled` (default true), `self_recycle_rss_gib` (absolute watermark, default 0 = derive), `self_recycle_rss_fraction` (default 0.75 × the cgroup memory limit; disabled with a startup log if no limit is readable). Sizing: the watermark must clear the deployment's legitimate peak (≈ `delivery.buffer_total_max_bytes` + pool native footprint + baseline) or leak-free load recycles the pod every min-uptime — sized deployments should set the absolute knob.
 
 ## Error Handling and Retries
 
