@@ -557,17 +557,28 @@ class DeliveryManager:
                 buf = self._buffers[dest_id]
                 # Flush-batch slicing: one swap takes at most
                 # flush_batch_max_rows AND at most the adaptive per-dest
-                # byte target, cut at CHUNK boundaries (a single oversize
-                # entry still goes whole — poll.read_unit_max_rows bounds
-                # that). Without the rows cap, a slow flush lets the
-                # buffer pile up and the next swap takes everything — the
-                # feedback loop that produced 170-440K-row batches and
-                # drove the fork's native layer into buffer-manager
-                # corruption (2026-07-29). Without the BYTE cut, the
-                # adaptive target would gate only the trigger while
-                # backlogged swaps stay rows-cap-sized — the controller
-                # would converge its target and actuate nothing in
-                # exactly the contended-catalog regime it exists for.
+                # byte target, cut at CHUNK boundaries — and, when the
+                # FIRST entry alone exceeds a cap, cut WITHIN it
+                # (zero-copy pa.Table.slice). Without the rows cap, a slow
+                # flush lets the buffer pile up and the next swap takes
+                # everything — the feedback loop that produced 170-440K-row
+                # batches and drove the fork's native layer into
+                # buffer-manager corruption (2026-07-29). Without the BYTE
+                # cut, the adaptive target would gate only the trigger
+                # while backlogged swaps stay rows-cap-sized — the
+                # controller would converge its target and actuate nothing
+                # in exactly the contended-catalog regime it exists for.
+                # And without the WITHIN-entry cut, a single destination-
+                # heavy read unit arrives as one unsliceable entry that
+                # bypasses both caps at once: the 2026-08 team-2 episode
+                # (~100K-op/1.4GB single-entry appends at 145-468s while
+                # the adaptive target sat pinned at its floor, powerless).
+                # Flush payload is priced by the S3 upload of its bytes
+                # (append profiles: ~90% of statement latency), so p95/p99
+                # flush duration IS payload size — the cap must bind
+                # for every entry shape (up to row-size skew: the split is
+                # rows-proportional, so a few giant variable-width rows
+                # can overshoot the byte cap; a single row is the floor).
                 # The remainder stays buffered with its age preserved,
                 # and the "sliced" trigger keeps the pipeline of bounded
                 # slices draining back-to-back.
@@ -589,8 +600,49 @@ class DeliveryManager:
                         take += 1
                 sliced = buf.entries[:take]
                 remainder = buf.entries[take:]
+                # Within-entry slice: the loop above always admits the
+                # first entry whole. If that entry alone is over a cap,
+                # split it and leave the tail (SAME cov/hi — the entry's
+                # coverage is indivisible) at the buffer head. The head
+                # slice's flush must NOT persist the entry's cov: rows
+                # covered by cov are only fully delivered when the tail
+                # lands, so `through` stays at the durable flushed
+                # position (strictly conservative vs the slice-cursor
+                # rule / EntryCoverageInvariant — the cursor advances
+                # less eagerly than the model permits, never more).
+                entry_split = False
+                if take == 1:
+                    tbl0, cov0, hi0 = sliced[0]
+                    over_rows = cap > 0 and tbl0.num_rows > cap
+                    over_bytes = byte_cap > 0 and tbl0.nbytes > byte_cap
+                    if (over_rows or over_bytes) and tbl0.num_rows > 1:
+                        n = tbl0.num_rows
+                        if over_rows:
+                            n = min(n, cap)
+                        if over_bytes and tbl0.nbytes > 0:
+                            n = min(n, max(1, (tbl0.num_rows * byte_cap) // tbl0.nbytes))
+                        if 0 < n < tbl0.num_rows:
+                            sliced = [(tbl0.slice(0, n), cov0, hi0)]
+                            remainder = [(tbl0.slice(n), cov0, hi0)] + remainder
+                            entry_split = True
                 tables = [tbl for tbl, _cov, _hi in sliced]
-                if remainder:
+                if entry_split:
+                    # Partial-entry swap: no coverage completes — persist
+                    # NOTHING (through=None). Using self._flushed here is
+                    # wrong: the retention clamp is the one writer that
+                    # raises _flushed WITHOUT delivering, so a head slice
+                    # carrying that value into the commit path would run
+                    # DropCoveredPrefix at the clamp floor and silently
+                    # drop the undelivered tail (adversarial-review
+                    # HIGH-1, reproduced). None makes the commit path skip
+                    # cursor persist, position restore, AND the covered-
+                    # prefix drop — a split flush contributes destination
+                    # rows and adaptive/circuit evidence, nothing else.
+                    # (NOTE: pa.Table.slice is zero-copy; slice nbytes can
+                    # over-report shared buffers, so buffer-bytes gauges
+                    # for a split are approximate until the entry drains.)
+                    through = None
+                elif remainder:
                     # Cursor for a partial swap: the last included chunk's
                     # through — NOT the live position, which covers the
                     # chunks left behind.
@@ -821,8 +873,19 @@ class DeliveryManager:
                 duration,
             )
 
-    def _flush(self, dest_id: str, tables: list[pa.Table], through: int, trigger: str) -> None:
-        """Worker: FlushCommit / FlushFail."""
+    def _flush(self, dest_id: str, tables: list[pa.Table], through: int | None, trigger: str) -> None:
+        """Worker: FlushCommit / FlushFail.
+
+        `through=None` marks a PARTIAL-ENTRY flush (within-entry slice):
+        the destination write happens and counts as adaptive/circuit
+        evidence, but no cursor state moves — no durable advance, no
+        _flushed/position update, no covered-prefix drop, no error clear.
+        The entry's coverage persists only with its completing slice.
+        Consequence (accepted, at-least-once): every committed head slice
+        widens the duplicate window on a later failure to at most one
+        entry — a mid-drain failure re-reads the whole entry and
+        re-applies landed slices (append_only duplicates them).
+        """
         t0 = time.monotonic()
         batch_bytes = sum(t.nbytes for t in tables)
         deadline = t0 + self._flush_deadline_s if self._flush_deadline_s is not None else None
@@ -852,11 +915,13 @@ class DeliveryManager:
             # destination write already landed.
             with self._lock:
                 cumulative = self._rows_replicated[dest_id] + ops_count
-            self._advance_cursor_with_retry(dest_id, through, cumulative)
+            if through is not None:
+                self._advance_cursor_with_retry(dest_id, through, cumulative)
             duration = time.monotonic() - t0
             type_counts = self._change_type_counts(batch) if tables else None
             with self._lock:
-                self._flushed[dest_id] = max(self._flushed[dest_id], through)
+                if through is not None:
+                    self._flushed[dest_id] = max(self._flushed[dest_id], through)
                 # A lifecycle discard (pause/retire) may have rewound the
                 # position below `through` while this flush was in flight.
                 # The flush SUCCEEDED, so the destination has the range —
@@ -864,7 +929,7 @@ class DeliveryManager:
                 # resume (deterministic duplicates in append_only). Restore
                 # position >= flushed; epoch bump discards any read that
                 # overlapped the restore.
-                if self._position[dest_id] < through:
+                if through is not None and self._position[dest_id] < through:
                     self._position[dest_id] = through
                     self._epoch[dest_id] += 1
                 # Pair-split phantom fix (TLA witness in tla/Viaduck.tla:
@@ -886,7 +951,7 @@ class DeliveryManager:
                 # contiguous units hi == cov; straddle entries (hi > cov)
                 # are NOT droppable by cov, and the model proves why.
                 buf = self._buffers[dest_id]
-                if buf.entries:
+                if through is not None and buf.entries:
                     drop = 0
                     for _tbl, _cov, entry_hi in buf.entries:
                         if entry_hi > through:
@@ -917,7 +982,7 @@ class DeliveryManager:
                 # clamp landed mid-flight) must not clear the clamp's loss
                 # note or regress the cursor gauge.
                 flushed_after = self._flushed[dest_id]
-                if through >= flushed_after:
+                if through is not None and through >= flushed_after:
                     self._last_error[dest_id] = None
                 if type_counts is not None:
                     applied = self._applied[dest_id]
@@ -949,10 +1014,10 @@ class DeliveryManager:
                 if self._on_flush_success is not None:
                     self._on_flush_success()
                 log.info(
-                    "Flushed %s: %d ops through snapshot %d (trigger=%s, %.2fs)",
+                    "Flushed %s: %d ops through snapshot %s (trigger=%s, %.2fs)",
                     dest_id,
                     ops_count,
-                    through,
+                    "PARTIAL-ENTRY (cursor held)" if through is None else through,
                     trigger,
                     duration,
                 )
