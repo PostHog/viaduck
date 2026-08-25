@@ -982,15 +982,67 @@ def test_slice_takes_chunks_up_to_cap_with_boundary_cursor():
     assert mgr.status_snapshot()["d1"].buffer_rows == 4
 
 
-def test_single_oversize_chunk_flushes_whole():
+def test_single_oversize_chunk_is_split_within_entry():
+    # 2026-08: a single destination-heavy read unit arrives as ONE entry
+    # that used to bypass both caps and flush whole (the team-2
+    # ~100K-op/145-468s mega-append episode). Now the entry is cut
+    # within: the head slice flushes at the cap, and — because the
+    # entry's coverage is indivisible — the head's flush must NOT
+    # persist the entry's cov. The tail keeps cov/hi at the buffer head.
     mgr, _, _ = _manager(flush_batch_max_rows=2)
     fake, calls = _recording_flush(mgr)
     _, epoch = mgr.read_plan()["d1"]
     mgr.buffer("d1", _table(7), through_snapshot=10, epoch=epoch)
     with patch.object(mgr, "_flush", fake):
         assert mgr.maybe_flush(shutdown=True) == 1
-    assert sum(t.num_rows for t in calls[0][1]) == 7  # never splits a chunk
-    assert calls[0][2] == 10
+    assert sum(t.num_rows for t in calls[0][1]) == 2  # head slice at cap
+    assert calls[0][2] is None  # partial entry: persist nothing
+    assert mgr.status_snapshot()["d1"].buffer_rows == 5  # tail buffered
+
+
+def test_split_entry_drains_and_advances_cursor_only_on_completion():
+    # Drain the 7-row entry in 2-row slices: cursor persists the entry's
+    # cov only on the flush that completes it, never before.
+    mgr, _, _ = _manager(flush_batch_max_rows=2, flush_interval_seconds=0.0)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(7), through_snapshot=10, epoch=epoch)
+    seen = []
+
+    def _record(pool, d, b, **kw):
+        seen.append(b.num_rows)
+        return b.num_rows
+
+    with patch("viaduck.delivery.append_only", side_effect=_record):
+        for _ in range(8):
+            mgr.maybe_flush(shutdown=True)
+            assert mgr.wait_idle()
+            snap = mgr.status_snapshot()["d1"]
+            if snap.buffer_rows > 0:
+                # Entry not yet fully delivered: cov must not be durable.
+                assert snap.flushed_snapshot == 0
+            if mgr.is_clean("d1"):
+                break
+    assert seen == [2, 2, 2, 1]  # bounded slices, tail remainder last
+    assert mgr.status_snapshot()["d1"].flushed_snapshot == 10
+
+
+def test_byte_cap_splits_oversize_entry():
+    # Adaptive byte target binds within an entry too: with a target far
+    # below the entry's nbytes, the head slice lands near the byte cap
+    # (proportional row split), not the whole entry.
+    mgr, _, _ = _manager(flush_batch_max_rows=0, flush_adaptive=True)
+    _, epoch = mgr.read_plan()["d1"]
+    tbl = _table(100)
+    per_row = max(1, tbl.nbytes // tbl.num_rows)
+    mgr._flush_target["d1"] = per_row * 10  # ~10 rows' worth of bytes
+    fake, calls = _recording_flush(mgr)
+    mgr.buffer("d1", tbl, through_snapshot=10, epoch=epoch)
+    with patch.object(mgr, "_flush", fake):
+        assert mgr.maybe_flush(shutdown=True) == 1
+    head_rows = sum(t.num_rows for t in calls[0][1])
+    assert 1 <= head_rows <= 20  # near the byte cap, never the whole entry
+    assert calls[0][2] is None  # partial entry: persist nothing
+    assert mgr.status_snapshot()["d1"].buffer_rows == 100 - head_rows
 
 
 def test_full_swap_persists_through_position():
@@ -1235,9 +1287,12 @@ def test_swap_byte_cut_disabled_with_adaptive_off():
     assert len(calls[0][1]) == 3  # everything in one swap despite tiny bytes
 
 
-def test_swap_byte_cut_never_splits_single_chunk():
-    # One chunk larger than the target still goes whole (the one-chunk
-    # floor): cdc_chunk_snapshots bounds chunk size, not this layer.
+def test_swap_byte_cut_splits_single_chunk_at_floor():
+    # 2026-08 inversion of the old one-chunk floor: a chunk larger than
+    # the byte target is now cut WITHIN, so the target binds
+    # unconditionally (flush duration is priced by uploaded bytes). At a
+    # degenerate 1-byte target the head slice is the 1-row minimum, and
+    # the partial-entry flush persists nothing.
     mgr, _, _ = _manager(flush_max_bytes=1_000_000_000, flush_adaptive_min_bytes=1)
     fake, calls = _recording_flush(mgr)
     _, epoch = mgr.read_plan()["d1"]
@@ -1246,8 +1301,9 @@ def test_swap_byte_cut_never_splits_single_chunk():
         mgr._flush_target["d1"] = 1  # far below one chunk
     with patch.object(mgr, "_flush", fake):
         assert mgr.maybe_flush() == 1
-    assert len(calls[0][1]) == 1
-    assert calls[0][2] == 10
+    assert sum(t.num_rows for t in calls[0][1]) == 1  # 1-row floor slice
+    assert calls[0][2] is None  # partial entry: persist nothing
+    assert mgr.status_snapshot()["d1"].buffer_rows == 99
 
 
 def test_memory_trigger_fires_regardless_of_target():
@@ -1785,3 +1841,32 @@ def test_flush_commit_drops_covered_replay_entries():
     assert buf.entries[0][1] == 30
     assert buf.rows == 1
     assert mgr._flushed["d1"] == 20
+
+
+def test_split_flush_after_retention_clamp_does_not_drop_tail():
+    # Adversarial-review HIGH-1 regression pin: the retention clamp is the
+    # one writer that raises `flushed` WITHOUT delivering. A head-slice
+    # flush must not carry that value into the commit path — doing so ran
+    # DropCoveredPrefix at the clamp floor and silently dropped the
+    # undelivered tail (data loss). With through=None the tail survives,
+    # drains, and the entry's cov persists on completion.
+    mgr, _, _ = _manager(flush_batch_max_rows=2, flush_interval_seconds=0.0)
+    _, epoch = mgr.read_plan()["d1"]
+    mgr.buffer("d1", _table(7), through_snapshot=10, epoch=epoch)
+    mgr.clamp_to_retention("d1", 50)  # buffered rows are kept per contract
+    seen = []
+
+    def _record(pool, d, b, **kw):
+        seen.append(b.num_rows)
+        return b.num_rows
+
+    with patch("viaduck.delivery.append_only", side_effect=_record):
+        for _ in range(8):
+            mgr.maybe_flush(shutdown=True)
+            assert mgr.wait_idle()
+            if mgr.is_clean("d1"):
+                break
+    assert sum(seen) == 7  # every buffered row delivered, none dropped
+    # Cursor: clamp floor wins (50 > entry cov 10); the entry completing
+    # must not regress it, and nothing may persist beyond it early.
+    assert mgr.status_snapshot()["d1"].flushed_snapshot == 50
