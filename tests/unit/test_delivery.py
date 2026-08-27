@@ -42,7 +42,7 @@ def _recording_flush(mgr):
     in-flight guard contract (the real _flush's finally block)."""
     calls = []
 
-    def _fake(dest, tables, through, trigger):
+    def _fake(dest, tables, through, trigger, est_bytes=None):
         calls.append((dest, tables, through, trigger))
         with mgr._lock:
             mgr._inflight.discard(dest)
@@ -179,7 +179,7 @@ def test_no_second_flush_while_in_flight_and_swap_keeps_buffering():
     started = threading.Event()
     seen = []
 
-    def slow_flush(dest, tables, through, trigger):
+    def slow_flush(dest, tables, through, trigger, est_bytes=None):
         seen.append((sum(t.num_rows for t in tables), through))
         started.set()
         release.wait(5)
@@ -1870,3 +1870,230 @@ def test_split_flush_after_retention_clamp_does_not_drop_tail():
     # Cursor: clamp floor wins (50 > entry cov 10); the entry completing
     # must not regress it, and nothing may persist beyond it early.
     assert mgr.status_snapshot()["d1"].flushed_snapshot == 50
+
+
+# ---------------------------------------------------------------------------
+# Honest-bytes estimation (the 2026-08-26 nbytes-inflation regression class)
+# ---------------------------------------------------------------------------
+
+
+def _offset_sliced_table(parent_rows: int, offset: int, n: int) -> pa.Table:
+    """An entry-shaped table reproducing the PRODUCTION nbytes inflation:
+    a slice of a dictionary-encoded column counts the entire shared
+    dictionary (measured ~41KB/row against ~hundreds true), and
+    combine_chunks does not prune it. Plain flat-array slices do NOT
+    over-report on current pyarrow — the dictionary is the mechanism."""
+    dictionary = pa.array(["v" * 200 + str(i) for i in range(20_000)])
+    indices = pa.array([i % 10 for i in range(parent_rows)], type=pa.int32())
+    parent = pa.table(
+        {
+            "a": pa.array(range(parent_rows), type=pa.int64()),
+            "s": pa.DictionaryArray.from_arrays(indices, dictionary),
+        }
+    )
+    return parent.slice(offset, n)
+
+
+class TestHonestBytes:
+    def test_offset_slice_nbytes_overreports(self):
+        # Fixture sanity: the pathology must exist for these tests to
+        # mean anything. A 100-row slice of a 100K-row parent reports
+        # the parent's buffers.
+        sliced = _offset_sliced_table(100_000, 5_000, 100)
+        from viaduck.delivery import _estimate_row_bytes
+
+        honest = _estimate_row_bytes(sliced) * sliced.num_rows
+        assert sliced.nbytes > honest * 50
+        # combine_chunks alone does NOT fix it (dictionary retained):
+        assert sliced.combine_chunks().nbytes > honest * 50
+
+    def test_estimate_row_bytes_matches_honest_copy(self):
+        from viaduck.delivery import _estimate_row_bytes
+
+        sliced = _offset_sliced_table(100_000, 5_000, 2_000)
+        decoded = sliced.combine_chunks()
+        decoded = pa.Table.from_arrays(
+            [decoded.column("a"), decoded.column("s").cast(pa.string())],
+            names=["a", "s"],
+        )
+        honest_per_row = decoded.nbytes / sliced.num_rows
+        est = _estimate_row_bytes(sliced)
+        assert honest_per_row * 0.5 <= est <= honest_per_row * 2
+
+    def test_estimate_row_bytes_empty_table(self):
+        from viaduck.delivery import _estimate_row_bytes
+
+        assert _estimate_row_bytes(_offset_sliced_table(10, 0, 0)) == 0
+
+    def test_split_sizes_from_honest_bytes_not_inflated(self):
+        # Adaptive byte-cut against an offset-sliced entry: the split must
+        # come out near target/honest_per_row. The inflated math produced
+        # target/parent_bytes-per-row — crumbs ~100x smaller.
+        from viaduck.delivery import _estimate_row_bytes
+
+        mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive=True)
+        entry = _offset_sliced_table(100_000, 5_000, 10_000)
+        per_row = _estimate_row_bytes(entry)
+        target = per_row * 1_000  # honest target: ~1,000 rows
+        with mgr._lock:
+            mgr._flush_target["d1"] = target
+        fake, calls = _recording_flush(mgr)
+        _, epoch = mgr.read_plan()["d1"]
+        mgr.buffer("d1", entry, through_snapshot=5, epoch=epoch)
+        with patch.object(mgr, "_flush", fake):
+            mgr.maybe_flush()
+        assert calls, "expected a flush"
+        rows = calls[0][1][0].num_rows
+        assert 500 <= rows <= 1_100, f"split of {rows} rows is not honest-sized (crumb regression)"
+
+    def test_flush_receives_honest_est_bytes(self):
+        # The adaptive controller's evidence must be in the same units as
+        # the cut. Capture the est_bytes handed to _flush and compare to
+        # the honest sample, not the inflated entry nbytes.
+        from viaduck.delivery import _estimate_row_bytes
+
+        mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive=True)
+        entry = _offset_sliced_table(100_000, 5_000, 500)
+        per_row = _estimate_row_bytes(entry)
+        with mgr._lock:
+            mgr._flush_target["d1"] = per_row * 10_000  # far above the entry: no split
+        received = []
+
+        def _fake(dest, tables, through, trigger, est_bytes=None):
+            received.append(est_bytes)
+            with mgr._lock:
+                mgr._inflight.discard(dest)
+
+        _, epoch = mgr.read_plan()["d1"]
+        mgr.buffer("d1", entry, through_snapshot=5, epoch=epoch)
+        with patch.object(mgr, "_flush", _fake):
+            mgr.maybe_flush(shutdown=True)
+        assert received and received[0] is not None
+        assert received[0] == 500 * per_row
+        assert received[0] < entry.nbytes / 10  # decisively not the inflated number
+
+    def test_adaptive_growth_gate_passes_with_honest_fill(self):
+        # Frozen-controller regression: a target-sized split flush must
+        # satisfy the fill gate when judged in honest units.
+        mgr, _, _ = _manager(
+            flush_batch_max_rows=0,
+            flush_interval_seconds=0.0,
+            flush_adaptive=True,
+        )
+        with mgr._lock:
+            cur = mgr._flush_target["d1"] = 1_000_000
+        honest_batch = 900_000  # fill 0.9 >= 0.7 gate
+        mgr._adapt_flush_target("d1", duration=0.01, batch_bytes=honest_batch)
+        with mgr._lock:
+            grown = mgr._flush_target["d1"]
+        assert grown > cur, "growth gate did not pass with honest fill"
+
+
+class TestHonestBytesTotality:
+    """Review HIGH-1/HIGH-2: the estimator must never raise (poll-cycle
+    escape handler exits the pod) and must price NESTED dictionaries
+    (which inflate identically but dodge a top-level-only check)."""
+
+    def _dict_col(self, parent_rows):
+        dictionary = pa.array(["v" * 200 + str(i) for i in range(20_000)])
+        indices = pa.array([i % 10 for i in range(parent_rows)], type=pa.int32())
+        return pa.DictionaryArray.from_arrays(indices, dictionary)
+
+    def test_struct_of_dict_priced_honestly(self):
+        from viaduck.delivery import _estimate_row_bytes
+
+        col = pa.StructArray.from_arrays([self._dict_col(50_000)], names=["inner"])
+        t = pa.table({"s": col}).slice(1_000, 500)
+        est = _estimate_row_bytes(t)
+        assert 0 < est < 2_000, f"nested dict unpriced or inflated: {est}"
+
+    def test_list_of_dict_priced_honestly(self):
+        from viaduck.delivery import _estimate_row_bytes
+
+        inner = self._dict_col(50_000)
+        offsets = pa.array(range(0, 50_001), type=pa.int32())
+        col = pa.ListArray.from_arrays(offsets, inner)
+        t = pa.table({"l": col}).slice(1_000, 500)
+        est = _estimate_row_bytes(t)
+        assert 0 < est < 2_000, f"list<dict> unpriced or inflated: {est}"
+
+    def test_dict_of_struct_never_raises(self):
+        # dict<struct> casts are unsupported in pyarrow — the estimator
+        # must degrade to 0 (byte-cut inert), never propagate.
+        from viaduck.delivery import _estimate_row_bytes
+
+        struct_vals = pa.StructArray.from_arrays([pa.array(["x" * 100] * 50)], names=["f"])
+        indices = pa.array([i % 50 for i in range(5_000)], type=pa.int32())
+        col = pa.DictionaryArray.from_arrays(indices, struct_vals)
+        t = pa.table({"d": col})
+        est = _estimate_row_bytes(t)  # must not raise
+        assert est >= 0
+
+    def test_multichunk_dictionary_entry_priced_honestly(self):
+        from viaduck.delivery import _estimate_row_bytes
+
+        parent = pa.table({"s": self._dict_col(100_000)})
+        cat = pa.concat_tables([parent.slice(i * 100, 100) for i in range(50)])
+        assert cat.nbytes > 50_000_000  # per-chunk whole-dictionary inflation
+        est = _estimate_row_bytes(cat)
+        assert 0 < est < 2_000
+
+    def test_aimd_grows_after_real_split_flush(self):
+        # End-to-end wiring (review MEDIUM-2): through the REAL _flush,
+        # a fast target-sized split flush must grow the target. Reverting
+        # the est_bytes plumbing in _flush makes this fail.
+        from viaduck.delivery import _estimate_row_bytes
+
+        mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive=True)
+        entry = _offset_sliced_table(100_000, 5_000, 10_000)
+        per_row = _estimate_row_bytes(entry)
+        target = per_row * 2_000
+        with mgr._lock:
+            mgr._flush_target["d1"] = target
+        _, epoch = mgr.read_plan()["d1"]
+        mgr.buffer("d1", entry, through_snapshot=5, epoch=epoch)
+        # Mock the destination WRITE only — _flush's own est/adapt logic
+        # stays real, which is the wiring under test.
+        with patch("viaduck.delivery.append_only", return_value=2_000):
+            assert mgr.maybe_flush() == 1
+            mgr._executor.shutdown(wait=True)
+        with mgr._lock:
+            grown = mgr._flush_target["d1"]
+        assert grown > target, f"AIMD did not grow ({target} -> {grown}); est_bytes plumbing broken"
+
+    def test_aimd_no_spurious_growth_on_underfilled_flush(self):
+        # THE discriminator for the _flush est_bytes plumbing (review N2):
+        # a 500-row flush against a 2,000-row-equivalent target has honest
+        # fill 0.25 < 0.7 -> NO growth. The reverted (inflated-nbytes)
+        # wiring reads ~4MB >= 0.7*target and grows spuriously — this test
+        # fails under that revert; the growth test alone cannot (inflated
+        # >= honest always, so growth happens in both worlds).
+        from viaduck.delivery import _estimate_row_bytes
+
+        mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive=True)
+        entry = _offset_sliced_table(100_000, 5_000, 500)
+        per_row = _estimate_row_bytes(entry)
+        target = per_row * 2_000
+        with mgr._lock:
+            mgr._flush_target["d1"] = target
+        _, epoch = mgr.read_plan()["d1"]
+        mgr.buffer("d1", entry, through_snapshot=5, epoch=epoch)
+        with patch("viaduck.delivery.append_only", return_value=500):
+            assert mgr.maybe_flush(shutdown=True) == 1
+            mgr._executor.shutdown(wait=True)
+        with mgr._lock:
+            after = mgr._flush_target["d1"]
+        assert after == target, f"spurious growth {target} -> {after}: _flush fed inflated bytes to the fill gate"
+
+    def test_fixed_size_list_of_dict_priced_honestly(self):
+        # Review N1: fixed_size_list<dict> dodged the rewrite and kept
+        # ~19x inflation silently.
+        from viaduck.delivery import _estimate_row_bytes
+
+        dictionary = pa.array(["v" * 200 + str(i) for i in range(20_000)])
+        indices = pa.array([i % 10 for i in range(20_000)], type=pa.int32())
+        inner = pa.DictionaryArray.from_arrays(indices, dictionary)
+        col = pa.FixedSizeListArray.from_arrays(inner, 2)
+        t = pa.table({"fl": col}).slice(1_000, 500)
+        est = _estimate_row_bytes(t)
+        assert 0 < est < 3_000, f"fixed_size_list<dict> unpriced or inflated: {est}"
