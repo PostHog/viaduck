@@ -58,6 +58,89 @@ log = logging.getLogger(__name__)
 # trickle flushes re-inflate a learned-down target (see _adapt_flush_target).
 _ADAPT_GROWTH_MIN_FILL = 0.7
 
+# Rows sampled to price an entry's honest bytes-per-row. ~1,024 rows of the
+# production event shape is a ~300KB copy — one per destination per
+# maybe_flush cycle, only while the adaptive byte-cut is enabled.
+_ROW_BYTES_SAMPLE = 1024
+
+# Entries examined when the head of the buffer cannot be priced (zero rows
+# or estimator failure) before the byte-cut goes inert for the cycle.
+_ROW_BYTES_SAMPLE_ENTRIES = 4
+
+
+def _honest_type(t: pa.DataType) -> pa.DataType:
+    """Rewrite a type with every dictionary layer (at any nesting depth)
+    replaced by its value type. Nested dictionaries carry the same
+    whole-dictionary nbytes inflation as top-level ones and MUST be
+    decoded before measuring (review: struct<dict>/list<dict> slices
+    measured 41,700 B/row against 213 honest; fixed_size_list<dict>
+    19x)."""
+    if pa.types.is_dictionary(t):
+        return _honest_type(t.value_type)
+    if pa.types.is_struct(t):
+        return pa.struct([pa.field(f.name, _honest_type(f.type)) for f in t])
+    if pa.types.is_list(t):
+        return pa.list_(_honest_type(t.value_type))
+    if pa.types.is_large_list(t):
+        return pa.large_list(_honest_type(t.value_type))
+    if pa.types.is_fixed_size_list(t):
+        return pa.list_(_honest_type(t.value_type), t.list_size)
+    if pa.types.is_list_view(t):
+        return pa.list_view(_honest_type(t.value_type))
+    if pa.types.is_large_list_view(t):
+        return pa.large_list_view(_honest_type(t.value_type))
+    if pa.types.is_map(t):
+        return pa.map_(_honest_type(t.key_type), _honest_type(t.item_type))
+    return t
+
+
+_estimate_failure_logged: set[tuple[str, str]] = set()
+
+
+def _estimate_row_bytes(tbl: pa.Table, dest_id: str = "") -> int:
+    """Honest bytes-per-row for a possibly dictionary-encoded table.
+
+    pa.Table.nbytes on production entry tables over-reports ~150x
+    (2026-08-26: the adaptive byte-cut divided by it and sliced team-2
+    into ~2,850-row flushes with a frozen growth gate). Root cause is
+    DICTIONARY-encoded columns from the parquet read path: every chunk
+    of a sliced dictionary column counts the ENTIRE shared dictionary
+    (measured: a 100-row slice reporting a 4.1MB dictionary ~= 41KB/row;
+    multi-chunk entries multiply it per chunk). combine_chunks() does
+    NOT correct this — unified dictionaries keep unreferenced entries —
+    so the sample is CAST to a dictionary-free schema (recursively:
+    nested dictionaries inflate identically) and the decoded copy's
+    nbytes is the honest logical size. Anything that SIZES work
+    (admission, split, bytes trigger, adaptive evidence) must use this,
+    never raw entry nbytes.
+
+    Returns 0 — "unpriceable", byte-cut inert, the 60K rows cap
+    backstops — when the sample prices below one byte per row OR when
+    any pyarrow operation raises: this runs inside the poll cycle,
+    whose escape handler exits the pod, and a poisonous entry must
+    degrade to the flag-off behavior, not a crash loop.
+    """
+    n = min(_ROW_BYTES_SAMPLE, tbl.num_rows)
+    if n <= 0:
+        return 0
+    try:
+        sample = tbl.slice(0, n)
+        target = pa.schema([pa.field(f.name, _honest_type(f.type)) for f in sample.schema])
+        if target != sample.schema:
+            sample = sample.cast(target)
+        return sample.combine_chunks().nbytes // n
+    except Exception as exc:  # noqa: BLE001 — total by contract, see docstring
+        key = (dest_id, type(exc).__name__)
+        if key not in _estimate_failure_logged:
+            _estimate_failure_logged.add(key)
+            log.warning(
+                "Honest-bytes estimate failed for %s (%s: %s); byte-cut inert for affected entries",
+                dest_id or "<unknown>",
+                key[1],
+                exc,
+            )
+        return 0
+
 
 @dataclass
 class _Buffer:
@@ -291,6 +374,12 @@ class DeliveryManager:
         # _adapt_flush_target. In-memory only — a restart re-learns a
         # contended destination's target in ~log2(cap/floor) flushes.
         self._flush_target: dict[str, int] = {d: cfg.flush_max_bytes for d in assigned_ids}
+        # Last honest bytes-per-row estimate per destination (see
+        # _estimate_row_bytes). The bytes TRIGGER consults this so it
+        # judges the buffer in the same units as the target and the
+        # fill gate (QE-BUG-1: raw buf.bytes vs honest target trickled
+        # target-capped crumb flushes and froze a halved target).
+        self._per_row_est: dict[str, int] = {}
         for d in assigned_ids:
             # Seed the gauge so "target == ceiling" is visible before the
             # first data flush — a dashboard reading "pinned at floor =
@@ -584,19 +673,34 @@ class DeliveryManager:
                 # slices draining back-to-back.
                 cap = self._cfg.flush_batch_max_rows
                 byte_cap = self._flush_target[dest_id] if self._cfg.flush_adaptive else 0
+                # Honest pricing for the byte-cut: entries are dictionary-
+                # encoded slices whose .nbytes over-reports shared buffers
+                # (see _estimate_row_bytes), so admission and the split
+                # below price entries as rows x a sampled per-row rate.
+                # Sampled from the first PRICEABLE entry (QE-BUG-3: a
+                # zero-row or unpriceable head must not disarm the cut
+                # for the whole buffer), bounded to a few attempts.
+                per_row = 0
+                if byte_cap > 0:
+                    for tbl, _cov, _hi in buf.entries[:_ROW_BYTES_SAMPLE_ENTRIES]:
+                        per_row = _estimate_row_bytes(tbl, dest_id)
+                        if per_row > 0:
+                            break
+                    self._per_row_est[dest_id] = per_row
                 take = len(buf.entries)
                 if cap > 0 or byte_cap > 0:
                     taken_rows = 0
                     taken_bytes = 0
                     take = 0
                     for tbl, _cov, _hi in buf.entries:
+                        est = tbl.num_rows * per_row
                         if take > 0 and (
                             (cap > 0 and taken_rows + tbl.num_rows > cap)
-                            or (byte_cap > 0 and taken_bytes + tbl.nbytes > byte_cap)
+                            or (byte_cap > 0 and taken_bytes + est > byte_cap)
                         ):
                             break
                         taken_rows += tbl.num_rows
-                        taken_bytes += tbl.nbytes
+                        taken_bytes += est
                         take += 1
                 sliced = buf.entries[:take]
                 remainder = buf.entries[take:]
@@ -614,13 +718,13 @@ class DeliveryManager:
                 if take == 1:
                     tbl0, cov0, hi0 = sliced[0]
                     over_rows = cap > 0 and tbl0.num_rows > cap
-                    over_bytes = byte_cap > 0 and tbl0.nbytes > byte_cap
+                    over_bytes = byte_cap > 0 and per_row > 0 and tbl0.num_rows * per_row > byte_cap
                     if (over_rows or over_bytes) and tbl0.num_rows > 1:
                         n = tbl0.num_rows
                         if over_rows:
                             n = min(n, cap)
-                        if over_bytes and tbl0.nbytes > 0:
-                            n = min(n, max(1, (tbl0.num_rows * byte_cap) // tbl0.nbytes))
+                        if over_bytes:
+                            n = min(n, max(1, byte_cap // per_row))
                         if 0 < n < tbl0.num_rows:
                             sliced = [(tbl0.slice(0, n), cov0, hi0)]
                             remainder = [(tbl0.slice(n), cov0, hi0)] + remainder
@@ -667,7 +771,16 @@ class DeliveryManager:
                     self._position_dirty_since[dest_id] = None
                 metrics.delivery_buffer_rows.labels(destination=dest_id).set(rem_buf.rows)
                 metrics.delivery_buffer_bytes.labels(destination=dest_id).set(rem_buf.bytes)
-                future = self._executor.submit(self._flush, dest_id, tables, through, trigger)
+                # per_row == 0 with the byte-cut armed: pass 0, not None —
+                # the None fallback would feed raw (inflated) nbytes to the
+                # AIMD fill gate and allow spurious growth.
+                if per_row > 0:
+                    est_bytes = sum(t.num_rows for t in tables) * per_row
+                elif byte_cap > 0:
+                    est_bytes = 0
+                else:
+                    est_bytes = None
+                future = self._executor.submit(self._flush, dest_id, tables, through, trigger, est_bytes)
                 # _flush catches everything it expects; anything escaping
                 # (a bug) must not vanish into an unobserved Future.
                 future.add_done_callback(self._log_escaped_exception)
@@ -813,8 +926,17 @@ class DeliveryManager:
         # and initial value. When the target has shrunk below one CDC
         # chunk, the trigger fires per chunk: one chunk is the floor by
         # construction (slicing never splits a chunk either).
-        if has_data and buf.bytes >= self._flush_target[dest_id]:
-            return "bytes"
+        # The comparison runs in HONEST units via the cached per-row
+        # estimate when available (QE-BUG-1: raw inflated buf.bytes vs an
+        # honest target fired at ~target/150 of real content — trickle
+        # flushes that could never satisfy the growth gate). Before the
+        # first estimate (or unpriceable), raw bytes: fires early, never
+        # late — the conservative direction.
+        if has_data:
+            per_row_est = self._per_row_est.get(dest_id, 0) if self._cfg.flush_adaptive else 0
+            trigger_bytes = buf.rows * per_row_est if per_row_est > 0 else buf.bytes
+            if trigger_bytes >= self._flush_target[dest_id]:
+                return "bytes"
         dirty_since = self._position_dirty_since[dest_id]
         age_start = buf.first_buffered_at if has_data else dirty_since
         if age_start is not None and (now - age_start) >= self._cfg.flush_interval_seconds:
@@ -873,7 +995,9 @@ class DeliveryManager:
                 duration,
             )
 
-    def _flush(self, dest_id: str, tables: list[pa.Table], through: int | None, trigger: str) -> None:
+    def _flush(
+        self, dest_id: str, tables: list[pa.Table], through: int | None, trigger: str, est_bytes: int | None = None
+    ) -> None:
         """Worker: FlushCommit / FlushFail.
 
         `through=None` marks a PARTIAL-ENTRY flush (within-entry slice):
@@ -887,7 +1011,15 @@ class DeliveryManager:
         re-applies landed slices (append_only duplicates them).
         """
         t0 = time.monotonic()
-        batch_bytes = sum(t.nbytes for t in tables)
+        # est_bytes is the honest sampled sizing from maybe_flush; entry
+        # nbytes over-reports shared buffers, and the adaptive fill gate
+        # (batch_bytes >= target * fill) must judge growth in the same
+        # units the cut used or it never passes (the frozen-controller
+        # half of the 2026-08-26 incident). Known limit: the estimate
+        # comes from a head sample, so a batch whose tail rows are much
+        # wider can under-report and let the gate grow on bad evidence —
+        # duration-based halving is the recovery path (QE quantified).
+        batch_bytes = est_bytes if est_bytes is not None else sum(t.nbytes for t in tables)
         deadline = t0 + self._flush_deadline_s if self._flush_deadline_s is not None else None
         circuit_was_open = False
         # apply_done tracks whether the destination-write phase completed (or
