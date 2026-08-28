@@ -99,6 +99,14 @@ class ProjectionPlan:
         # 3. Cast columns present in both with mismatched types.
         for name, src_type, dst_type in self.cast_columns:
             idx = batch.schema.get_field_index(name)
+            if idx < 0:
+                # get_field_index returns -1 for missing/duplicated fields,
+                # and Table.column(-1) silently returns the LAST column —
+                # guard explicitly or a drifted batch casts the wrong column.
+                raise RuntimeError(
+                    f"schema_projection: planned cast column {name!r} missing (or duplicated) in batch schema "
+                    f"{[f.name for f in batch.schema]} — source schema drifted from the connect-time plan"
+                )
             col = batch.column(idx)
             casted, failed = _cast_column(col, src_type, dst_type)
             batch = batch.set_column(idx, name, casted)

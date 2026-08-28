@@ -675,6 +675,15 @@ def apply_full_cdc(
         metrics.dest_rows_upserted_total.labels(destination=dest_id).inc(counts["upserted"])
     if counts["upsert_matched"] > 0:
         metrics.dest_upsert_matched_total.labels(destination=dest_id).inc(counts["upsert_matched"])
+    # Rows-written parity with append_only: the flush BATCH size, counted
+    # once post-commit (retries above must not inflate it). The per-op
+    # counters (deleted/upserted/matched) measure the APPLIED shape; this
+    # one answers "how much did a flush carry" — the signal batch-size
+    # assertions (and dashboards) read. Exception: a batch whose rows all
+    # resolve away (resolved.num_rows == 0 above) returns before this line
+    # and counts 0 — truthful as "written", and such flushes carry no
+    # destination cost.
+    metrics.dest_rows_written_total.labels(destination=dest_id).inc(batch.num_rows)
     return counts["deleted"] + counts["upserted"]
 
 

@@ -62,6 +62,25 @@ class SecretReadError(Exception):
     contains secret material."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib's default redirect handling re-sends custom
+    headers — the ServiceAccount Bearer token here — to the redirect target,
+    cross-host included. Twin of discovery._NoRedirect (same hazard, same
+    fix; kept separate because discovery imports this module, not the other
+    way around)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open(req: urllib.request.Request, *, timeout_s: float, ctx: ssl.SSLContext):
+    """One Secret GET, isolated as the test seam. Production behavior: the
+    no-redirect opener above (the SA token must never follow a redirect)
+    with the CA-pinned TLS context carried by the handler."""
+    opener = urllib.request.build_opener(_NoRedirect(), urllib.request.HTTPSHandler(context=ctx))
+    return opener.open(req, timeout=timeout_s)
+
+
 def _api_base() -> str:
     host = os.environ.get("KUBERNETES_SERVICE_HOST")
     port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
@@ -101,7 +120,7 @@ def read_secret_key(namespace: str, name: str, key: str, *, timeout_s: float = 1
         # Scheme is pinned https by _api_base(); path components are
         # validated against the k8s name grammar above (the semgrep
         # dynamic-urllib audit rule can't see either).
-        with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:  # nosemgrep
+        with _open(req, timeout_s=timeout_s, ctx=ctx) as resp:  # nosemgrep
             body = json.load(resp)
     except urllib.error.HTTPError as e:
         # 403 here means the RBAC grant is missing/wrong — the actionable

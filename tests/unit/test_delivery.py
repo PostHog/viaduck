@@ -1230,6 +1230,51 @@ def test_adaptive_targets_are_per_destination():
     assert mgr._flush_target["d2"] == 128 * _MIB
 
 
+# ---------------------------------------------------------------------------
+# AIMD feedback-signal span: the controller eats the DESTINATION-WRITE span,
+# never the shared-PG cursor-persist tail (2026-08-28 review round 2).
+# ---------------------------------------------------------------------------
+
+
+def test_slow_cursor_persist_does_not_halve_target(monkeypatch):
+    """A slow cursor persist (shared PG) after a healthy write is not
+    destination-contention evidence — the target must not move."""
+    mgr, sm, _ = _manager(flush_adaptive_low_seconds=0.01, flush_adaptive_high_seconds=0.05)
+    tbl = _table(5)
+    monkeypatch.setattr("viaduck.delivery.append_only", lambda *a, **k: tbl.num_rows)
+
+    def slow_advance(*a, **k):
+        _time_mod.sleep(0.2)  # cursor tail blows past the high bound
+        return 1
+
+    monkeypatch.setattr(sm, "advance_cursor", slow_advance)
+    mgr._flush("d1", [tbl], 10, "interval")
+    assert mgr._flush_target["d1"] == mgr._cfg.flush_max_bytes
+
+
+def test_slow_apply_halves_target(monkeypatch):
+    """...and the span that IS the destination's still teaches the controller."""
+    mgr, _, _ = _manager(flush_adaptive_low_seconds=0.01, flush_adaptive_high_seconds=0.05)
+
+    def slow_apply(*a, **k):
+        _time_mod.sleep(0.2)
+        return 5
+
+    monkeypatch.setattr("viaduck.delivery.append_only", slow_apply)
+    mgr._flush("d1", [_table(5)], 10, "interval")
+    assert mgr._flush_target["d1"] == mgr._cfg.flush_max_bytes // 2
+
+
+def test_cursor_persist_failure_after_healthy_write_does_not_halve(monkeypatch):
+    """Apply committed, cursor persist failed: the retry burn is shared-PG
+    evidence; the (fast) write is the destination's. No halve."""
+    mgr, sm, _ = _manager(flush_adaptive_low_seconds=0.01, flush_adaptive_high_seconds=0.05)
+    monkeypatch.setattr("viaduck.delivery.append_only", lambda *a, **k: 5)
+    sm.advance_cursor.side_effect = RuntimeError("pg down")
+    mgr._flush("d1", [_table(5)], 10, "interval")
+    assert mgr._flush_target["d1"] == mgr._cfg.flush_max_bytes
+
+
 def test_bytes_trigger_uses_adapted_target():
     # Shrink d1's target below the buffered bytes while the GLOBAL
     # flush_max_bytes stays far above them.

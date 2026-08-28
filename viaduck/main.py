@@ -616,9 +616,21 @@ def _seed_new_destinations(src_table, state_mgr, dest_pool, cfg, assigned_ids, *
                         table.upsert(batch_table, join_cols=key_columns)
                     else:
                         table.append(batch_table)
+                except Exception:
+                    # Flush-path parity: a failed destination write counts
+                    # here too — seeding is when a destination does its
+                    # largest writes.
+                    metrics.errors_total.labels(type="dest_write", destination=dest_id).inc()
+                    raise
                 finally:
                     dest_pool.release(dest_id)
-                write_secs_total += time.monotonic() - write_t0
+                write_secs = time.monotonic() - write_t0
+                write_secs_total += write_secs
+                # Flush-path metric parity (the 2026-08-28 rows_written
+                # gap, seed half): the largest write volume a destination
+                # ever does must not be invisible to the write signals.
+                metrics.dest_write_seconds.labels(destination=dest_id).observe(write_secs)
+                metrics.dest_rows_written_total.labels(destination=dest_id).inc(batch.num_rows)
                 progress["rows"] += batch.num_rows
                 progress["batches"] += 1
 
@@ -800,7 +812,15 @@ def run(cfg: config.ViaduckConfig) -> None:
                 allowed_secret_namespaces=cfg.discovery.allowed_secret_namespaces,
             )
             generation = payload["config_generation"]
-            baseline = {m.dest_id: m for m in mapped}
+            # First-wins on duplicate ids, matching materialize() /
+            # ClassifiedView dedupe: this baseline is the reconciler's
+            # "what did this process APPLY" basis, so it must agree with
+            # materialize's choice — a last-wins map here makes rule 2
+            # spuriously restart a duplicate-id tenant on the first fresh
+            # drift view.
+            baseline = {}
+            for m in mapped:
+                baseline.setdefault(m.dest_id, m)
             all_destinations = list(cfg.destinations) + discovered
             cfg = replace(cfg, destinations=all_destinations)
             # Success only after the merged config validated — synced=1
@@ -1560,6 +1580,10 @@ def _poll_cycle(
     cycle_t0 = time.monotonic()
     cycle_rows_read = 0
     cycle_units = 0
+    # Per-cycle gauge: re-zero BEFORE the branches so an all-paused or
+    # empty cycle reads 0, not the last dispatching cycle's value (the
+    # cursor-scatter trend reads this exactly during cap events).
+    metrics.read_clusters.set(0)
 
     # One combined MIN/MAX statement: the postgres scanner does no aggregate
     # pushdown, so separate earliest/current queries would each pull the
@@ -1719,7 +1743,12 @@ def _poll_cycle(
                 label=f"CDC read barrier ({len(futures)} units)",
                 pre_progress_label="reading",
             )
-            remaining_units = 0
+            # Outstanding-unit count for the overall-barrier TimeoutError
+            # handler below: decremented as the iterator yields, so a
+            # barrier timeout reports the units never yielded (initializing
+            # this to 0 made the handler log and count "0 outstanding"
+            # every time it fired).
+            remaining_units = len(futures)
             try:
                 # Completion order under a real pool (as_completed);
                 # dispatch order on the inline (test) path.
@@ -1735,6 +1764,7 @@ def _poll_cycle(
                 else:
                     pending = list(futures)
                 for future in pending:
+                    remaining_units -= 1
                     # Failure containment per unit (the retired per-group
                     # containment's successor): a read/route/apply failure
                     # skips THIS cluster this cycle — nothing fleet-wide.
@@ -1773,6 +1803,7 @@ def _poll_cycle(
                                     columns=source_columns,
                                     with_snapshot=True,
                                 )
+                                replan_t0 = time.monotonic()
                                 rows = (
                                     feed.execute_read(src_table._catalog.connection, planned)
                                     if planned is not None
@@ -1780,6 +1811,12 @@ def _poll_cycle(
                                 )
                                 if rows is None:
                                     rows = pa.table({})
+                                # Metric parity with _read_unit's first-pass
+                                # path: a re-planned read still read rows —
+                                # cdc_rows_read_total and cdc_read_seconds
+                                # must not go dark exactly when a re-plan fires.
+                                metrics.cdc_read_seconds.observe(time.monotonic() - replan_t0)
+                                metrics.cdc_rows_read_total.inc(rows.num_rows)
                                 hi = unit_hi
                             except Exception:
                                 log.exception("CDC unit re-plan failed for cluster at %d", lo)

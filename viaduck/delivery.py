@@ -339,6 +339,13 @@ class DeliveryManager:
         cursors = state_mgr.load_cursors(assigned_ids)
         self._flushed: dict[str, int] = {d: cursors[d].last_snapshot_id if d in cursors else 0 for d in assigned_ids}
         self._position: dict[str, int] = dict(self._flushed)
+        # rows_replicated caveat (referenced by the _applied comment below
+        # and the status UI): this count REPLAYS. A flush whose destination
+        # write committed but whose cursor persist failed re-reads and
+        # re-applies the range, re-adding ops_count — at-least-once means
+        # the count can exceed the truth, and because it persists to PG,
+        # the inflation survives restarts. It answers "how much work did we
+        # do", never "how many rows does the destination hold".
         self._rows_replicated: dict[str, int] = {
             d: cursors[d].rows_replicated if d in cursors else 0 for d in assigned_ids
         }
@@ -383,8 +390,14 @@ class DeliveryManager:
         for d in assigned_ids:
             # Seed the gauge so "target == ceiling" is visible before the
             # first data flush — a dashboard reading "pinned at floor =
-            # contended" must be able to tell "never flushed" apart.
+            # contended" must be able to tell "never flushed" apart. Same
+            # alerting-contract reasoning for the cursor and buffer gauges:
+            # they must read real values (cursor position, 0 rows), not
+            # absent series, for a destination that has not flushed yet.
             metrics.dest_flush_target_bytes.labels(destination=d).set(cfg.flush_max_bytes)
+            metrics.dest_last_snapshot_id.labels(destination=d).set(self._flushed[d])
+            metrics.delivery_buffer_rows.labels(destination=d).set(0)
+            metrics.delivery_buffer_bytes.labels(destination=d).set(0)
         # Lifecycle-suspended destinations (paused/retired): no flush
         # submissions. Draining destinations are NOT here — draining exists
         # to flush out. Owned by the poll thread via set_suspended().
@@ -767,8 +780,12 @@ class DeliveryManager:
                 self._buffers[dest_id] = rem_buf
                 self._inflight.add(dest_id)
                 self._inflight_bytes[dest_id] = buf.bytes - rem_buf.bytes
-                if not remainder:
-                    self._position_dirty_since[dest_id] = None
+                # NOTE: _position_dirty_since is deliberately NOT cleared
+                # here — a submitted flush is not a durable one. It is
+                # cleared in the flush-success path after the cursor
+                # persists (clearing at submit showed "caught up" through
+                # multi-minute in-flight flushes, exactly when the lag
+                # column is being watched).
                 metrics.delivery_buffer_rows.labels(destination=dest_id).set(rem_buf.rows)
                 metrics.delivery_buffer_bytes.labels(destination=dest_id).set(rem_buf.bytes)
                 # per_row == 0 with the byte-cut armed: pass 0, not None —
@@ -956,17 +973,22 @@ class DeliveryManager:
         high bound → halve (floored at flush_adaptive_min_bytes; the
         effective floor is one CDC chunk since neither the bytes trigger
         nor the swap byte-cut splits a chunk); faster than the low bound
-        AND the batch nearly filled the current target → additive step
-        up (capped at flush_max_bytes); otherwise hold. The fill
-        condition is what makes growth evidence-based: a tiny interval
-        flush finishing in <1s says nothing about whether a target-sized
-        batch is sustainable, and without it a quiet period walks a
-        learned-down target back to the cap, so the next burst re-runs
-        the oversize-flush/drop/re-read cycle from scratch. Failures
-        never grow. Converges from a cold start in ~log2(cap/floor)
-        flushes and re-probes upward as contention subsides — but only
-        under enough traffic to fill the target, which is the only time
-        the target matters."""
+         AND the batch nearly filled the current target → additive step
+         up (capped at flush_max_bytes); otherwise hold. The fill
+         condition is what makes growth evidence-based: a tiny interval
+         flush finishing in <1s says nothing about whether a target-sized
+         batch is sustainable, and without it a quiet period walks a
+         learned-down target back to the cap, so the next burst re-runs
+         the oversize-flush/drop/re-read cycle from scratch. Failures
+         never grow. Converges from a cold start in ~log2(cap/floor)
+         flushes and re-probes upward as contention subsides — but only
+         under enough traffic to fill the target, which is the only time
+         the target matters. `duration` is the DESTINATION-WRITE span
+         (apply incl. its OCC retries; for a failed apply, the burn so
+         far): the cursor-persist tail is shared-PG infrastructure and
+         must not shape a per-destination contention signal — a
+         fleet-wide PG blip would otherwise ratchet every target down on
+         the wrong resource's time."""
         cfg = self._cfg
         if not cfg.flush_adaptive:
             return
@@ -1029,6 +1051,11 @@ class DeliveryManager:
         # not trip the breaker for it (same stance as lifecycle: a PG blip
         # must not punish destinations).
         apply_done = not tables
+        # Destination-write span, captured when the apply phase completes.
+        # Fed to the adaptive controller and dest_write_seconds — both
+        # contracts are "destination write latency", and the cursor-persist
+        # tail (shared PG) is neither's evidence.
+        apply_seconds: float | None = None
         try:
             ops_count = 0
             if tables:
@@ -1040,6 +1067,7 @@ class DeliveryManager:
                 else:
                     ops_count = append_only(self._pool, dest_id, batch, stop_event=self._stopping, deadline=deadline)
                 apply_done = True
+                apply_seconds = time.monotonic() - t0
             # Cursor persist AFTER the destination commit (the gap is the
             # spec's CrashDuringFlush window). A short retry here avoids
             # invoking the full failure path (buffer drop + healthy-catalog
@@ -1109,6 +1137,14 @@ class DeliveryManager:
                             through,
                         )
                 self._rows_replicated[dest_id] = cumulative
+                # Lag honesty: positions up to `through` are durable NOW —
+                # this is the earliest correct clearing point for
+                # _position_dirty_since (the swap in maybe_flush must NOT
+                # clear it: in-flight is not durable). If reads landed
+                # during the flight, the oldest un-persisted advance's best
+                # lower bound is the remainder buffer's first_buffered_at.
+                if through is not None:
+                    self._position_dirty_since[dest_id] = buf.first_buffered_at if buf.rows else None
                 # Clear the error only when this flush is at/ahead of the
                 # cursor. A zombie flush (through < flushed — a retention
                 # clamp landed mid-flight) must not clear the clamp's loss
@@ -1140,9 +1176,12 @@ class DeliveryManager:
                 # report write latency or readiness "replication" signals.
                 metrics.delivery_flush_seconds.labels(destination=dest_id).observe(duration)
                 # dest_write_seconds continuity: pre-buffering dashboards
-                # observe per-destination write latency under this name.
-                metrics.dest_write_seconds.labels(destination=dest_id).observe(duration)
-                self._adapt_flush_target(dest_id, duration, batch_bytes)
+                # observe per-destination WRITE latency under this name —
+                # the apply span, not the cursor tail (the full span grew
+                # into this metric when buffering landed; delivery_flush_seconds
+                # covers that span and its HELP says so).
+                metrics.dest_write_seconds.labels(destination=dest_id).observe(apply_seconds)
+                self._adapt_flush_target(dest_id, apply_seconds, batch_bytes)
                 if self._on_flush_success is not None:
                     self._on_flush_success()
                 log.info(
@@ -1211,7 +1250,13 @@ class DeliveryManager:
                 # failure (connection blip) can't inflate the target. Last
                 # in the handler: nothing after it may be skipped if the
                 # controller ever raises — the evict above must run.
-                self._adapt_flush_target(dest_id, duration, batch_bytes, failed=True)
+                # Span: apply_seconds when the write committed (a
+                # cursor-persist failure after a healthy write is shared-PG
+                # evidence, not destination contention); the full burn when
+                # the apply phase itself failed.
+                self._adapt_flush_target(
+                    dest_id, apply_seconds if apply_seconds is not None else duration, batch_bytes, failed=True
+                )
         finally:
             with self._lock:
                 self._inflight.discard(dest_id)
@@ -1298,6 +1343,9 @@ class DeliveryManager:
                 self._buffered_rows_total[dest_id] = 0
                 self._flush_target[dest_id] = self._cfg.flush_max_bytes
                 metrics.dest_flush_target_bytes.labels(destination=dest_id).set(self._cfg.flush_max_bytes)
+                metrics.dest_last_snapshot_id.labels(destination=dest_id).set(cursor)
+                metrics.delivery_buffer_rows.labels(destination=dest_id).set(0)
+                metrics.delivery_buffer_bytes.labels(destination=dest_id).set(0)
             # Circuit state is activation-scoped, not ever-member: a stopped,
             # fixed, re-added destination deserves a fresh probe immediately,
             # not its predecessor's open circuit (re-add after retire = new

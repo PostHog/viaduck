@@ -354,13 +354,20 @@ class DestinationConfig:
 @dataclass(frozen=True)
 class PollConfig:
     interval_seconds: float = 5.0
-    # Read loop (log-consumer-proposal.md §6.3): each read unit is bounded
-    # by rows AND bytes AND snapshot span. Row/byte budgets bound memory and
-    # keep a unit's flush under the destination commit cliff (measured:
-    # 56.5s @60-90k rows vs the 240s deadline); the span cap bounds
-    # inline-row overrun and GET fan-out. Units are the read-amortization
-    # knob — the retired cdc_chunk_snapshots coupled read size to the flush
-    # floor, which is exactly the wedge it caused.
+    # Read loop (log-consumer-proposal.md §6.3): each FEED read unit
+    # (append_only) is bounded by rows AND bytes AND snapshot span; the
+    # full_cdc extension path has no per-row attribution to budget on and
+    # is span-only, hard-capped at 480 snapshots per unit (main.py
+    # read-unit planning). UNIT CONTRACT: read_unit_max_bytes is priced in
+    # parquet file_size_bytes from the catalog — compressed, on-wire — NOT
+    # decoded Arrow memory, which can exceed it 20-100x for
+    # dictionary-heavy shapes (the 2026-08 unit-lie class; the flush side
+    # retired byte-denominated control over it). Inline rows price at 0
+    # bytes. Rows and span are the actual memory backstops; the row budget
+    # also keeps a unit's flush under the destination commit cliff
+    # (measured: 56.5s @60-90k rows vs the 240s deadline). Units are the
+    # read-amortization knob — the retired cdc_chunk_snapshots coupled
+    # read size to the flush floor, which is exactly the wedge it caused.
     read_unit_max_rows: int = 50_000
     read_unit_max_bytes: int = 256 * 1024 * 1024
     read_unit_max_span: int = 10_000

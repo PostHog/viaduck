@@ -48,6 +48,15 @@ def test_init_binds_upsert_metrics():
     assert hasattr(metrics.dest_rows_upserted_total, "labels")
 
 
+def test_init_binds_rows_written_metric():
+    """After init(), dest_rows_written_total should have .labels() (both apply modes inc it)."""
+    from viaduck import metrics
+
+    init("test-pipeline")
+
+    assert hasattr(metrics.dest_rows_written_total, "labels")
+
+
 def test_init_binds_cdc_routing_mutations_metric():
     """After init(), cdc_routing_mutations_total should have .inc()."""
     from viaduck import metrics

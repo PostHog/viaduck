@@ -820,6 +820,13 @@ def test_connect_errors_scrub_credentials():
     url = 'IOException: Cannot open file "postgresql://user:SECRETPW@host:5432/db"'
     assert "SECRETPW" not in _scrub_credentials(url)
     assert "user:***@host" in _scrub_credentials(url)
+    # SQL ''-doubled quoting (discovery.build_attach_uri): a pre-parse
+    # exception embeds the raw doubled-quote literal; a backslash-only
+    # pattern would terminate halfway and leak the password tail.
+    doubled = "Parser Error: syntax error in \"ATTACH '... password='SEC''RET' dbname=d' ...\""
+    assert "SEC" not in _scrub_credentials(doubled).split("password=***")[1]
+    assert "password=***" in _scrub_credentials(doubled)
+    assert "RET" not in _scrub_credentials(doubled)
 
 
 def test_scrub_hardened_formats():

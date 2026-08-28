@@ -113,7 +113,7 @@ _dest_write_seconds = Histogram(
 )
 _dest_rows_written_total = Counter(
     "viaduck_dest_rows_written_total",
-    "Rows written to destination",
+    "Rows written to destination (at-least-once: a range replayed after a commit/cursor-gap failure is counted again)",
     ["pipeline", "destination"],
 )
 _dest_last_snapshot_id = Gauge(
@@ -190,17 +190,17 @@ _cdc_batch_rows = Histogram(
 )
 _dest_rows_deleted_total = Counter(
     "viaduck_dest_rows_deleted_total",
-    "Rows deleted from destination via CDC",
+    "Rows deleted from destination via CDC (at-least-once: replays re-count)",
     ["pipeline", "destination"],
 )
 _dest_rows_upserted_total = Counter(
     "viaduck_dest_rows_upserted_total",
-    "Rows sent to upsert (insert + update via MERGE) to destination",
+    "Rows sent to upsert (insert + update via MERGE) to destination (at-least-once: replays re-count)",
     ["pipeline", "destination"],
 )
 _dest_upsert_matched_total = Counter(
     "viaduck_dest_upsert_matched_total",
-    "Rows that matched existing rows during upsert (updated, not inserted)",
+    "Rows that matched existing rows during upsert (updated, not inserted) (at-least-once: replays re-count)",
     ["pipeline", "destination"],
 )
 _cdc_routing_mutations_total = Counter(
@@ -241,7 +241,7 @@ _delivery_buffer_total_bytes = Gauge(
 )
 _delivery_flushes_total = Counter(
     "viaduck_delivery_flushes_total",
-    "Completed destination flushes by trigger (interval/rows/bytes/memory/shutdown)",
+    "Completed destination flushes by trigger (interval/rows/bytes/memory/sliced/shutdown)",
     ["pipeline", "destination", "trigger"],
 )
 _delivery_flush_seconds = Histogram(
@@ -257,7 +257,9 @@ _delivery_reads_paused = Gauge(
 )
 _delivery_circuit_open = Gauge(
     "viaduck_delivery_circuit_open",
-    "1 while a destination's flush circuit breaker is open (flush submissions paused after repeated failures)",
+    "1 from the Nth consecutive flush failure until a DATA flush succeeds (position-only persists don't prove "
+    "health). Submissions resume as a probe after each backoff, so 1 reads 'unproven', not 'paused' — an idle "
+    "destination can hold 1 until traffic returns.",
     ["pipeline", "destination"],
 )
 _delivery_circuit_opens_total = Counter(
@@ -296,7 +298,8 @@ _secret_cache_stale_fallback_total = Counter(
 )
 _discovery_synced = Gauge(
     "viaduck_discovery_synced",
-    "1 after a successful discovery poll; 0 = static-only (CP unreachable at startup) or stale drift view",
+    "1 after a successful STARTUP discovery poll; 0 = static-only (CP unreachable at startup). Startup-owned: "
+    "the drift poller never moves it — read staleness from discovery_last_success_timestamp_seconds instead",
     ["pipeline"],
 )
 _discovery_config_generation = Gauge(
@@ -344,7 +347,8 @@ _discovery_applied_total = Counter(
 )
 _reconciler_pending = Gauge(
     "viaduck_reconciler_pending",
-    "Deliberately deferred reconciler work by reason (debounce|static_suppressed|floor|pending_restart|failure)",
+    "Deliberately deferred reconciler work by reason "
+    "(debounce|static_suppressed|floor|pending_restart|budget|rate_capped|retired|failure)",
     ["pipeline", "reason"],
 )
 _discovery_stop_countdown = Gauge(
