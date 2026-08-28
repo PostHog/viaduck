@@ -140,6 +140,26 @@ demo: up
     echo "Stop with: just down"
     open http://localhost:8000/ui
 
+# === Load test (flush-sizing behavior without a prod deploy) ===
+
+# Start the load stack: shaped 3K-rows/s producer + catalog contender wave
+[group('docker')]
+load-up:
+    docker compose -f docker-compose.yaml -f docker-compose.load.yaml build
+    docker compose -f docker-compose.yaml -f docker-compose.load.yaml up -d
+
+# Poll /metrics through baseline → contention → recovery and assert controller
+# behavior (target halving on the contended catalog only, drains clean, no
+# errors). Args e.g. `just load-check --warmup 60 --on 60 --off 120`.
+[group('docker')]
+load-check *ARGS:
+    uv run python test/loadcheck.py {{ARGS}}
+
+# Tear down the load stack (wipes volumes)
+[group('docker')]
+load-down:
+    docker compose -f docker-compose.yaml -f docker-compose.load.yaml down -v
+
 # === Docs ===
 
 # Render d2 diagrams to SVG
