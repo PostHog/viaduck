@@ -48,11 +48,11 @@ services:
     # Idempotent: a `docker compose restart toxiproxy` wipes the in-memory
     # proxy while this init container stays exited(0) — re-running (or a
     # fresh up against a warm API) must tolerate the proxy already existing.
-    entrypoint: >
-      /bin/sh -c "until curl -fs http://toxiproxy:8474/version >/dev/null 2>&1; do sleep 1; done
-      && (curl -fs -X POST http://toxiproxy:8474/proxies -H 'Content-Type: application/json'
-      -d '{\"name\":\"dest1-pg\",\"listen\":\"0.0.0.0:5433\",\"upstream\":\"postgres-dest-1:5432\",\"enabled\":true}'
-      || curl -fs http://toxiproxy:8474/proxies/dest1-pg | grep -q postgres-dest-1:5432)"
+    # The logic lives in a mounted script so semgrep nosemgrep comments
+    # work (they can't inside a folded YAML string).
+    entrypoint: /bin/sh /app/test/toxiproxy-init.sh
+    volumes:
+      - ./test:/app/test:ro
 
   viaduck:
     command: ["--config", "/app/test/viaduck-load.yaml"]
