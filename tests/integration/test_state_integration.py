@@ -231,6 +231,32 @@ def test_concurrent_create_table_race(pg_uri, state_table_name):
     assert not errors
 
 
+def test_ensure_table_tolerates_duplicate_object_race(pg_uri, state_table_name, monkeypatch):
+    """Deterministic pin for the CI flake (2026-08-29): PG17's concurrent
+    CREATE TABLE can raise DuplicateObject (the implicit pg_type/composite
+    insert loses the race), not just DuplicateTable/UniqueViolation. The
+    loser of a boot race must survive all three error classes."""
+    sm = StateManager(pg_uri, "i_dupobj", StateConfig(table=state_table_name))
+    try:
+        conn = sm._connection()
+        real_execute = conn.execute
+        state = {"raised": False}
+
+        def flaky_execute(stmt, *args, **kwargs):
+            if not state["raised"] and "CREATE TABLE" in stmt:
+                state["raised"] = True
+                raise psycopg.errors.DuplicateObject(f'type "{state_table_name}" already exists')
+            return real_execute(stmt, *args, **kwargs)
+
+        monkeypatch.setattr(conn, "execute", flaky_execute)
+        sm._table_ensured = False
+        sm._ensure_table(conn)  # must not raise
+        assert sm._table_ensured
+        assert state["raised"]
+    finally:
+        sm.close()
+
+
 # ---------------------------------------------------------------------------
 # Destination lifecycle (viaduck/lifecycle.py semantics live in the tracker;
 # these pin the StateManager's storage contract against real Postgres)

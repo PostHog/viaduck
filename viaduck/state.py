@@ -123,10 +123,12 @@ class StateManager:
                 )
                 """
             )
-        except (psycopg.errors.DuplicateTable, psycopg.errors.UniqueViolation):
+        except (psycopg.errors.DuplicateTable, psycopg.errors.DuplicateObject, psycopg.errors.UniqueViolation):
             # Two instances racing the first boot: IF NOT EXISTS still
-            # raises a unique violation on the pg_class/pg_type insert in
-            # one of them. The table exists either way.
+            # raises in one of them — a unique violation on the pg_class
+            # insert, or DuplicateObject on the implicit pg_type (composite
+            # type) insert; PG17 serves either by timing. The table exists
+            # either way.
             log.info("State table '%s' created concurrently by another instance", self._table)
         try:
             # Lifecycle is per-DESTINATION operator intent (pausing a
@@ -148,7 +150,8 @@ class StateManager:
                 )
                 """
             )
-        except (psycopg.errors.DuplicateTable, psycopg.errors.UniqueViolation):
+        except (psycopg.errors.DuplicateTable, psycopg.errors.DuplicateObject, psycopg.errors.UniqueViolation):
+            # Same concurrent-create race as the cursor table above.
             log.info("Lifecycle table created concurrently by another instance")
         if not self._table_ensured:
             log.info("State table '%s' ready", self._table)
