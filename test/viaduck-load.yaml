@@ -4,10 +4,13 @@
 # mid-head tenant, so the control group has real baseline+wave flushes
 # (the Zipf tail is interval-bound at 120s and would give the control
 # assertion nothing to evaluate). Delivery tuning is prod-like: a 120s
-# interval so thin tenants are interval-bound, and a 32MiB byte target so
-# the head tenant is target-bound under both controller generations (at
-# ~35% of 3K rows/s at ~2KB/row, a 32MiB byte target
-# fills in ~16s; the 60K rows ceiling post-change fills in ~58s).
+# interval so thin tenants are interval-bound. Rows-controller generation:
+# flush_batch_max_rows is the target ceiling — 30K (not the prod 60K) so
+# the head (~35% of 3K rows/s ≈ 1K rows/s) fills it in ~29s and mallardine
+# (~450 rows/s) in ~67s, both inside loadcheck's 90s baseline; the tail
+# stays interval-bound. The AIMD band is test-scaled (baseline flushes
+# run ~0.4s at this size — ~7x margin under the high bound; the latency
+# wave pushes flushes past it via OCC retries).
 source:
   name: source
   postgres_uri_env: SOURCE_POSTGRES_URI
@@ -168,13 +171,12 @@ server:
 delivery:
   workers: 8
   flush_interval_seconds: 120
-  # 32 MiB: the head tenant (~35% of 3K rows/s at ~2KB/row) fills this in
-  # ~16s — target-triggered; the tail stays interval-bound, as in prod.
-  flush_max_bytes: 33554432
+  # Target init + ceiling (see the header comment for the 30K rationale).
+  flush_batch_max_rows: 30000
   buffer_total_max_bytes: 1610612736
-  # Test-scaled AIMD band: local flushes are ~0.1s, so the prod [5,30]s
-  # band is unreachable; [0.5, 2.0]s is the identical controller behavior
-  # at local speed. Baseline flushes hold ~20x margin under the high
-  # bound; contender-driven OCC retries push flushes past it.
+  # Test-scaled AIMD band: local flushes are ~0.4s at 30K rows, so the
+  # prod [5,30]s band is unreachable; [0.5, 3.0]s is the identical
+  # controller behavior at local speed. Baseline flushes hold ~7x margin
+  # under the high bound; latency-wave OCC retries push flushes past it.
   flush_adaptive_low_seconds: 0.5
-  flush_adaptive_high_seconds: 2.0
+  flush_adaptive_high_seconds: 3.0

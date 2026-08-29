@@ -133,12 +133,14 @@ _dest_time_lag_seconds = Gauge(
     "snapshot-count lag, which needs a commit-rate assumption to convert",
     ["pipeline", "destination"],
 )
-_dest_flush_target_bytes = Gauge(
-    "viaduck_dest_flush_target_bytes",
-    "Adaptive per-destination flush-size target (the bytes flush-trigger "
-    "threshold): starts at delivery.flush_max_bytes and AIMD-adapts to "
-    "observed flush duration — a target pinned at the floor marks a "
-    "commit-contended destination catalog",
+_dest_flush_target_rows = Gauge(
+    "viaduck_dest_flush_target_rows",
+    "Adaptive per-destination flush-size target in ROWS (the flush-trigger "
+    "threshold): starts at delivery.flush_batch_max_rows (its ceiling) and "
+    "AIMD-adapts to observed flush duration — a target pinned at the floor "
+    "marks a commit-contended destination catalog. Row-denominated since "
+    "2026-08-28; the byte-denominated gauge was deleted, never repurposed "
+    "(flush-sizing endgame)",
     ["pipeline", "destination"],
 )
 
@@ -456,7 +458,7 @@ dest_rows_written_total = _dest_rows_written_total
 dest_last_snapshot_id = _dest_last_snapshot_id
 dest_lag_snapshots = _dest_lag_snapshots
 dest_time_lag_seconds = _dest_time_lag_seconds
-dest_flush_target_bytes = _dest_flush_target_bytes
+dest_flush_target_rows = _dest_flush_target_rows
 
 unrouted_rows_total = _unrouted_rows_total
 
@@ -528,7 +530,7 @@ def init(pipeline: str):
     global self_recycles_total
     global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
-    global dest_time_lag_seconds, dest_flush_target_bytes
+    global dest_time_lag_seconds, dest_flush_target_rows
     global unrouted_rows_total
     global pool_open_connections, pool_evictions_total, pool_creates_total
     global errors_total
@@ -585,7 +587,7 @@ def init(pipeline: str):
     dest_last_snapshot_id = _AutoPipelineLabels(_dest_last_snapshot_id, pipeline)
     dest_lag_snapshots = _AutoPipelineLabels(_dest_lag_snapshots, pipeline)
     dest_time_lag_seconds = _AutoPipelineLabels(_dest_time_lag_seconds, pipeline)
-    dest_flush_target_bytes = _AutoPipelineLabels(_dest_flush_target_bytes, pipeline)
+    dest_flush_target_rows = _AutoPipelineLabels(_dest_flush_target_rows, pipeline)
     errors_total = _AutoPipelineLabels(_errors_total, pipeline)
     dest_rows_deleted_total = _AutoPipelineLabels(_dest_rows_deleted_total, pipeline)
     dest_rows_upserted_total = _AutoPipelineLabels(_dest_rows_upserted_total, pipeline)
@@ -632,7 +634,7 @@ def remove_destination_series(dest_id: str) -> None:
         dest_lag_snapshots,
         dest_time_lag_seconds,
         dest_last_snapshot_id,
-        dest_flush_target_bytes,
+        dest_flush_target_rows,
         delivery_buffer_rows,
         delivery_buffer_bytes,
         delivery_reads_paused,

@@ -53,7 +53,7 @@ Viaduck
        reads (masked per destination), half-open ranges (position, current]
     3. If key_columns: table_changes() → Phase 1 → route → buffer
        Else: table_insertions() → route → buffer
-    4. Evaluate flush triggers (interval/rows/bytes/memory/shutdown), gated
+    4. Evaluate flush triggers (interval/target/memory/sliced/shutdown), gated
        by the per-destination flush circuit breaker
   flush workers (delivery.workers threads, flush cadence):
     5. Phase 2 (conflict resolution) on the concatenated buffer

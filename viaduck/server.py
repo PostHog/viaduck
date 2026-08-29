@@ -383,10 +383,11 @@ function fmtBytes(n) {
 function flushTip(d) {
   const c = d.delivery_config || {};
   return 'Changes buffer in memory and flush on the FIRST trigger to fire: ' +
-    'age \u2265 ' + esc(d.flush_interval || '?') + 's \u00b7 ' +
-    'rows \u2265 ' + fmt(c.flush_max_rows) + ' \u00b7 ' +
-    'bytes \u2265 ' + fmtBytes(c.flush_max_bytes) + ' \u00b7 ' +
-    'global watermark ' + fmtBytes(c.buffer_total_max_bytes) + ' (largest first) \u00b7 ' +
+    'age ≥ ' + esc(d.flush_interval || '?') + 's · ' +
+    'rows ≥ the adaptive per-destination target (starts at flush_batch_max_rows = ' + fmt(c.flush_batch_max_rows) +
+    (c.flush_adaptive ? ', AIMD-halves on slow flushes and re-probes upward' : ', fixed') + ') · ' +
+    'destination buffer at its cap · ' +
+    'global watermark ' + fmtBytes(c.buffer_total_max_bytes) + ' (largest first) · ' +
     'shutdown. Workers: ' + fmt(c.workers) + ', connection pool: ' + fmt(c.pool_max_open);
 }
 

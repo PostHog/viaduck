@@ -58,88 +58,20 @@ log = logging.getLogger(__name__)
 # trickle flushes re-inflate a learned-down target (see _adapt_flush_target).
 _ADAPT_GROWTH_MIN_FILL = 0.7
 
-# Rows sampled to price an entry's honest bytes-per-row. ~1,024 rows of the
-# production event shape is a ~300KB copy — one per destination per
-# maybe_flush cycle, only while the adaptive byte-cut is enabled.
-_ROW_BYTES_SAMPLE = 1024
-
-# Entries examined when the head of the buffer cannot be priced (zero rows
-# or estimator failure) before the byte-cut goes inert for the cycle.
-_ROW_BYTES_SAMPLE_ENTRIES = 4
-
-
-def _honest_type(t: pa.DataType) -> pa.DataType:
-    """Rewrite a type with every dictionary layer (at any nesting depth)
-    replaced by its value type. Nested dictionaries carry the same
-    whole-dictionary nbytes inflation as top-level ones and MUST be
-    decoded before measuring (review: struct<dict>/list<dict> slices
-    measured 41,700 B/row against 213 honest; fixed_size_list<dict>
-    19x)."""
-    if pa.types.is_dictionary(t):
-        return _honest_type(t.value_type)
-    if pa.types.is_struct(t):
-        return pa.struct([pa.field(f.name, _honest_type(f.type)) for f in t])
-    if pa.types.is_list(t):
-        return pa.list_(_honest_type(t.value_type))
-    if pa.types.is_large_list(t):
-        return pa.large_list(_honest_type(t.value_type))
-    if pa.types.is_fixed_size_list(t):
-        return pa.list_(_honest_type(t.value_type), t.list_size)
-    if pa.types.is_list_view(t):
-        return pa.list_view(_honest_type(t.value_type))
-    if pa.types.is_large_list_view(t):
-        return pa.large_list_view(_honest_type(t.value_type))
-    if pa.types.is_map(t):
-        return pa.map_(_honest_type(t.key_type), _honest_type(t.item_type))
-    return t
-
-
-_estimate_failure_logged: set[tuple[str, str]] = set()
-
-
-def _estimate_row_bytes(tbl: pa.Table, dest_id: str = "") -> int:
-    """Honest bytes-per-row for a possibly dictionary-encoded table.
-
-    pa.Table.nbytes on production entry tables over-reports ~150x
-    (2026-08-26: the adaptive byte-cut divided by it and sliced team-2
-    into ~2,850-row flushes with a frozen growth gate). Root cause is
-    DICTIONARY-encoded columns from the parquet read path: every chunk
-    of a sliced dictionary column counts the ENTIRE shared dictionary
-    (measured: a 100-row slice reporting a 4.1MB dictionary ~= 41KB/row;
-    multi-chunk entries multiply it per chunk). combine_chunks() does
-    NOT correct this — unified dictionaries keep unreferenced entries —
-    so the sample is CAST to a dictionary-free schema (recursively:
-    nested dictionaries inflate identically) and the decoded copy's
-    nbytes is the honest logical size. Anything that SIZES work
-    (admission, split, bytes trigger, adaptive evidence) must use this,
-    never raw entry nbytes.
-
-    Returns 0 — "unpriceable", byte-cut inert, the 60K rows cap
-    backstops — when the sample prices below one byte per row OR when
-    any pyarrow operation raises: this runs inside the poll cycle,
-    whose escape handler exits the pod, and a poisonous entry must
-    degrade to the flag-off behavior, not a crash loop.
-    """
-    n = min(_ROW_BYTES_SAMPLE, tbl.num_rows)
-    if n <= 0:
-        return 0
-    try:
-        sample = tbl.slice(0, n)
-        target = pa.schema([pa.field(f.name, _honest_type(f.type)) for f in sample.schema])
-        if target != sample.schema:
-            sample = sample.cast(target)
-        return sample.combine_chunks().nbytes // n
-    except Exception as exc:  # noqa: BLE001 — total by contract, see docstring
-        key = (dest_id, type(exc).__name__)
-        if key not in _estimate_failure_logged:
-            _estimate_failure_logged.add(key)
-            log.warning(
-                "Honest-bytes estimate failed for %s (%s: %s); byte-cut inert for affected entries",
-                dest_id or "<unknown>",
-                key[1],
-                exc,
-            )
-        return 0
+# UNIT CONTRACT (2026-08-28, flush-sizing endgame): flush control is
+# ROW-denominated end to end — the trigger, the slice cut, and the adaptive
+# target. No component converts between byte flavors anywhere in the control
+# path: there is no single correct "bytes" for an arrow table (in-memory
+# nbytes counts shared dictionaries per chunk, ~150x; decoded-logical
+# expands shared blobs 20-100x; parquet-on-wire differs again), and three
+# incidents in three days (08-26..08-28) were that ambiguity wearing
+# different units. The controller never needed bytes: its feedback signal is
+# flush DURATION, its actuator is ROWS. Buffer CAPS stay on raw nbytes —
+# inflated, the conservative direction for a memory safety bound; changing
+# THAT unit re-rates every cap ~150x, so _Buffer.bytes and every cap knob
+# carry the contract comment. The byte-invariance fencing test
+# (test_delivery.py) makes "bytes cannot re-enter the control path"
+# executable.
 
 
 @dataclass
@@ -158,6 +90,12 @@ class _Buffer:
     # the buffer and bumps the epoch.
     entries: list[tuple[pa.Table, int, int]] = field(default_factory=list)
     rows: int = 0
+    # RAW pa.Table.nbytes — INFLATED by shared-dictionary counting, and that
+    # is the contract: this feeds ONLY memory-safety bounds (per-dest caps,
+    # the global watermark, largest-first ordering), where inflated is the
+    # conservative direction. Flush control is rows-denominated (unit
+    # contract, top of module); nothing here may feed a sizing decision.
+    # Changing this unit re-rates every cap by the inflation factor (~150x).
     bytes: int = 0
     first_buffered_at: float | None = None  # monotonic; None when empty
     # Set when this buffer is the REMAINDER of a partial swap: the next
@@ -375,18 +313,17 @@ class DeliveryManager:
         # (same caveat as rows_replicated).
         self._applied: dict[str, dict[str, int]] = {d: {"inserts": 0, "updates": 0, "deletes": 0} for d in assigned_ids}
         self._buffered_rows_total: dict[str, int] = {d: 0 for d in assigned_ids}
-        # Adaptive flush-size target: the bytes flush-trigger threshold,
-        # per destination (see DeliveryConfig.flush_adaptive). Starts at
-        # the global cap and AIMD-adapts to observed flush duration in
-        # _adapt_flush_target. In-memory only — a restart re-learns a
-        # contended destination's target in ~log2(cap/floor) flushes.
-        self._flush_target: dict[str, int] = {d: cfg.flush_max_bytes for d in assigned_ids}
-        # Last honest bytes-per-row estimate per destination (see
-        # _estimate_row_bytes). The bytes TRIGGER consults this so it
-        # judges the buffer in the same units as the target and the
-        # fill gate (QE-BUG-1: raw buf.bytes vs honest target trickled
-        # target-capped crumb flushes and froze a halved target).
-        self._per_row_est: dict[str, int] = {}
+        # Adaptive flush-size target: the ROWS flush-trigger threshold, per
+        # destination (see DeliveryConfig.flush_adaptive and the UNIT
+        # CONTRACT at the top of this module). Starts at
+        # flush_batch_max_rows (its ceiling) and AIMD-adapts to observed
+        # flush DURATION in _adapt_flush_target. In-memory only — a restart
+        # re-learns a contended destination's target in ~log2(ceiling/floor)
+        # flushes.
+        self._flush_target: dict[str, int] = {d: cfg.flush_batch_max_rows for d in assigned_ids}
+        # Consecutive in-band, >=fill, successful flushes per destination —
+        # the dead-zone re-probe streak (see _adapt_flush_target).
+        self._inband_streak: dict[str, int] = {d: 0 for d in assigned_ids}
         for d in assigned_ids:
             # Seed the gauge so "target == ceiling" is visible before the
             # first data flush — a dashboard reading "pinned at floor =
@@ -394,7 +331,7 @@ class DeliveryManager:
             # alerting-contract reasoning for the cursor and buffer gauges:
             # they must read real values (cursor position, 0 rows), not
             # absent series, for a destination that has not flushed yet.
-            metrics.dest_flush_target_bytes.labels(destination=d).set(cfg.flush_max_bytes)
+            metrics.dest_flush_target_rows.labels(destination=d).set(cfg.flush_batch_max_rows)
             metrics.dest_last_snapshot_id.labels(destination=d).set(self._flushed[d])
             metrics.delivery_buffer_rows.labels(destination=d).set(0)
             metrics.delivery_buffer_bytes.labels(destination=d).set(0)
@@ -415,7 +352,7 @@ class DeliveryManager:
         self._circuit_open_until: dict[str, float] = {}
         for d in assigned_ids:
             # Seed the gauge so "never opened" reads 0, not absent — same
-            # alerting-contract reasoning as dest_flush_target_bytes above.
+            # alerting-contract reasoning as dest_flush_target_rows above.
             metrics.delivery_circuit_open.labels(destination=d).set(0)
         # Overall per-flush wall-clock deadline (delivery.flush_deadline_seconds;
         # 0 derives 2x flush_interval). Bounds the retry loop's wall time —
@@ -665,60 +602,32 @@ class DeliveryManager:
                 # flush lets the buffer pile up and the next swap takes
                 # everything — the feedback loop that produced 170-440K-row
                 # batches and drove the fork's native layer into
-                # buffer-manager corruption (2026-07-29). Without the BYTE
-                # cut, the adaptive target would gate only the trigger
-                # while backlogged swaps stay rows-cap-sized — the
-                # controller would converge its target and actuate nothing
-                # in exactly the contended-catalog regime it exists for.
-                # And without the WITHIN-entry cut, a single destination-
-                # heavy read unit arrives as one unsliceable entry that
-                # bypasses both caps at once: the 2026-08 team-2 episode
-                # (~100K-op/1.4GB single-entry appends at 145-468s while
-                # the adaptive target sat pinned at its floor, powerless).
-                # Flush payload is priced by the S3 upload of its bytes
-                # (append profiles: ~90% of statement latency), so p95/p99
-                # flush duration IS payload size — the cap must bind
-                # for every entry shape (up to row-size skew: the split is
-                # rows-proportional, so a few giant variable-width rows
-                # can overshoot the byte cap; a single row is the floor).
+                # buffer-manager corruption (2026-07-29). The cut is the
+                # adaptive ROWS target (the unit contract at the top of
+                # this module): it gates both the trigger AND the swap, so
+                # a learned-down target actuates backlogged drains too.
+                # And the WITHIN-entry cut matters because a single
+                # destination-heavy read unit arrives as one entry that
+                # would otherwise bypass the cap: the 2026-08 team-2
+                # episode (~100K-op/1.4GB single-entry appends at 145-468s
+                # while the adaptive target sat pinned at its floor,
+                # powerless).
                 # The remainder stays buffered with its age preserved,
                 # and the "sliced" trigger keeps the pipeline of bounded
                 # slices draining back-to-back.
-                cap = self._cfg.flush_batch_max_rows
-                byte_cap = self._flush_target[dest_id] if self._cfg.flush_adaptive else 0
-                # Honest pricing for the byte-cut: entries are dictionary-
-                # encoded slices whose .nbytes over-reports shared buffers
-                # (see _estimate_row_bytes), so admission and the split
-                # below price entries as rows x a sampled per-row rate.
-                # Sampled from the first PRICEABLE entry (QE-BUG-3: a
-                # zero-row or unpriceable head must not disarm the cut
-                # for the whole buffer), bounded to a few attempts.
-                per_row = 0
-                if byte_cap > 0:
-                    for tbl, _cov, _hi in buf.entries[:_ROW_BYTES_SAMPLE_ENTRIES]:
-                        per_row = _estimate_row_bytes(tbl, dest_id)
-                        if per_row > 0:
-                            break
-                    self._per_row_est[dest_id] = per_row
+                cap = self._flush_target[dest_id]
                 take = len(buf.entries)
-                if cap > 0 or byte_cap > 0:
-                    taken_rows = 0
-                    taken_bytes = 0
-                    take = 0
-                    for tbl, _cov, _hi in buf.entries:
-                        est = tbl.num_rows * per_row
-                        if take > 0 and (
-                            (cap > 0 and taken_rows + tbl.num_rows > cap)
-                            or (byte_cap > 0 and taken_bytes + est > byte_cap)
-                        ):
-                            break
-                        taken_rows += tbl.num_rows
-                        taken_bytes += est
-                        take += 1
+                taken_rows = 0
+                take = 0
+                for tbl, _cov, _hi in buf.entries:
+                    if take > 0 and taken_rows + tbl.num_rows > cap:
+                        break
+                    taken_rows += tbl.num_rows
+                    take += 1
                 sliced = buf.entries[:take]
                 remainder = buf.entries[take:]
                 # Within-entry slice: the loop above always admits the
-                # first entry whole. If that entry alone is over a cap,
+                # first entry whole. If that entry alone is over the cap,
                 # split it and leave the tail (SAME cov/hi — the entry's
                 # coverage is indivisible) at the buffer head. The head
                 # slice's flush must NOT persist the entry's cov: rows
@@ -730,14 +639,8 @@ class DeliveryManager:
                 entry_split = False
                 if take == 1:
                     tbl0, cov0, hi0 = sliced[0]
-                    over_rows = cap > 0 and tbl0.num_rows > cap
-                    over_bytes = byte_cap > 0 and per_row > 0 and tbl0.num_rows * per_row > byte_cap
-                    if (over_rows or over_bytes) and tbl0.num_rows > 1:
-                        n = tbl0.num_rows
-                        if over_rows:
-                            n = min(n, cap)
-                        if over_bytes:
-                            n = min(n, max(1, byte_cap // per_row))
+                    if tbl0.num_rows > cap and tbl0.num_rows > 1:
+                        n = min(tbl0.num_rows, cap)
                         if 0 < n < tbl0.num_rows:
                             sliced = [(tbl0.slice(0, n), cov0, hi0)]
                             remainder = [(tbl0.slice(n), cov0, hi0)] + remainder
@@ -788,16 +691,7 @@ class DeliveryManager:
                 # column is being watched).
                 metrics.delivery_buffer_rows.labels(destination=dest_id).set(rem_buf.rows)
                 metrics.delivery_buffer_bytes.labels(destination=dest_id).set(rem_buf.bytes)
-                # per_row == 0 with the byte-cut armed: pass 0, not None —
-                # the None fallback would feed raw (inflated) nbytes to the
-                # AIMD fill gate and allow spurious growth.
-                if per_row > 0:
-                    est_bytes = sum(t.num_rows for t in tables) * per_row
-                elif byte_cap > 0:
-                    est_bytes = 0
-                else:
-                    est_bytes = None
-                future = self._executor.submit(self._flush, dest_id, tables, through, trigger, est_bytes)
+                future = self._executor.submit(self._flush, dest_id, tables, through, trigger)
                 # _flush catches everything it expects; anything escaping
                 # (a bug) must not vanish into an unobserved Future.
                 future.add_done_callback(self._log_escaped_exception)
@@ -926,90 +820,98 @@ class DeliveryManager:
             return "memory"
         # A destination at its own queue cap must flush even if the global
         # thresholds aren't met — reads for it are paused until this drains,
-        # so waiting for flush_max_bytes/interval would leave it wedged at
+        # so waiting for the rows target/interval would leave it wedged at
         # the cap with its intake stopped.
         if has_data and self._dest_bytes_locked(dest_id) >= self._cap_for_locked(dest_id):
             return "memory"
         if has_data and buf.sliced_remainder:
             # The tail of a sliced pile drains as soon as the in-flight
             # slice completes — never on the interval cadence (slicing
-            # review F1: a mid-size remainder below the rows/bytes
-            # thresholds would otherwise stall up to flush_interval).
+            # review F1: a mid-size remainder below the rows target would
+            # otherwise stall up to flush_interval).
             return "sliced"
-        if has_data and buf.rows >= self._cfg.flush_max_rows:
-            return "rows"
-        # Bytes trigger consults the ADAPTIVE per-destination target, not
-        # the global cap — flush_max_bytes survives as the target's ceiling
-        # and initial value. When the target has shrunk below one CDC
-        # chunk, the trigger fires per chunk: one chunk is the floor by
-        # construction (slicing never splits a chunk either).
-        # The comparison runs in HONEST units via the cached per-row
-        # estimate when available (QE-BUG-1: raw inflated buf.bytes vs an
-        # honest target fired at ~target/150 of real content — trickle
-        # flushes that could never satisfy the growth gate). Before the
-        # first estimate (or unpriceable), raw bytes: fires early, never
-        # late — the conservative direction.
-        if has_data:
-            per_row_est = self._per_row_est.get(dest_id, 0) if self._cfg.flush_adaptive else 0
-            trigger_bytes = buf.rows * per_row_est if per_row_est > 0 else buf.bytes
-            if trigger_bytes >= self._flush_target[dest_id]:
-                return "bytes"
+        # The rows trigger: the per-destination adaptive target (ceiling
+        # flush_batch_max_rows; fixed at the ceiling when flush_adaptive is
+        # off). Rows are the unit the slicer, the caps, and the logs all
+        # speak — see the unit contract at the top of this module.
+        if has_data and buf.rows >= self._flush_target[dest_id]:
+            return "target"
         dirty_since = self._position_dirty_since[dest_id]
         age_start = buf.first_buffered_at if has_data else dirty_since
         if age_start is not None and (now - age_start) >= self._cfg.flush_interval_seconds:
             return "interval"
         return None
 
-    def _adapt_flush_target(self, dest_id: str, duration: float, batch_bytes: int, *, failed: bool = False) -> None:
-        """AIMD controller on flush duration (millpond's backpressure
-        precedent, per-destination). The sustainable batch size is a
-        property of the destination catalog's commit contention — on a
-        contended catalog, throughput DECREASES with batch size (longer
-        write+commit window → more peer-commit collisions → more
-        DuckLake-internal OCC retries, each re-running multi-second
-        catalog SQL) — so no global flush_max_bytes serves both a busy
-        and an idle catalog. Called by the flush worker after every DATA
-        flush (position-only persists carry no signal): slower than the
-        high bound → halve (floored at flush_adaptive_min_bytes; the
-        effective floor is one CDC chunk since neither the bytes trigger
-        nor the swap byte-cut splits a chunk); faster than the low bound
-         AND the batch nearly filled the current target → additive step
-         up (capped at flush_max_bytes); otherwise hold. The fill
-         condition is what makes growth evidence-based: a tiny interval
-         flush finishing in <1s says nothing about whether a target-sized
-         batch is sustainable, and without it a quiet period walks a
-         learned-down target back to the cap, so the next burst re-runs
-         the oversize-flush/drop/re-read cycle from scratch. Failures
-         never grow. Converges from a cold start in ~log2(cap/floor)
-         flushes and re-probes upward as contention subsides — but only
-         under enough traffic to fill the target, which is the only time
-         the target matters. `duration` is the DESTINATION-WRITE span
-         (apply incl. its OCC retries; for a failed apply, the burn so
-         far): the cursor-persist tail is shared-PG infrastructure and
-         must not shape a per-destination contention signal — a
-         fleet-wide PG blip would otherwise ratchet every target down on
-         the wrong resource's time."""
+    def _adapt_flush_target(self, dest_id: str, duration: float, batch_rows: int, *, failed: bool = False) -> None:
+        """AIMD controller on flush DURATION (millpond's backpressure
+        precedent, per-destination), actuating a ROWS target. The
+        sustainable batch size is a property of the destination catalog's
+        commit contention — on a contended catalog, throughput DECREASES
+        with batch size (longer write+commit window → more peer-commit
+        collisions → more DuckLake-internal OCC retries, each re-running
+        multi-second catalog SQL) — so no single global batch size serves
+        both a busy and an idle catalog. Called by the flush worker after
+        every DATA flush (position-only persists carry no signal): slower
+        than the high bound → halve (floored at flush_adaptive_min_rows);
+        faster than the low bound AND the batch nearly filled the current
+        target → additive step up (capped at flush_batch_max_rows);
+        otherwise hold. The fill condition is what makes growth
+        evidence-based: a tiny interval flush finishing in <1s says nothing
+        about whether a target-sized batch is sustainable, and without it a
+        quiet period walks a learned-down target back to the ceiling, so
+        the next burst re-runs the oversize-flush/drop/re-read cycle from
+        scratch. Failures never grow. Converges from a cold start in
+        ~log2(ceiling/floor) flushes.
+
+        The [low, high] dead zone is a RATCHET by design, with one heal:
+        the RE-PROBE. After flush_adaptive_reprobe_after consecutive
+        in-band, >=fill-fraction, successful flushes, the target steps up
+        once — healing ratchet-downs from transient contention spikes
+        without waiting for a restart. The streak resets on any halve,
+        grow, out-of-band, under-filled, or failed flush.
+
+        `duration` is the DESTINATION-WRITE span (apply incl. its OCC
+        retries; for a failed apply, the burn so far): the cursor-persist
+        tail is shared-PG infrastructure and must not shape a
+        per-destination contention signal — a fleet-wide PG blip would
+        otherwise ratchet every target down on the wrong resource's time.
+        """
         cfg = self._cfg
         if not cfg.flush_adaptive:
             return
-        # Floor clamped to the ceiling: an operator lowering flush_max_bytes
-        # below flush_adaptive_min_bytes shouldn't need a second knob.
-        floor = min(cfg.flush_adaptive_min_bytes, cfg.flush_max_bytes)
+        ceiling = cfg.flush_batch_max_rows
+        # Floor clamped to the ceiling: an operator lowering
+        # flush_batch_max_rows below flush_adaptive_min_rows shouldn't need
+        # a second knob.
+        floor = min(cfg.flush_adaptive_min_rows, ceiling)
         with self._lock:
             cur = self._flush_target[dest_id]
+            streak = self._inband_streak[dest_id]
             if duration > cfg.flush_adaptive_high_seconds:
                 new = max(floor, cur // 2)
+                streak = 0
             elif (
-                not failed and duration < cfg.flush_adaptive_low_seconds and batch_bytes >= cur * _ADAPT_GROWTH_MIN_FILL
+                not failed and duration < cfg.flush_adaptive_low_seconds and batch_rows >= cur * _ADAPT_GROWTH_MIN_FILL
             ):
-                new = min(cfg.flush_max_bytes, cur + cfg.flush_adaptive_step_bytes)
+                new = min(ceiling, cur + cfg.flush_adaptive_step_rows)
+                streak = 0
+            elif not failed and batch_rows >= cur * _ADAPT_GROWTH_MIN_FILL:
+                # In-band, full, successful: count toward a re-probe.
+                streak += 1
+                if streak >= cfg.flush_adaptive_reprobe_after:
+                    new = min(ceiling, cur + cfg.flush_adaptive_step_rows)
+                    streak = 0
+                else:
+                    new = cur
             else:
                 new = cur
+                streak = 0
             self._flush_target[dest_id] = new
-        metrics.dest_flush_target_bytes.labels(destination=dest_id).set(new)
+            self._inband_streak[dest_id] = streak
+        metrics.dest_flush_target_rows.labels(destination=dest_id).set(new)
         if new != cur:
             log.info(
-                "Adaptive flush target for %s: %d -> %d bytes (%s flush took %.1fs)",
+                "Adaptive flush target for %s: %d -> %d rows (%s flush took %.1fs)",
                 dest_id,
                 cur,
                 new,
@@ -1017,9 +919,7 @@ class DeliveryManager:
                 duration,
             )
 
-    def _flush(
-        self, dest_id: str, tables: list[pa.Table], through: int | None, trigger: str, est_bytes: int | None = None
-    ) -> None:
+    def _flush(self, dest_id: str, tables: list[pa.Table], through: int | None, trigger: str) -> None:
         """Worker: FlushCommit / FlushFail.
 
         `through=None` marks a PARTIAL-ENTRY flush (within-entry slice):
@@ -1033,15 +933,10 @@ class DeliveryManager:
         re-applies landed slices (append_only duplicates them).
         """
         t0 = time.monotonic()
-        # est_bytes is the honest sampled sizing from maybe_flush; entry
-        # nbytes over-reports shared buffers, and the adaptive fill gate
-        # (batch_bytes >= target * fill) must judge growth in the same
-        # units the cut used or it never passes (the frozen-controller
-        # half of the 2026-08-26 incident). Known limit: the estimate
-        # comes from a head sample, so a batch whose tail rows are much
-        # wider can under-report and let the gate grow on bad evidence —
-        # duration-based halving is the recovery path (QE quantified).
-        batch_bytes = est_bytes if est_bytes is not None else sum(t.nbytes for t in tables)
+        # The adaptive fill gate's evidence, in ROWS — the unit the trigger,
+        # the slice cut, and the target all speak (unit contract, top of
+        # module). No byte flavor is consulted anywhere in the control path.
+        batch_rows = sum(t.num_rows for t in tables)
         deadline = t0 + self._flush_deadline_s if self._flush_deadline_s is not None else None
         circuit_was_open = False
         # apply_done tracks whether the destination-write phase completed (or
@@ -1181,7 +1076,7 @@ class DeliveryManager:
                 # into this metric when buffering landed; delivery_flush_seconds
                 # covers that span and its HELP says so).
                 metrics.dest_write_seconds.labels(destination=dest_id).observe(apply_seconds)
-                self._adapt_flush_target(dest_id, apply_seconds, batch_bytes)
+                self._adapt_flush_target(dest_id, apply_seconds, batch_rows)
                 if self._on_flush_success is not None:
                     self._on_flush_success()
                 log.info(
@@ -1255,7 +1150,7 @@ class DeliveryManager:
                 # evidence, not destination contention); the full burn when
                 # the apply phase itself failed.
                 self._adapt_flush_target(
-                    dest_id, apply_seconds if apply_seconds is not None else duration, batch_bytes, failed=True
+                    dest_id, apply_seconds if apply_seconds is not None else duration, batch_rows, failed=True
                 )
         finally:
             with self._lock:
@@ -1341,8 +1236,9 @@ class DeliveryManager:
                 self._inflight_bytes[dest_id] = 0
                 self._applied[dest_id] = {"inserts": 0, "updates": 0, "deletes": 0}
                 self._buffered_rows_total[dest_id] = 0
-                self._flush_target[dest_id] = self._cfg.flush_max_bytes
-                metrics.dest_flush_target_bytes.labels(destination=dest_id).set(self._cfg.flush_max_bytes)
+                self._flush_target[dest_id] = self._cfg.flush_batch_max_rows
+                self._inband_streak[dest_id] = 0
+                metrics.dest_flush_target_rows.labels(destination=dest_id).set(self._cfg.flush_batch_max_rows)
                 metrics.dest_last_snapshot_id.labels(destination=dest_id).set(cursor)
                 metrics.delivery_buffer_rows.labels(destination=dest_id).set(0)
                 metrics.delivery_buffer_bytes.labels(destination=dest_id).set(0)

@@ -1,8 +1,16 @@
-# Flush sizing endgame: retire byte-denominated control (plan v3, implementation-ready)
+# Flush sizing endgame: retire byte-denominated control (plan v3, IMPLEMENTED)
 
-Status: APPROVED FOR IMPLEMENTATION. Adversarial review verdict: "approve —
-this design can be the last one" with 10 amendments; repo-level review
-2026-08-28 added 7 more. All folded below.
+Status: IMPLEMENTED + locally gated (2026-08-29). Adversarial review verdict:
+"approve — this design can be the last one" with 10 amendments; repo-level
+review 2026-08-28 added 7 more. All folded below. The rows controller, the
+byte-path deletion, the warn-ignore config compat, the docs, and the test
+surface (rewrites + convergence-from-ceiling + byte-invariance fencing +
+re-probe + config-compat) landed in the same PR as the review bundle and the
+load harness. Gate run against the rows controller: 842 unit + 124
+integration green; load harness 10/10 (head target-triggered at ~17.8K-row
+batches under a 30K test ceiling, 9 contended destinations halved 30K→15K
+under the latency wave, control held, burst tenant migrated interval→target
+with ≤83s lag, zero errors).
 
 Constraint set by Jakob 2026-08-28: portola's recovery (charts#14834, byte-AIMD
 growing under a 1GiB ceiling) must not regress; team-2 (crumb-cut to ~2-19K-row

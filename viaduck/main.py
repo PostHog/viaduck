@@ -1915,8 +1915,8 @@ def _poll_cycle(
         flush_interval=cfg.delivery.flush_interval_seconds,
         delivery_config={
             "workers": cfg.delivery.workers,
-            "flush_max_rows": cfg.delivery.flush_max_rows,
-            "flush_max_bytes": cfg.delivery.flush_max_bytes,
+            "flush_batch_max_rows": cfg.delivery.flush_batch_max_rows,
+            "flush_adaptive": cfg.delivery.flush_adaptive,
             "buffer_total_max_bytes": cfg.delivery.buffer_total_max_bytes,
             "buffer_max_bytes_per_destination": cfg.delivery.buffer_max_bytes_per_destination,
             "pool_max_open": cfg.delivery.pool_max_open,

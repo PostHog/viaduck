@@ -27,6 +27,8 @@ import yaml
 
 from viaduck.partition_transforms import TRANSFORM_NAMES as _PARTITION_TRANSFORMS
 
+log = logging.getLogger(__name__)
+
 
 class ConfigError(Exception):
     pass
@@ -518,9 +520,14 @@ class DeliveryConfig:
 
     workers: int = 8
     flush_interval_seconds: float = 120.0
-    flush_max_rows: int = 500_000
-    flush_max_bytes: int = 268_435_456  # 256 MiB — ceiling + start of the adaptive per-dest target
-    buffer_total_max_bytes: int = 1_073_741_824  # 1 GiB across all buffers
+    # NOTE (2026-08-28, flush-sizing endgame): byte-denominated flush sizing
+    # was retired — no single correct "bytes" exists for an arrow table
+    # (in-memory vs decoded-logical vs parquet-on-wire differ by orders of
+    # magnitude per shape; three incidents in three days). Flush control is
+    # ROW-denominated end to end: the trigger, the slice, and the adaptive
+    # target. Buffer CAPS below stay on raw nbytes by contract (inflated —
+    # the conservative direction for a memory bound).
+    buffer_total_max_bytes: int = 1_073_741_824  # 1 GiB across all buffers — raw nbytes, see above
     # Per-destination buffer + in-flight byte ceiling — the bound on each
     # destination's CDC "queue". When a destination's (buffered + in-flight)
     # bytes reach this, the poll thread stops reading FOR THAT DESTINATION
@@ -530,39 +537,48 @@ class DeliveryConfig:
     # paused reads for everyone. 0 (default) auto-derives a fair share:
     # buffer_total_max_bytes / number of assigned destinations.
     buffer_max_bytes_per_destination: int = 0
-    # Ceiling on the rows ONE flush takes from the buffer (sliced at
-    # chunk boundaries; the remainder stays buffered and goes out in the
-    # next flush). Without it, a slow flush lets the buffer pile up and
-    # the NEXT swap takes everything — the feedback loop that produced
-    # 170-440K-row append batches and drove the fork's native layer into
-    # buffer-manager corruption + SIGSEGV (2026-07-29 incident).
-    # Batches <=~60K rows are the empirically stable regime. A single
-    # buffered chunk larger than the cap still flushes whole (slicing
-    # never splits a read entry) — poll.read_unit_max_rows bounds that.
-    # 0 = unlimited (pre-slicing behavior).
+    # Ceiling on the rows ONE flush takes from the buffer, AND the
+    # init/ceiling of the per-destination adaptive rows target below
+    # (sliced at entry boundaries, or within an oversize entry; the
+    # remainder stays buffered and goes out in the next flush). Without
+    # it, a slow flush lets the buffer pile up and the NEXT swap takes
+    # everything — the feedback loop that produced 170-440K-row append
+    # batches and drove the fork's native layer into buffer-manager
+    # corruption + SIGSEGV (2026-07-29 incident). Batches <=~60K rows are
+    # the empirically stable regime. Must be >= 1: it is the controller's
+    # ceiling, and an unbounded ceiling is undefined.
     flush_batch_max_rows: int = 60_000
-    # Adaptive per-destination flush sizing (AIMD on flush duration).
-    # flush_max_bytes is a global knob, but the sustainable batch size is a
-    # property of each DESTINATION's catalog: on a commit-contended catalog
-    # write throughput DECREASES with batch size (a longer write+commit
-    # window collides with more peer commits → more DuckLake-internal OCC
-    # retries, each re-running multi-second catalog SQL), while an idle
-    # catalog absorbs the full-size batch at wire speed. team-2 vs team-50689
-    # (2026-07-30): same row sizes, opposite needs — no single global value
-    # serves both. Each destination therefore carries an in-memory bytes
-    # target that starts at flush_max_bytes and adapts to observed flush
-    # duration: in the [low, high] band → hold; faster than low → additive
-    # increase (step_bytes, capped at flush_max_bytes); slower than high →
-    # halve (floored at min_bytes). Effective floor is one CDC chunk —
-    # slicing never splits a read entry — so poll.read_unit_max_rows stays the
-    # true lower bound on batch size.
+    # Adaptive per-destination flush sizing (AIMD on flush DURATION — the
+    # unit-proof feedback signal; the actuator is ROWS). The sustainable
+    # batch size is a property of each DESTINATION's catalog: on a
+    # commit-contended catalog write throughput DECREASES with batch size
+    # (a longer write+commit window collides with more peer commits → more
+    # DuckLake-internal OCC retries, each re-running multi-second catalog
+    # SQL), while an idle catalog absorbs the full-size batch at wire
+    # speed. team-2 vs team-50689 (2026-07-30): same row sizes, opposite
+    # needs — no single global value serves both. Each destination carries
+    # an in-memory ROWS target that starts at flush_batch_max_rows and
+    # adapts: in the [low, high] seconds band → hold; faster than low with
+    # a >=70%-full batch → additive step_rows (capped at
+    # flush_batch_max_rows); slower than high → halve (floored at
+    # min_rows). The [low, high] dead zone would be a one-way RATCHET
+    # without the re-probe: after flush_adaptive_reprobe_after consecutive
+    # in-band, >=70%-full, successful flushes, the target steps up once —
+    # healing ratchet-downs from transient contention spikes without
+    # waiting for a restart. flush_adaptive=false: fixed target at the
+    # ceiling.
     flush_adaptive: bool = True
     flush_adaptive_low_seconds: float = 5.0
     flush_adaptive_high_seconds: float = 30.0
-    flush_adaptive_step_bytes: int = 16_777_216  # +16 MiB per fast flush
-    # Target floor; clamped to flush_max_bytes at runtime so lowering the
-    # ceiling below the floor stays a one-knob change.
-    flush_adaptive_min_bytes: int = 8_388_608  # 8 MiB
+    # Additive growth step in ROWS (default = ceiling/15 — the old
+    # 16MiB/256MiB byte-step ratio).
+    flush_adaptive_step_rows: int = 4_000
+    # Target floor in ROWS; clamped to flush_batch_max_rows at runtime so
+    # lowering the ceiling below the floor stays a one-knob change.
+    flush_adaptive_min_rows: int = 4_000
+    # Consecutive in-band, >=70%-full, successful flushes before the
+    # controller re-probes upward one step (the dead-zone ratchet heal).
+    flush_adaptive_reprobe_after: int = 50
     pool_max_open: int = 100  # destination connection pool size
     # Overall per-flush wall-clock deadline. The OCC retry loop
     # (apply._write_with_retry) is bounded in ATTEMPTS but unbounded in
@@ -605,7 +621,7 @@ class DeliveryConfig:
             raise ConfigError(f"delivery.workers must be >= 1, got {self.workers}")
         if self.flush_interval_seconds < 0:
             raise ConfigError(f"delivery.flush_interval_seconds must be >= 0, got {self.flush_interval_seconds}")
-        for name in ("flush_max_rows", "flush_max_bytes", "buffer_total_max_bytes", "pool_max_open"):
+        for name in ("buffer_total_max_bytes", "pool_max_open"):
             if getattr(self, name) < 1:
                 raise ConfigError(f"delivery.{name} must be >= 1, got {getattr(self, name)}")
         if self.buffer_max_bytes_per_destination < 0:
@@ -613,11 +629,15 @@ class DeliveryConfig:
                 f"delivery.buffer_max_bytes_per_destination must be >= 0 (0 = auto), "
                 f"got {self.buffer_max_bytes_per_destination}"
             )
-        if self.flush_batch_max_rows < 0:
+        if self.flush_batch_max_rows < 1:
+            # The adaptive controller's init AND ceiling — 0 would leave no
+            # rows bound at all (the legacy flush_max_rows backstop is
+            # deleted), in either adaptive or fixed mode.
             raise ConfigError(
-                f"delivery.flush_batch_max_rows must be >= 0 (0 = unlimited), got {self.flush_batch_max_rows}"
+                f"delivery.flush_batch_max_rows must be >= 1 (it is the flush target's ceiling), "
+                f"got {self.flush_batch_max_rows}"
             )
-        for name in ("flush_adaptive_step_bytes", "flush_adaptive_min_bytes"):
+        for name in ("flush_adaptive_step_rows", "flush_adaptive_min_rows", "flush_adaptive_reprobe_after"):
             if getattr(self, name) < 1:
                 raise ConfigError(f"delivery.{name} must be >= 1, got {getattr(self, name)}")
         if self.flush_adaptive_low_seconds < 0:
@@ -814,20 +834,20 @@ class ViaduckConfig:
 
         log.info("config: delivery.workers=%d", self.delivery.workers)
         log.info("config: delivery.flush_interval_seconds=%s", self.delivery.flush_interval_seconds)
-        log.info("config: delivery.flush_max_rows=%d", self.delivery.flush_max_rows)
-        log.info("config: delivery.flush_max_bytes=%d", self.delivery.flush_max_bytes)
+        log.info("config: delivery.flush_batch_max_rows=%d", self.delivery.flush_batch_max_rows)
         log.info("config: delivery.buffer_total_max_bytes=%d", self.delivery.buffer_total_max_bytes)
         log.info(
             "config: delivery.buffer_max_bytes_per_destination=%d (0=auto: total/N)",
             self.delivery.buffer_max_bytes_per_destination,
         )
         log.info(
-            "config: delivery.flush_adaptive=%s (band=[%s, %s]s, step=%d, min=%d)",
+            "config: delivery.flush_adaptive=%s (band=[%s, %s]s, step_rows=%d, min_rows=%d, reprobe_after=%d)",
             self.delivery.flush_adaptive,
             self.delivery.flush_adaptive_low_seconds,
             self.delivery.flush_adaptive_high_seconds,
-            self.delivery.flush_adaptive_step_bytes,
-            self.delivery.flush_adaptive_min_bytes,
+            self.delivery.flush_adaptive_step_rows,
+            self.delivery.flush_adaptive_min_rows,
+            self.delivery.flush_adaptive_reprobe_after,
         )
         log.info("config: delivery.pool_max_open=%d", self.delivery.pool_max_open)
         log.info(
@@ -1045,11 +1065,27 @@ def load(path: str | Path) -> ViaduckConfig:
     )
 
     delivery_raw = raw.get("delivery", {})
+    # Retired with the byte-denominated flush controller (2026-08-28,
+    # flush-sizing endgame): WARN-ignored, never refused — the replacement
+    # rows controller is on by default, so a stale chart carrying these
+    # silently gets the new defaults, which is the safe direction (contrast
+    # the M4 poll-section refusal list, where a silent default would have
+    # meant a deleted safety bound).
+    for retired in (
+        "flush_max_rows",
+        "flush_max_bytes",
+        "flush_adaptive_min_bytes",
+        "flush_adaptive_step_bytes",
+    ):
+        if retired in delivery_raw:
+            log.warning(
+                "config: delivery.%s was removed with the byte-denominated flush controller "
+                "(rows-denominated now — see flush-sizing-endgame-2026-08-28.md); ignoring it",
+                retired,
+            )
     delivery = DeliveryConfig(
         workers=_validate_int(delivery_raw.get("workers", 8), "delivery.workers"),
         flush_interval_seconds=float(delivery_raw.get("flush_interval_seconds", 120.0)),
-        flush_max_rows=_validate_int(delivery_raw.get("flush_max_rows", 500_000), "delivery.flush_max_rows"),
-        flush_max_bytes=_validate_int(delivery_raw.get("flush_max_bytes", 268_435_456), "delivery.flush_max_bytes"),
         buffer_total_max_bytes=_validate_int(
             delivery_raw.get("buffer_total_max_bytes", 1_073_741_824), "delivery.buffer_total_max_bytes"
         ),
@@ -1063,11 +1099,14 @@ def load(path: str | Path) -> ViaduckConfig:
         flush_adaptive=bool(delivery_raw.get("flush_adaptive", True)),
         flush_adaptive_low_seconds=float(delivery_raw.get("flush_adaptive_low_seconds", 5.0)),
         flush_adaptive_high_seconds=float(delivery_raw.get("flush_adaptive_high_seconds", 30.0)),
-        flush_adaptive_step_bytes=_validate_int(
-            delivery_raw.get("flush_adaptive_step_bytes", 16_777_216), "delivery.flush_adaptive_step_bytes"
+        flush_adaptive_step_rows=_validate_int(
+            delivery_raw.get("flush_adaptive_step_rows", 4_000), "delivery.flush_adaptive_step_rows"
         ),
-        flush_adaptive_min_bytes=_validate_int(
-            delivery_raw.get("flush_adaptive_min_bytes", 8_388_608), "delivery.flush_adaptive_min_bytes"
+        flush_adaptive_min_rows=_validate_int(
+            delivery_raw.get("flush_adaptive_min_rows", 4_000), "delivery.flush_adaptive_min_rows"
+        ),
+        flush_adaptive_reprobe_after=_validate_int(
+            delivery_raw.get("flush_adaptive_reprobe_after", 50), "delivery.flush_adaptive_reprobe_after"
         ),
         pool_max_open=_validate_int(delivery_raw.get("pool_max_open", 100), "delivery.pool_max_open"),
         flush_deadline_seconds=float(delivery_raw.get("flush_deadline_seconds", 0.0)),

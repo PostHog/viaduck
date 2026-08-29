@@ -1,7 +1,7 @@
 """QE tests for within-entry flush-batch slicing (2026-08 patch).
 
 The patch cuts WITHIN the first buffered entry when it alone exceeds the
-rows cap or the adaptive byte target: the head slice flushes with
+adaptive rows target: the head slice flushes with
 ``through = flushed`` (no cursor advance), the tail returns to the buffer
 head with the SAME (cov, hi), and the cursor advances only on the flush
 that completes the entry. These tests try to break that contract through
@@ -245,9 +245,9 @@ def test_advance_position_during_split_drain_no_premature_persist():
 
 
 def test_one_row_oversize_entry_flushes_whole():
-    """A 1-row entry over the byte target cannot split (num_rows > 1 guard):
+    """A 1-row entry over the rows target cannot split (num_rows > 1 guard):
     it flushes whole as a full swap and the cursor advances to its cov."""
-    mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0)
+    mgr, _, _ = _manager(flush_interval_seconds=0.0)
     with mgr._lock:
         mgr._flush_target["d1"] = 1  # far below one row
     fake, calls = _recording_flush(mgr)
@@ -261,9 +261,8 @@ def test_one_row_oversize_entry_flushes_whole():
 
 
 def test_zero_nbytes_entry_splits_by_rows():
-    """nbytes == 0 (null-typed column): the rows cap still splits, and the
-    byte-proportional formula's division guard never runs (over_bytes is
-    False at 0 bytes)."""
+    """nbytes == 0 (null-typed column): the rows target still splits —
+    the cut never consults bytes (unit contract)."""
     mgr, sm, _ = _manager(flush_batch_max_rows=2, flush_interval_seconds=0.0)
     _, epoch = mgr.read_plan()["d1"]
     delivered = []
@@ -274,29 +273,13 @@ def test_zero_nbytes_entry_splits_by_rows():
     assert mgr.status_snapshot()["d1"].flushed_snapshot == 10
 
 
-def test_zero_nbytes_entry_byte_cap_inert_no_division_error():
-    """nbytes == 0 with ONLY the byte target set: 0 > byte_cap is False, so
-    no split, no ZeroDivisionError — the entry goes whole with its cov."""
-    mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0)
-    with mgr._lock:
-        mgr._flush_target["d1"] = 1
-    fake, calls = _recording_flush(mgr)
-    _, epoch = mgr.read_plan()["d1"]
-    mgr.buffer("d1", pa.table({"company": pa.nulls(5)}), through_snapshot=10, epoch=epoch)
-    with patch.object(mgr, "_flush", fake):
-        assert mgr.maybe_flush() == 1
-    assert sum(t.num_rows for t in calls[0][1]) == 5
-    assert calls[0][2] == 10
-
-
-def test_byte_cap_below_one_row_drains_one_row_slices():
-    """byte target smaller than a single row's bytes: the 1-row floor makes
-    every slice one row; the drain converges and the cursor lands on cov
-    exactly once, at the end."""
+def test_target_of_one_row_drains_one_row_slices():
+    """A rows target of 1: the 1-row floor makes every slice one row; the
+    drain converges and the cursor lands on cov exactly once, at the end."""
     # flush_adaptive_low_seconds=0: the AIMD controller cannot grow the
     # target mid-drain (a fast tiny-target slice trivially satisfies the
-    # fill gate and would jump the target by step_bytes — by design).
-    mgr, sm, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive_low_seconds=0.0)
+    # fill gate and would step the target up — by design).
+    mgr, sm, _ = _manager(flush_interval_seconds=0.0, flush_adaptive_low_seconds=0.0)
     with mgr._lock:
         mgr._flush_target["d1"] = 1
     _, epoch = mgr.read_plan()["d1"]
@@ -310,8 +293,8 @@ def test_byte_cap_below_one_row_drains_one_row_slices():
 
 
 def test_adaptive_off_rows_cap_still_splits_within_entry():
-    """flush_adaptive=false leaves byte_cap=0; the rows cap alone must still
-    cut within the oversize entry."""
+    """flush_adaptive=false fixes the target at the ceiling; the cut must
+    still apply within an oversize entry."""
     mgr, sm, _ = _manager(flush_batch_max_rows=3, flush_adaptive=False, flush_interval_seconds=0.0)
     _, epoch = mgr.read_plan()["d1"]
     delivered = []
@@ -328,16 +311,15 @@ def test_target_mutation_between_slices_converges():
     rule: nothing persists until the entry completes."""
     # Growth disabled (low_seconds=0) so only OUR explicit mutations move
     # the target between slices.
-    mgr, sm, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive_low_seconds=0.0)
+    mgr, sm, _ = _manager(flush_interval_seconds=0.0, flush_adaptive_low_seconds=0.0)
     _, epoch = mgr.read_plan()["d1"]
     tbl = _table(12)
-    per_row = tbl.nbytes // 12
     delivered = []
     with patch("viaduck.delivery.append_only", side_effect=_recording_apply(delivered)):
         with mgr._lock:
-            mgr._flush_target["d1"] = per_row * 4
+            mgr._flush_target["d1"] = 4
         mgr.buffer("d1", tbl, through_snapshot=10, epoch=epoch)
-        assert mgr.maybe_flush() == 1  # ~4-row head at the initial target
+        assert mgr.maybe_flush() == 1  # 4-row head at the initial target
         assert mgr.wait_idle(10)
         with mgr._lock:
             mgr._flush_target["d1"] = 1  # shrink to the 1-row floor
@@ -353,23 +335,6 @@ def test_target_mutation_between_slices_converges():
     assert all(p == 0 for p in persists[:-1])
     assert persists[-1] == 10
     assert mgr.status_snapshot()["d1"].flushed_snapshot == 10
-
-
-def test_rows_cap_and_byte_cap_together_take_the_tighter_cut():
-    """Both caps set: the head slice honors min(rows cap, byte-proportional
-    rows)."""
-    mgr, _, _ = _manager(flush_batch_max_rows=5, flush_interval_seconds=0.0)
-    _, epoch = mgr.read_plan()["d1"]
-    tbl = _table(20)
-    per_row = tbl.nbytes // 20
-    with mgr._lock:
-        mgr._flush_target["d1"] = per_row * 2  # byte cut (2 rows) tighter than rows cap (5)
-    fake, calls = _recording_flush(mgr)
-    mgr.buffer("d1", tbl, through_snapshot=10, epoch=epoch)
-    with patch.object(mgr, "_flush", fake):
-        assert mgr.maybe_flush() == 1
-    assert sum(t.num_rows for t in calls[0][1]) == 2
-    assert calls[0][2] is None  # partial entry: persist nothing
 
 
 # ---------------------------------------------------------------------------
@@ -407,19 +372,19 @@ def test_sliced_trigger_keeps_split_tail_draining_without_interval():
     """flush_interval huge, tail below every ordinary threshold: the
     sliced_remainder fast-path must keep the tail draining back-to-back —
     no stall until the entry completes."""
-    mgr, _, _ = _manager(flush_batch_max_rows=2, flush_max_rows=5, flush_interval_seconds=3600.0)
+    mgr, _, _ = _manager(flush_batch_max_rows=2, flush_interval_seconds=3600.0)
     fake, calls = _recording_flush(mgr)
     _, epoch = mgr.read_plan()["d1"]
     mgr.buffer("d1", _table(5), through_snapshot=10, epoch=epoch)
     with patch.object(mgr, "_flush", fake):
-        assert mgr.maybe_flush() == 1  # rows trigger admits the oversize entry
+        assert mgr.maybe_flush() == 1  # target trigger admits the oversize entry
         assert mgr.wait_idle(10)
-        assert mgr.maybe_flush() == 1  # 3-row tail: below rows/bytes, must not wait 3600s
+        assert mgr.maybe_flush() == 1  # 3-row tail: above the target, drains as "sliced"
         assert mgr.wait_idle(10)
-        assert mgr.maybe_flush() == 1  # 1-row tail: same
+        assert mgr.maybe_flush() == 1  # 1-row tail: below target — the fast-path, no 3600s wait
         assert mgr.wait_idle(10)
         assert mgr.maybe_flush() == 0  # drained; nothing left to submit
-    assert [c[3] for c in calls] == ["rows", "sliced", "sliced"]
+    assert [c[3] for c in calls] == ["target", "sliced", "sliced"]
     assert [sum(t.num_rows for t in c[1]) for c in calls] == [2, 2, 1]
     assert [c[2] for c in calls] == [None, None, 10]
 
@@ -451,41 +416,29 @@ def test_watermark_forced_flush_respects_within_entry_cut():
 
 
 def test_property_random_entries_and_caps_drain_exactly_once():
-    """Random entry sizes and caps: every flush respects the caps (within
-    the documented slice tolerance), every buffered row is delivered
-    exactly once, the final cursor is the max cov, and no cursor persist
-    ever covers rows not yet delivered."""
+    """Random entry sizes and rows targets: every flush respects the target
+    (within the documented 1-row floor tolerance), every buffered row is
+    delivered exactly once, the final cursor is the max cov, and no cursor
+    persist ever covers rows not yet delivered."""
     rng = random.Random(20260825)
-    one_row_bytes = _table(1).nbytes
-    per_row = _table(10).nbytes // 10
 
     for iteration in range(25):
-        rows_cap = rng.choice([0, 1, 2, 3, 5])
-        byte_rows = rng.choice([0, 1, 2, 4, 8])  # byte target in ~rows; 0 = inert
+        rows_cap = rng.choice([1, 2, 3, 5, 60])  # 60 exceeds any entry sum: whole-drain case
         sizes = [rng.randint(1, 12) for _ in range(rng.randint(1, 4))]
         entries = [(s, (i + 1) * 10) for i, s in enumerate(sizes)]
-        ctx = f"iter={iteration} rows_cap={rows_cap} byte_rows={byte_rows} sizes={sizes}"
+        ctx = f"iter={iteration} rows_cap={rows_cap} sizes={sizes}"
 
-        # Growth disabled (low_seconds=0): the byte target under test must
-        # stay where the iteration pinned it, not AIMD-grow after the
-        # first fast slice.
+        # AIMD pinned (low_seconds=0): the target under test stays at the
+        # configured ceiling rather than stepping up after a fast slice.
         mgr, sm, _ = _manager(flush_batch_max_rows=rows_cap, flush_interval_seconds=0.0, flush_adaptive_low_seconds=0.0)
-        byte_cap = 0
-        if byte_rows:
-            byte_cap = max(1, per_row * byte_rows)
-            with mgr._lock:
-                mgr._flush_target["d1"] = byte_cap
         _, epoch = mgr.read_plan()["d1"]
 
         delivered = {"rows": 0}
         violations: list[str] = []
 
         def _apply(pool, dest, batch, **kw):
-            if rows_cap > 0 and batch.num_rows > max(rows_cap, 1):
-                violations.append(f"{ctx}: batch rows {batch.num_rows} > rows cap {rows_cap}")
-            # Byte tolerance: rows-proportional cut rounding + the 1-row floor.
-            if byte_cap and batch.nbytes > byte_cap + 3 * one_row_bytes:
-                violations.append(f"{ctx}: batch bytes {batch.nbytes} > byte cap {byte_cap} (+tolerance)")
+            if batch.num_rows > max(rows_cap, 1):
+                violations.append(f"{ctx}: batch rows {batch.num_rows} > rows target {rows_cap}")
             delivered["rows"] += batch.num_rows
             return batch.num_rows
 
