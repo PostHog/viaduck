@@ -113,7 +113,7 @@ _dest_write_seconds = Histogram(
 )
 _dest_rows_written_total = Counter(
     "viaduck_dest_rows_written_total",
-    "Rows written to destination",
+    "Rows written to destination (at-least-once: a range replayed after a commit/cursor-gap failure is counted again)",
     ["pipeline", "destination"],
 )
 _dest_last_snapshot_id = Gauge(
@@ -133,12 +133,14 @@ _dest_time_lag_seconds = Gauge(
     "snapshot-count lag, which needs a commit-rate assumption to convert",
     ["pipeline", "destination"],
 )
-_dest_flush_target_bytes = Gauge(
-    "viaduck_dest_flush_target_bytes",
-    "Adaptive per-destination flush-size target (the bytes flush-trigger "
-    "threshold): starts at delivery.flush_max_bytes and AIMD-adapts to "
-    "observed flush duration — a target pinned at the floor marks a "
-    "commit-contended destination catalog",
+_dest_flush_target_rows = Gauge(
+    "viaduck_dest_flush_target_rows",
+    "Adaptive per-destination flush-size target in ROWS (the flush-trigger "
+    "threshold): starts at delivery.flush_batch_max_rows (its ceiling) and "
+    "AIMD-adapts to observed flush duration — a target pinned at the floor "
+    "marks a commit-contended destination catalog. Row-denominated since "
+    "2026-08-28; the byte-denominated gauge was deleted, never repurposed "
+    "(flush-sizing endgame)",
     ["pipeline", "destination"],
 )
 
@@ -190,17 +192,17 @@ _cdc_batch_rows = Histogram(
 )
 _dest_rows_deleted_total = Counter(
     "viaduck_dest_rows_deleted_total",
-    "Rows deleted from destination via CDC",
+    "Rows deleted from destination via CDC (at-least-once: replays re-count)",
     ["pipeline", "destination"],
 )
 _dest_rows_upserted_total = Counter(
     "viaduck_dest_rows_upserted_total",
-    "Rows sent to upsert (insert + update via MERGE) to destination",
+    "Rows sent to upsert (insert + update via MERGE) to destination (at-least-once: replays re-count)",
     ["pipeline", "destination"],
 )
 _dest_upsert_matched_total = Counter(
     "viaduck_dest_upsert_matched_total",
-    "Rows that matched existing rows during upsert (updated, not inserted)",
+    "Rows that matched existing rows during upsert (updated, not inserted) (at-least-once: replays re-count)",
     ["pipeline", "destination"],
 )
 _cdc_routing_mutations_total = Counter(
@@ -241,7 +243,7 @@ _delivery_buffer_total_bytes = Gauge(
 )
 _delivery_flushes_total = Counter(
     "viaduck_delivery_flushes_total",
-    "Completed destination flushes by trigger (interval/rows/bytes/memory/shutdown)",
+    "Completed destination flushes by trigger (interval/rows/bytes/memory/sliced/shutdown)",
     ["pipeline", "destination", "trigger"],
 )
 _delivery_flush_seconds = Histogram(
@@ -257,7 +259,9 @@ _delivery_reads_paused = Gauge(
 )
 _delivery_circuit_open = Gauge(
     "viaduck_delivery_circuit_open",
-    "1 while a destination's flush circuit breaker is open (flush submissions paused after repeated failures)",
+    "1 from the Nth consecutive flush failure until a DATA flush succeeds (position-only persists don't prove "
+    "health). Submissions resume as a probe after each backoff, so 1 reads 'unproven', not 'paused' — an idle "
+    "destination can hold 1 until traffic returns.",
     ["pipeline", "destination"],
 )
 _delivery_circuit_opens_total = Counter(
@@ -296,7 +300,8 @@ _secret_cache_stale_fallback_total = Counter(
 )
 _discovery_synced = Gauge(
     "viaduck_discovery_synced",
-    "1 after a successful discovery poll; 0 = static-only (CP unreachable at startup) or stale drift view",
+    "1 after a successful STARTUP discovery poll; 0 = static-only (CP unreachable at startup). Startup-owned: "
+    "the drift poller never moves it — read staleness from discovery_last_success_timestamp_seconds instead",
     ["pipeline"],
 )
 _discovery_config_generation = Gauge(
@@ -344,7 +349,8 @@ _discovery_applied_total = Counter(
 )
 _reconciler_pending = Gauge(
     "viaduck_reconciler_pending",
-    "Deliberately deferred reconciler work by reason (debounce|static_suppressed|floor|pending_restart|failure)",
+    "Deliberately deferred reconciler work by reason "
+    "(debounce|static_suppressed|floor|pending_restart|budget|rate_capped|retired|failure)",
     ["pipeline", "reason"],
 )
 _discovery_stop_countdown = Gauge(
@@ -452,7 +458,7 @@ dest_rows_written_total = _dest_rows_written_total
 dest_last_snapshot_id = _dest_last_snapshot_id
 dest_lag_snapshots = _dest_lag_snapshots
 dest_time_lag_seconds = _dest_time_lag_seconds
-dest_flush_target_bytes = _dest_flush_target_bytes
+dest_flush_target_rows = _dest_flush_target_rows
 
 unrouted_rows_total = _unrouted_rows_total
 
@@ -524,7 +530,7 @@ def init(pipeline: str):
     global self_recycles_total
     global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
-    global dest_time_lag_seconds, dest_flush_target_bytes
+    global dest_time_lag_seconds, dest_flush_target_rows
     global unrouted_rows_total
     global pool_open_connections, pool_evictions_total, pool_creates_total
     global errors_total
@@ -581,7 +587,7 @@ def init(pipeline: str):
     dest_last_snapshot_id = _AutoPipelineLabels(_dest_last_snapshot_id, pipeline)
     dest_lag_snapshots = _AutoPipelineLabels(_dest_lag_snapshots, pipeline)
     dest_time_lag_seconds = _AutoPipelineLabels(_dest_time_lag_seconds, pipeline)
-    dest_flush_target_bytes = _AutoPipelineLabels(_dest_flush_target_bytes, pipeline)
+    dest_flush_target_rows = _AutoPipelineLabels(_dest_flush_target_rows, pipeline)
     errors_total = _AutoPipelineLabels(_errors_total, pipeline)
     dest_rows_deleted_total = _AutoPipelineLabels(_dest_rows_deleted_total, pipeline)
     dest_rows_upserted_total = _AutoPipelineLabels(_dest_rows_upserted_total, pipeline)
@@ -628,7 +634,7 @@ def remove_destination_series(dest_id: str) -> None:
         dest_lag_snapshots,
         dest_time_lag_seconds,
         dest_last_snapshot_id,
-        dest_flush_target_bytes,
+        dest_flush_target_rows,
         delivery_buffer_rows,
         delivery_buffer_bytes,
         delivery_reads_paused,

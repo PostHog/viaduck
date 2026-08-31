@@ -1,0 +1,70 @@
+# Load-test overlay: `docker compose -f docker-compose.yaml -f docker-compose.load.yaml`.
+# Replaces the demo producer with the shaped load generator, routes the
+# dest-1 catalog's Postgres through toxiproxy (so loadcheck.py can inject a
+# catalog-latency wave — the prod "commit-contended catalog" shape), and
+# points viaduck at the load profile config. Tear down with
+# `just load-down` (or `docker compose -f ... -f ... down -v`).
+#
+# Why latency injection instead of competing commits: DuckLake commit
+# conflict detection is table-scoped and appends merge — a competing writer
+# does NOT measurably slow another writer's flushes (verified 2026-08-28:
+# 20 commits/s, zero effect on flush durations). PG round-trip latency on
+# the catalog connection inflates every commit's cost directly and
+# deterministically, which is what a contended catalog feels like.
+services:
+  producer:
+    command: /app/test/loadgen.py
+    environment:
+      SOURCE_POSTGRES_URI: "postgres:host=postgres-source port=5432 user=ducklake password=ducklake dbname=ducklake"
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_USE_SSL: "false"
+      S3_URL_STYLE: path
+      S3_DATA_PATH: s3://source/
+      LOAD_ROWS_PER_SECOND: "${LOAD_ROWS_PER_SECOND:-3000}"
+      LOAD_ROW_WIDTH_BYTES: "${LOAD_ROW_WIDTH_BYTES:-2048}"
+      LOAD_BLOB_CARDINALITY: "${LOAD_BLOB_CARDINALITY:-64}"
+      # Distribution-shift scenario: a tail tenant goes hot mid-run (see
+      # test/loadgen.py). Start matches loadcheck's --burst-start default.
+      LOAD_BURST_COMPANY: "${LOAD_BURST_COMPANY:-brantley}"
+      LOAD_BURST_START_S: "${LOAD_BURST_START_S:-190}"
+      LOAD_BURST_ROWS_PER_SECOND: "${LOAD_BURST_ROWS_PER_SECOND:-1500}"
+
+  # dest-1's PG, proxied. The proxy exists at stack-up (toxiproxy-init);
+  # loadcheck.py adds/removes a latency toxic on it at phase boundaries.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    ports:
+      - "127.0.0.1:8474:8474"
+
+  toxiproxy-init:
+    image: curlimages/curl:8.5.0
+    depends_on:
+      toxiproxy:
+        condition: service_started
+      postgres-dest-1:
+        condition: service_healthy
+    # Idempotent: a `docker compose restart toxiproxy` wipes the in-memory
+    # proxy while this init container stays exited(0) — re-running (or a
+    # fresh up against a warm API) must tolerate the proxy already existing.
+    # The logic lives in a mounted script so semgrep nosemgrep comments
+    # work (they can't inside a folded YAML string).
+    entrypoint: /bin/sh /app/test/toxiproxy-init.sh
+    volumes:
+      - ./test:/app/test:ro
+
+  viaduck:
+    command: ["--config", "/app/test/viaduck-load.yaml"]
+    environment:
+      SOURCE_POSTGRES_URI: "postgres:host=postgres-source port=5432 user=ducklake password=ducklake dbname=ducklake"
+      # dest-1 rides the proxy; dest-2 (control group) stays direct.
+      DEST_1_POSTGRES_URI: "postgres:host=toxiproxy port=5433 user=ducklake password=ducklake dbname=ducklake"
+      DEST_2_POSTGRES_URI: "postgres:host=postgres-dest-2 port=5432 user=ducklake password=ducklake dbname=ducklake"
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      producer:
+        condition: service_started
+      toxiproxy-init:
+        condition: service_completed_successfully

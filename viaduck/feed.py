@@ -397,6 +397,12 @@ class FeedReader:
         """Inserted rows in (after_snapshot, end_snapshot] for the filter's
         routing values — the replacement for the retired extension read.
 
+        Prod does NOT call this wrapper: the poll loop composes
+        plan_read/execute_read directly (main._read_unit + the loop-level
+        re-plan recovery) with deliberate metric parity. This method is
+        retained as the test/feed-parity API — wiring it back into the
+        poll loop would double-count the read metrics.
+
         `conn` is the source catalog's DuckDB connection (carries the S3
         credentials); used for parquet scans only. `with_snapshot` appends a
         per-row __viaduck_snap column (the read loop slices on it; it is

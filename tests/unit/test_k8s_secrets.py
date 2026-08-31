@@ -45,7 +45,7 @@ def _resp(payload: dict):
 
 def test_reads_and_decodes_key(_in_cluster):
     body = {"data": {"password": base64.b64encode(b"hunter2").decode()}}
-    with patch("urllib.request.urlopen", return_value=_resp(body)) as uo:
+    with patch("viaduck.k8s_secrets._open", return_value=_resp(body)) as uo:
         assert read_secret_key("ducklings", "cnpg-tenant-acme-password", "password") == "hunter2"
     req = uo.call_args[0][0]
     assert req.full_url == "https://10.0.0.1:443/api/v1/namespaces/ducklings/secrets/cnpg-tenant-acme-password"
@@ -61,7 +61,7 @@ def test_not_in_cluster_raises(tmp_path, monkeypatch):
 
 def test_rbac_denied_names_the_fix(_in_cluster):
     err = urllib.error.HTTPError("u", 403, "Forbidden", {}, None)
-    with patch("urllib.request.urlopen", side_effect=err):
+    with patch("viaduck.k8s_secrets._open", side_effect=err):
         with pytest.raises(SecretReadError, match="RBAC"):
             read_secret_key("ducklings", "s", "k")
 
@@ -70,7 +70,7 @@ def test_missing_key_reports_count_not_names(_in_cluster):
     # Key names come from the secret payload dict — error text must not
     # carry anything derived from it (clear-text-logging taint source).
     body = {"data": {"otherkeyname": base64.b64encode(b"x").decode()}}
-    with patch("urllib.request.urlopen", return_value=_resp(body)):
+    with patch("viaduck.k8s_secrets._open", return_value=_resp(body)):
         with pytest.raises(SecretReadError, match="1 other key") as ei:
             read_secret_key("ns", "s", "password")
         assert "otherkeyname" not in str(ei.value)
@@ -78,7 +78,7 @@ def test_missing_key_reports_count_not_names(_in_cluster):
 
 def test_error_messages_never_contain_secret_material(_in_cluster):
     body = {"data": {"password": "!!!not-base64!!!"}}
-    with patch("urllib.request.urlopen", return_value=_resp(body)):
+    with patch("viaduck.k8s_secrets._open", return_value=_resp(body)):
         with pytest.raises(SecretReadError) as ei:
             read_secret_key("ns", "s", "password")
         assert "!!!" not in str(ei.value)
@@ -99,6 +99,13 @@ def test_missing_ca_named_explicitly(tmp_path, monkeypatch):
     monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
     with pytest.raises(SecretReadError, match="CA bundle missing"):
         read_secret_key("ns", "s", "k")
+
+
+def test_redirects_refused():
+    # urllib's default redirect handling re-sends custom headers (the SA
+    # Bearer token) to the redirect target, cross-host included — the
+    # opener must refuse, not follow.
+    assert k8s_secrets._NoRedirect().redirect_request(MagicMock(), None, 302, "Found", {}, "https://evil") is None
 
 
 def test_namespace_label_grammar_stricter_than_name():

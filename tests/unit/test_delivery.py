@@ -42,7 +42,7 @@ def _recording_flush(mgr):
     in-flight guard contract (the real _flush's finally block)."""
     calls = []
 
-    def _fake(dest, tables, through, trigger, est_bytes=None):
+    def _fake(dest, tables, through, trigger):
         calls.append((dest, tables, through, trigger))
         with mgr._lock:
             mgr._inflight.discard(dest)
@@ -95,27 +95,6 @@ def test_no_trigger_below_thresholds():
     mgr, _, _ = _manager()
     mgr.buffer("d1", _table(1), 5)
     assert mgr.maybe_flush() == 0  # interval 1h, tiny buffer
-
-
-def test_rows_trigger():
-    mgr, sm, _ = _manager(flush_max_rows=4)
-    fake, calls = _recording_flush(mgr)
-    with patch.object(mgr, "_flush", side_effect=fake):
-        mgr.buffer("d1", _table(5), 5)
-        assert mgr.maybe_flush() == 1
-        assert mgr.wait_idle(5)
-    dest, _tables, through, trigger = calls[0]
-    assert dest == "d1" and through == 5 and trigger == "rows"
-
-
-def test_bytes_trigger():
-    mgr, _, _ = _manager(flush_max_bytes=8)  # any table exceeds 8 bytes
-    fake, calls = _recording_flush(mgr)
-    with patch.object(mgr, "_flush", side_effect=fake):
-        mgr.buffer("d1", _table(1), 5)
-        assert mgr.maybe_flush() == 1
-        assert mgr.wait_idle(5)
-    assert calls[0][3] == "bytes"
 
 
 def test_interval_trigger_uses_buffer_age():
@@ -179,7 +158,7 @@ def test_no_second_flush_while_in_flight_and_swap_keeps_buffering():
     started = threading.Event()
     seen = []
 
-    def slow_flush(dest, tables, through, trigger, est_bytes=None):
+    def slow_flush(dest, tables, through, trigger):
         seen.append((sum(t.num_rows for t in tables), through))
         started.set()
         release.wait(5)
@@ -377,12 +356,12 @@ def test_per_dest_cap_explicit_override_beats_auto_derive():
 
 def test_dest_at_cap_triggers_flush_even_below_global_thresholds():
     """A destination pinned at its cap has its reads paused, so it must
-    flush on the cap trigger rather than waiting for flush_max_bytes /
+    flush on the cap trigger rather than waiting for the rows target /
     interval — otherwise it wedges: full queue, paused intake, no flush."""
     mgr, _, pool = _manager(
         dests=("d1",),
         buffer_max_bytes_per_destination=1,
-        flush_max_bytes=10**12,  # global byte trigger unreachable
+        flush_batch_max_rows=10**12,  # rows target unreachable
         flush_interval_seconds=3600.0,  # interval trigger unreachable
     )
     fake, calls = _recording_flush(mgr)
@@ -1026,25 +1005,6 @@ def test_split_entry_drains_and_advances_cursor_only_on_completion():
     assert mgr.status_snapshot()["d1"].flushed_snapshot == 10
 
 
-def test_byte_cap_splits_oversize_entry():
-    # Adaptive byte target binds within an entry too: with a target far
-    # below the entry's nbytes, the head slice lands near the byte cap
-    # (proportional row split), not the whole entry.
-    mgr, _, _ = _manager(flush_batch_max_rows=0, flush_adaptive=True)
-    _, epoch = mgr.read_plan()["d1"]
-    tbl = _table(100)
-    per_row = max(1, tbl.nbytes // tbl.num_rows)
-    mgr._flush_target["d1"] = per_row * 10  # ~10 rows' worth of bytes
-    fake, calls = _recording_flush(mgr)
-    mgr.buffer("d1", tbl, through_snapshot=10, epoch=epoch)
-    with patch.object(mgr, "_flush", fake):
-        assert mgr.maybe_flush(shutdown=True) == 1
-    head_rows = sum(t.num_rows for t in calls[0][1])
-    assert 1 <= head_rows <= 20  # near the byte cap, never the whole entry
-    assert calls[0][2] is None  # partial entry: persist nothing
-    assert mgr.status_snapshot()["d1"].buffer_rows == 100 - head_rows
-
-
 def test_full_swap_persists_through_position():
     # No remainder: historical behavior — a position-only advance beyond
     # the last chunk still persists (lazy cursor persist).
@@ -1095,23 +1055,11 @@ def test_failure_drops_remainder_too():
     assert snap.position_snapshot == snap.flushed_snapshot == 0
 
 
-def test_cap_zero_is_legacy_full_swap():
-    mgr, _, _ = _manager(flush_batch_max_rows=0)
-    fake, calls = _recording_flush(mgr)
-    _, epoch = mgr.read_plan()["d1"]
-    mgr.buffer("d1", _table(3), through_snapshot=10, epoch=epoch)
-    mgr.buffer("d1", _table(4), through_snapshot=20, epoch=epoch)
-    with patch.object(mgr, "_flush", fake):
-        assert mgr.maybe_flush(shutdown=True) == 1
-    assert sum(t.num_rows for t in calls[0][1]) == 7
-    assert calls[0][2] == 20
-
-
 def test_sliced_remainder_drains_without_waiting_for_interval():
     # Review F1 (confirmed empirically): a remainder below the rows/bytes
     # thresholds must NOT wait out flush_interval — realistic interval,
     # non-shutdown maybe_flush calls only.
-    mgr, _, _ = _manager(flush_batch_max_rows=4, flush_max_rows=4, flush_interval_seconds=120.0)
+    mgr, _, _ = _manager(flush_batch_max_rows=4, flush_interval_seconds=120.0)
     fake, calls = _recording_flush(mgr)
     _, epoch = mgr.read_plan()["d1"]
     mgr.buffer("d1", _table(4), through_snapshot=10, epoch=epoch)
@@ -1124,7 +1072,7 @@ def test_sliced_remainder_drains_without_waiting_for_interval():
         assert mgr.maybe_flush() == 1
         assert mgr.wait_idle()
     assert [sum(t.num_rows for t in c[1]) for c in calls] == [4, 2]
-    assert [c[3] for c in calls] == ["rows", "sliced"]
+    assert [c[3] for c in calls] == ["target", "sliced"]
     assert [c[2] for c in calls] == [10, 20]
 
 
@@ -1132,41 +1080,41 @@ def test_sliced_remainder_drains_without_waiting_for_interval():
 # Adaptive flush sizing (AIMD on flush duration)
 # ---------------------------------------------------------------------------
 
-_MIB = 2**20
+_K = 1_000  # rows
 
 
 def _adaptive_manager(dests=("d1", "d2"), **over):
     defaults = dict(
-        flush_max_bytes=128 * _MIB,
+        flush_batch_max_rows=128 * _K,
         flush_adaptive_low_seconds=5.0,
         flush_adaptive_high_seconds=30.0,
-        flush_adaptive_step_bytes=16 * _MIB,
-        flush_adaptive_min_bytes=8 * _MIB,
+        flush_adaptive_step_rows=16 * _K,
+        flush_adaptive_min_rows=8 * _K,
     )
     defaults.update(over)
     return _manager(dests=dests, **defaults)
 
 
 def _full(mgr, dest="d1"):
-    """batch_bytes that satisfies the growth fill-gate for dest's current target."""
+    """batch_rows that satisfies the growth fill-gate for dest's current target."""
     return mgr._flush_target[dest]
 
 
 def test_adaptive_slow_flush_halves_target():
     mgr, _, _ = _adaptive_manager()
     mgr._adapt_flush_target("d1", 31.0, _full(mgr))
-    assert mgr._flush_target["d1"] == 64 * _MIB
+    assert mgr._flush_target["d1"] == 64 * _K
 
 
 def test_adaptive_fast_full_flush_grows_additively_to_cap():
     mgr, _, _ = _adaptive_manager()
-    mgr._flush_target["d1"] = 100 * _MIB
+    mgr._flush_target["d1"] = 100 * _K
     mgr._adapt_flush_target("d1", 1.0, _full(mgr))
-    assert mgr._flush_target["d1"] == 116 * _MIB
+    assert mgr._flush_target["d1"] == 116 * _K
     mgr._adapt_flush_target("d1", 1.0, _full(mgr))
-    assert mgr._flush_target["d1"] == 128 * _MIB  # capped at flush_max_bytes
+    assert mgr._flush_target["d1"] == 128 * _K  # capped at flush_batch_max_rows
     mgr._adapt_flush_target("d1", 1.0, _full(mgr))
-    assert mgr._flush_target["d1"] == 128 * _MIB
+    assert mgr._flush_target["d1"] == 128 * _K
 
 
 def test_adaptive_fast_but_small_flush_does_not_grow():
@@ -1175,125 +1123,170 @@ def test_adaptive_fast_but_small_flush_does_not_grow():
     # gate, quiet-period trickle flushes walk a learned-down target back
     # to the cap and the next burst re-runs the oversize-flush cycle.
     mgr, _, _ = _adaptive_manager()
-    mgr._flush_target["d1"] = 16 * _MIB
-    mgr._adapt_flush_target("d1", 0.5, 1 * _MIB)  # well under 70% fill
-    assert mgr._flush_target["d1"] == 16 * _MIB
-    mgr._adapt_flush_target("d1", 0.5, 12 * _MIB)  # 75% fill: grows
-    assert mgr._flush_target["d1"] == 32 * _MIB
+    mgr._flush_target["d1"] = 16 * _K
+    mgr._adapt_flush_target("d1", 0.5, 1 * _K)  # well under 70% fill
+    assert mgr._flush_target["d1"] == 16 * _K
+    mgr._adapt_flush_target("d1", 0.5, 12 * _K)  # 75% fill: grows
+    assert mgr._flush_target["d1"] == 32 * _K
 
 
 def test_adaptive_in_band_holds():
     mgr, _, _ = _adaptive_manager()
-    mgr._flush_target["d1"] = 64 * _MIB
+    mgr._flush_target["d1"] = 64 * _K
     for d in (5.0, 12.0, 30.0):  # hold band is inclusive at both edges
         mgr._adapt_flush_target("d1", d, _full(mgr))
-        assert mgr._flush_target["d1"] == 64 * _MIB
+        assert mgr._flush_target["d1"] == 64 * _K
 
 
-def test_adaptive_halving_floors_at_min_bytes():
+def test_adaptive_halving_floors_at_min_rows():
     mgr, _, _ = _adaptive_manager()
     for _ in range(20):
         mgr._adapt_flush_target("d1", 999.0, _full(mgr))
-    assert mgr._flush_target["d1"] == 8 * _MIB
+    assert mgr._flush_target["d1"] == 8 * _K
 
 
 def test_adaptive_floor_clamps_to_ceiling():
-    # flush_max_bytes below flush_adaptive_min_bytes: the effective floor is
+    # flush_batch_max_rows below flush_adaptive_min_rows: the effective floor is
     # the ceiling (one-knob change), never above it.
-    mgr, _, _ = _adaptive_manager(flush_max_bytes=4 * _MIB, flush_adaptive_min_bytes=8 * _MIB)
+    mgr, _, _ = _adaptive_manager(flush_batch_max_rows=4 * _K, flush_adaptive_min_rows=8 * _K)
     mgr._adapt_flush_target("d1", 999.0, _full(mgr))
-    assert mgr._flush_target["d1"] == 4 * _MIB
+    assert mgr._flush_target["d1"] == 4 * _K
 
 
 def test_adaptive_failed_flush_shrinks_when_slow_never_grows():
     mgr, _, _ = _adaptive_manager()
-    mgr._flush_target["d1"] = 64 * _MIB
+    mgr._flush_target["d1"] = 64 * _K
     # Fast failure (connection blip): must not inflate the target.
     mgr._adapt_flush_target("d1", 0.5, _full(mgr), failed=True)
-    assert mgr._flush_target["d1"] == 64 * _MIB
+    assert mgr._flush_target["d1"] == 64 * _K
     # Slow failure (retry budget burned): the flush was too big — shrink.
     mgr._adapt_flush_target("d1", 300.0, _full(mgr), failed=True)
-    assert mgr._flush_target["d1"] == 32 * _MIB
+    assert mgr._flush_target["d1"] == 32 * _K
 
 
 def test_adaptive_disabled_holds_target():
     mgr, _, _ = _adaptive_manager(flush_adaptive=False)
     mgr._adapt_flush_target("d1", 999.0, _full(mgr))
     mgr._adapt_flush_target("d1", 0.1, _full(mgr))
-    assert mgr._flush_target["d1"] == 128 * _MIB
+    assert mgr._flush_target["d1"] == 128 * _K
 
 
 def test_adaptive_targets_are_per_destination():
     mgr, _, _ = _adaptive_manager()
     mgr._adapt_flush_target("d1", 999.0, _full(mgr))
-    assert mgr._flush_target["d1"] == 64 * _MIB
-    assert mgr._flush_target["d2"] == 128 * _MIB
+    assert mgr._flush_target["d1"] == 64 * _K
+    assert mgr._flush_target["d2"] == 128 * _K
 
 
-def test_bytes_trigger_uses_adapted_target():
-    # Shrink d1's target below the buffered bytes while the GLOBAL
-    # flush_max_bytes stays far above them.
+# ---------------------------------------------------------------------------
+# AIMD feedback-signal span: the controller eats the DESTINATION-WRITE span,
+# never the shared-PG cursor-persist tail (2026-08-28 review round 2).
+# ---------------------------------------------------------------------------
+
+
+def test_slow_cursor_persist_does_not_halve_target(monkeypatch):
+    """A slow cursor persist (shared PG) after a healthy write is not
+    destination-contention evidence — the target must not move."""
+    mgr, sm, _ = _manager(flush_adaptive_low_seconds=0.01, flush_adaptive_high_seconds=0.05)
+    tbl = _table(5)
+    monkeypatch.setattr("viaduck.delivery.append_only", lambda *a, **k: tbl.num_rows)
+
+    def slow_advance(*a, **k):
+        _time_mod.sleep(0.2)  # cursor tail blows past the high bound
+        return 1
+
+    monkeypatch.setattr(sm, "advance_cursor", slow_advance)
+    mgr._flush("d1", [tbl], 10, "interval")
+    assert mgr._flush_target["d1"] == mgr._cfg.flush_batch_max_rows
+
+
+def test_slow_apply_halves_target(monkeypatch):
+    """...and the span that IS the destination's still teaches the controller."""
+    mgr, _, _ = _manager(flush_adaptive_low_seconds=0.01, flush_adaptive_high_seconds=0.05)
+
+    def slow_apply(*a, **k):
+        _time_mod.sleep(0.2)
+        return 5
+
+    monkeypatch.setattr("viaduck.delivery.append_only", slow_apply)
+    mgr._flush("d1", [_table(5)], 10, "interval")
+    assert mgr._flush_target["d1"] == mgr._cfg.flush_batch_max_rows // 2
+
+
+def test_cursor_persist_failure_after_healthy_write_does_not_halve(monkeypatch):
+    """Apply committed, cursor persist failed: the retry burn is shared-PG
+    evidence; the (fast) write is the destination's. No halve."""
+    mgr, sm, _ = _manager(flush_adaptive_low_seconds=0.01, flush_adaptive_high_seconds=0.05)
+    monkeypatch.setattr("viaduck.delivery.append_only", lambda *a, **k: 5)
+    sm.advance_cursor.side_effect = RuntimeError("pg down")
+    mgr._flush("d1", [_table(5)], 10, "interval")
+    assert mgr._flush_target["d1"] == mgr._cfg.flush_batch_max_rows
+
+
+def test_target_trigger_uses_adapted_target():
+    # Shrink d1's target below the buffered rows while the ceiling
+    # (flush_batch_max_rows) stays far above them.
     mgr, _, _ = _manager(
         dests=("d1", "d2"),
-        flush_max_bytes=1_000_000_000,
-        flush_adaptive_min_bytes=1,
+        flush_batch_max_rows=1_000_000,
+        flush_adaptive_min_rows=1,
     )
     tbl = _table(100)
     fake, calls = _recording_flush(mgr)
     mgr.buffer("d1", tbl, 5)
     mgr.buffer("d2", tbl, 5)
     with patch.object(mgr, "_flush", fake):
-        assert mgr.maybe_flush() == 0  # below global cap: nothing fires
+        assert mgr.maybe_flush() == 0  # below the ceiling: nothing fires
         with mgr._lock:
-            mgr._flush_target["d1"] = tbl.nbytes  # adapted down
+            mgr._flush_target["d1"] = 100  # adapted down
         assert mgr.maybe_flush() == 1  # d1 fires on ITS target; d2 holds
     assert [c[0] for c in calls] == ["d1"]
-    assert calls[0][3] == "bytes"
+    assert calls[0][3] == "target"
 
 
-def test_swap_is_byte_cut_at_adapted_target():
+def test_swap_is_row_cut_at_adapted_target():
     # The QE-review MAJOR: the target must bound the SWAP, not just the
     # trigger — otherwise a backlogged destination (flush in flight while
-    # reads continue) drains in rows-cap-sized batches no matter how far
+    # reads continue) drains in ceiling-sized batches no matter how far
     # the target adapted down, which is exactly the contended-catalog
     # regime the controller exists for.
-    mgr, _, _ = _manager(flush_max_bytes=1_000_000_000, flush_adaptive_min_bytes=1)
+    mgr, _, _ = _manager(flush_batch_max_rows=1_000_000, flush_adaptive_min_rows=1)
     fake, calls = _recording_flush(mgr)
     _, epoch = mgr.read_plan()["d1"]
-    chunk = _table(100)
-    for i, through in enumerate((10, 20, 30, 40)):
+    for through in (10, 20, 30, 40):
         mgr.buffer("d1", _table(100), through_snapshot=through, epoch=epoch)
     with mgr._lock:
-        mgr._flush_target["d1"] = 2 * chunk.nbytes  # fits two chunks
+        mgr._flush_target["d1"] = 200  # fits two 100-row chunks
     with patch.object(mgr, "_flush", fake):
         assert mgr.maybe_flush() == 1
         assert mgr.wait_idle()
-        assert mgr.maybe_flush() == 1  # sliced remainder drains, also byte-cut
+        assert mgr.maybe_flush() == 1  # sliced remainder drains, also row-cut
         assert mgr.wait_idle()
     assert [len(c[1]) for c in calls] == [2, 2]  # two chunks per swap, not four
     assert [c[2] for c in calls] == [20, 40]  # cursor at last included chunk
     assert calls[1][3] == "sliced"
 
 
-def test_swap_byte_cut_disabled_with_adaptive_off():
-    # flush_adaptive: false restores the legacy rows-only slicing exactly.
-    mgr, _, _ = _manager(flush_max_bytes=1, flush_adaptive=False)
+def test_swap_row_cut_fixed_at_ceiling_with_adaptive_off():
+    # flush_adaptive: false = fixed target at the flush_batch_max_rows
+    # ceiling; the swap takes up to the ceiling in rows, nothing more.
+    mgr, _, _ = _manager(flush_batch_max_rows=250, flush_adaptive=False)
     fake, calls = _recording_flush(mgr)
     _, epoch = mgr.read_plan()["d1"]
     for through in (10, 20, 30):
         mgr.buffer("d1", _table(100), through_snapshot=through, epoch=epoch)
     with patch.object(mgr, "_flush", fake):
         assert mgr.maybe_flush() == 1
-    assert len(calls[0][1]) == 3  # everything in one swap despite tiny bytes
+    assert len(calls[0][1]) == 2  # 250-row target: two whole 100-row chunks
+    assert mgr.status_snapshot()["d1"].buffer_rows == 100  # tail stays buffered
 
 
-def test_swap_byte_cut_splits_single_chunk_at_floor():
-    # 2026-08 inversion of the old one-chunk floor: a chunk larger than
-    # the byte target is now cut WITHIN, so the target binds
-    # unconditionally (flush duration is priced by uploaded bytes). At a
-    # degenerate 1-byte target the head slice is the 1-row minimum, and
-    # the partial-entry flush persists nothing.
-    mgr, _, _ = _manager(flush_max_bytes=1_000_000_000, flush_adaptive_min_bytes=1)
+def test_swap_row_cut_splits_single_chunk_at_floor():
+    # A single entry larger than the rows target is cut WITHIN, so the
+    # target binds unconditionally. At a degenerate 1-row target the head
+    # slice is the 1-row minimum, and the partial-entry flush persists
+    # nothing.
+    mgr, _, _ = _manager(flush_batch_max_rows=1_000_000, flush_adaptive_min_rows=1)
     fake, calls = _recording_flush(mgr)
     _, epoch = mgr.read_plan()["d1"]
     mgr.buffer("d1", _table(100), through_snapshot=10, epoch=epoch)
@@ -1307,9 +1300,9 @@ def test_swap_byte_cut_splits_single_chunk_at_floor():
 
 
 def test_memory_trigger_fires_regardless_of_target():
-    # Watermark pressure must not wait for the bytes target — a grown
+    # Watermark pressure must not wait for the rows target — a grown
     # target cannot defer memory relief.
-    mgr, _, _ = _manager(buffer_total_max_bytes=1, flush_max_bytes=1_000_000_000)
+    mgr, _, _ = _manager(buffer_total_max_bytes=1, flush_batch_max_rows=1_000_000_000)
     fake, calls = _recording_flush(mgr)
     mgr.buffer("d1", _table(10), 5)
     with patch.object(mgr, "_flush", fake):
@@ -1320,11 +1313,11 @@ def test_memory_trigger_fires_regardless_of_target():
 def test_add_destination_initializes_target_and_keeps_learned_on_readd():
     mgr, _, _ = _adaptive_manager(dests=("d1",))
     mgr.add_destination("d3")
-    assert mgr._flush_target["d3"] == 128 * _MIB
+    assert mgr._flush_target["d3"] == 128 * _K
     mgr._adapt_flush_target("d3", 999.0, _full(mgr, "d3"))
     mgr.remove_destination("d3")
     mgr.add_destination("d3")  # MAX-MERGE: surviving entries are reused
-    assert mgr._flush_target["d3"] == 64 * _MIB
+    assert mgr._flush_target["d3"] == 64 * _K
 
 
 def test_flush_success_feeds_controller_with_measured_duration():
@@ -1333,7 +1326,7 @@ def test_flush_success_feeds_controller_with_measured_duration():
     mgr, _, _ = _manager(
         cursors={"d1": 0},
         flush_interval_seconds=0.0,
-        flush_max_bytes=128 * _MIB,
+        flush_batch_max_rows=128 * _K,
         flush_adaptive_high_seconds=0.02,
         flush_adaptive_low_seconds=0.01,
     )
@@ -1348,7 +1341,7 @@ def test_flush_success_feeds_controller_with_measured_duration():
         mgr.buffer("d1", _table(3), 7)
         mgr.maybe_flush()
         assert mgr.wait_idle()
-    assert mgr._flush_target["d1"] == 64 * _MIB
+    assert mgr._flush_target["d1"] == 64 * _K
 
 
 def test_flush_failure_feeds_controller_as_failed():
@@ -1363,7 +1356,7 @@ def test_flush_failure_feeds_controller_as_failed():
     adapt.assert_called_once()
     assert adapt.call_args.kwargs["failed"] is True
     assert adapt.call_args.args[0] == "d1"
-    assert adapt.call_args.args[2] > 0  # batch_bytes threaded through
+    assert adapt.call_args.args[2] > 0  # batch_rows threaded through
 
 
 def test_position_only_flush_does_not_feed_controller():
@@ -1394,10 +1387,98 @@ def test_flush_target_gauge_seeded_at_startup_and_add():
     from viaduck import metrics
 
     mgr, _, _ = _adaptive_manager(dests=("d1",))
-    g = metrics.dest_flush_target_bytes.labels(destination="d1")
-    assert g._value.get() == 128 * _MIB
+    g = metrics.dest_flush_target_rows.labels(destination="d1")
+    assert g._value.get() == 128 * _K
     mgr.add_destination("d9")
-    assert metrics.dest_flush_target_bytes.labels(destination="d9")._value.get() == 128 * _MIB
+    assert metrics.dest_flush_target_rows.labels(destination="d9")._value.get() == 128 * _K
+
+
+def test_adaptive_converges_from_ceiling_on_sustained_slow_flushes():
+    # A destination that opens at the ceiling into a contended catalog
+    # (portola's shape): one halving per slow flush, straight to the floor —
+    # 128K -> 64K -> 32K -> 16K -> 8K (floor), then pinned.
+    mgr, _, _ = _adaptive_manager()
+    seq = []
+    for _ in range(6):
+        mgr._adapt_flush_target("d1", 999.0, _full(mgr))
+        seq.append(mgr._flush_target["d1"])
+    assert seq == [64 * _K, 32 * _K, 16 * _K, 8 * _K, 8 * _K, 8 * _K]
+
+
+def test_adaptive_reprobe_heals_dead_zone_ratchet():
+    # The [low, high] dead zone is a one-way ratchet WITHOUT the re-probe:
+    # a destination halved by one transient >high blip must be able to grow
+    # back without a restart. reprobe_after consecutive in-band, >=70%-fill,
+    # successful flushes step the target up once.
+    mgr, _, _ = _adaptive_manager(flush_adaptive_reprobe_after=3)
+    mgr._adapt_flush_target("d1", 999.0, _full(mgr))  # halve to 64K
+    assert mgr._flush_target["d1"] == 64 * _K
+    # Two in-band full flushes: streak builds, no growth yet.
+    for _ in range(2):
+        mgr._adapt_flush_target("d1", 12.0, _full(mgr))
+        assert mgr._flush_target["d1"] == 64 * _K
+    # An under-filled in-band flush resets the streak...
+    mgr._adapt_flush_target("d1", 12.0, 1 * _K)
+    for _ in range(2):
+        mgr._adapt_flush_target("d1", 12.0, _full(mgr))
+        assert mgr._flush_target["d1"] == 64 * _K
+    # ...and the third consecutive full in-band flush re-probes upward.
+    mgr._adapt_flush_target("d1", 12.0, _full(mgr))
+    assert mgr._flush_target["d1"] == 80 * _K
+    # Failures reset the streak and never grow.
+    mgr._adapt_flush_target("d1", 12.0, _full(mgr), failed=True)
+    for _ in range(2):
+        mgr._adapt_flush_target("d1", 12.0, _full(mgr))
+        assert mgr._flush_target["d1"] == 80 * _K
+
+
+def test_byte_invariance_fencing():
+    # THE kill-the-class test (flush-sizing endgame, review finding 10): a
+    # buffer whose tables' nbytes are inflated ~150x by a shared dictionary
+    # must produce byte-IDENTICAL trigger, cut, and AIMD decisions as its
+    # uninflated twin. Bytes cannot re-enter the control path — this test
+    # is the executable form of that contract.
+    def inflated_table(n: int) -> pa.Table:
+        # Slice of a dictionary-encoded parent: every slice counts the
+        # ENTIRE shared dictionary in nbytes (the 08-26 mechanism).
+        dictionary = pa.array(["v" * 200 + str(i) for i in range(20_000)])
+        indices = pa.array([i % 10 for i in range(100_000)], type=pa.int32())
+        parent = pa.table(
+            {
+                "a": pa.array(range(100_000), type=pa.int64()),
+                "s": pa.DictionaryArray.from_arrays(indices, dictionary),
+            }
+        )
+        return parent.slice(0, n)
+
+    plain = _table(100)
+    inflated = inflated_table(100)
+    assert inflated.nbytes > 100 * plain.nbytes, "fixture must actually inflate"
+
+    mgr_plain, _, _ = _manager(dests=("d1",), flush_interval_seconds=3600.0)
+    mgr_infl, _, _ = _manager(dests=("d1",), flush_interval_seconds=3600.0)
+    fake_p, calls_p = _recording_flush(mgr_plain)
+    fake_i, calls_i = _recording_flush(mgr_infl)
+    _, epoch_p = mgr_plain.read_plan()["d1"]
+    _, epoch_i = mgr_infl.read_plan()["d1"]
+    mgr_plain.buffer("d1", plain, through_snapshot=10, epoch=epoch_p)
+    mgr_infl.buffer("d1", inflated, through_snapshot=10, epoch=epoch_i)
+    with patch.object(mgr_plain, "_flush", fake_p), patch.object(mgr_infl, "_flush", fake_i):
+        # Identical trigger decisions despite ~100x different buffer bytes...
+        assert mgr_plain.maybe_flush() == mgr_infl.maybe_flush() == 0  # 100 rows < 60K target
+        for m, t in ((mgr_plain, plain), (mgr_infl, inflated)):
+            with m._lock:
+                m._flush_target["d1"] = 100
+        assert mgr_plain.maybe_flush() == mgr_infl.maybe_flush() == 1
+    # ...identical cut (rows taken) and trigger labels...
+    assert [(c[0], sum(t.num_rows for t in c[1]), c[2], c[3]) for c in calls_p] == [
+        (c[0], sum(t.num_rows for t in c[1]), c[2], c[3]) for c in calls_i
+    ]
+    # ...and identical AIMD decisions for identical durations.
+    for dur in (999.0, 1.0, 12.0):
+        mgr_plain._adapt_flush_target("d1", dur, 100)
+        mgr_infl._adapt_flush_target("d1", dur, 100)
+        assert mgr_plain._flush_target["d1"] == mgr_infl._flush_target["d1"]
 
 
 # ---------------------------------------------------------------------------
@@ -1420,7 +1501,7 @@ def _fail_flushes(mgr, n, start_through=1):
 
 def test_circuit_opens_at_threshold_and_pauses_submissions():
     mgr, _, _ = _manager(
-        flush_max_rows=1, flush_circuit_failures=3, flush_interval_seconds=100.0, flush_circuit_max_seconds=1000.0
+        flush_batch_max_rows=1, flush_circuit_failures=3, flush_interval_seconds=100.0, flush_circuit_max_seconds=1000.0
     )
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 3)
@@ -1434,7 +1515,7 @@ def test_circuit_opens_at_threshold_and_pauses_submissions():
 
 
 def test_circuit_probe_success_closes_and_resubmits():
-    mgr, _, _ = _manager(flush_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0)
+    mgr, _, _ = _manager(flush_batch_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0)
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 2)
     with mgr._lock:
@@ -1452,7 +1533,7 @@ def test_circuit_probe_success_closes_and_resubmits():
 
 def test_circuit_probe_failure_reopens_with_next_backoff_step():
     mgr, _, _ = _manager(
-        flush_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0, flush_circuit_max_seconds=1000.0
+        flush_batch_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0, flush_circuit_max_seconds=1000.0
     )
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 2)
@@ -1473,7 +1554,7 @@ def test_circuit_probe_failure_reopens_with_next_backoff_step():
 
 def test_circuit_backoff_capped_at_max_seconds():
     mgr, _, _ = _manager(
-        flush_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0, flush_circuit_max_seconds=150.0
+        flush_batch_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0, flush_circuit_max_seconds=150.0
     )
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 4)  # uncapped backoff would reach 100*2^2=400s
@@ -1483,7 +1564,7 @@ def test_circuit_backoff_capped_at_max_seconds():
 
 
 def test_success_before_threshold_resets_consecutive_failures():
-    mgr, _, _ = _manager(flush_max_rows=1, flush_circuit_failures=3, flush_interval_seconds=100.0)
+    mgr, _, _ = _manager(flush_batch_max_rows=1, flush_circuit_failures=3, flush_interval_seconds=100.0)
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 2)
     with mgr._lock:
@@ -1502,7 +1583,9 @@ def test_success_before_threshold_resets_consecutive_failures():
 
 
 def test_circuit_is_per_destination():
-    mgr, _, _ = _manager(dests=("d1", "d2"), flush_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0)
+    mgr, _, _ = _manager(
+        dests=("d1", "d2"), flush_batch_max_rows=1, flush_circuit_failures=2, flush_interval_seconds=100.0
+    )
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 2)
     with patch("viaduck.delivery.append_only", return_value=1):
@@ -1515,7 +1598,7 @@ def test_circuit_is_per_destination():
 
 
 def test_flush_passes_derived_deadline_to_apply():
-    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0, flush_deadline_seconds=0.0)
+    mgr, _, _ = _manager(flush_batch_max_rows=1, flush_interval_seconds=100.0, flush_deadline_seconds=0.0)
     with patch("viaduck.delivery.append_only", return_value=1) as ao:
         mgr.buffer("d1", _table(1), 5)
         assert mgr.maybe_flush() == 1
@@ -1527,7 +1610,7 @@ def test_flush_passes_derived_deadline_to_apply():
 
 
 def test_flush_deadline_disabled_when_derived_nonpositive():
-    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=0.0, flush_deadline_seconds=0.0)
+    mgr, _, _ = _manager(flush_batch_max_rows=1, flush_interval_seconds=0.0, flush_deadline_seconds=0.0)
     with patch("viaduck.delivery.append_only", return_value=1) as ao:
         mgr.buffer("d1", _table(1), 5)
         mgr.maybe_flush()
@@ -1538,7 +1621,7 @@ def test_flush_deadline_disabled_when_derived_nonpositive():
 def test_flush_deadline_exceeded_counts_metric_and_fails_flush():
     from viaduck.apply import FlushDeadlineExceeded
 
-    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0)
+    mgr, _, _ = _manager(flush_batch_max_rows=1, flush_interval_seconds=100.0)
     before = metrics.delivery_flush_deadlines_total.labels(destination="d1")._value.get()
     with patch("viaduck.delivery.append_only", side_effect=FlushDeadlineExceeded("too slow")):
         mgr.buffer("d1", _table(1), 5)
@@ -1554,7 +1637,7 @@ def test_position_only_flush_does_not_close_circuit():
     """A position-only persist (tables empty) never touches the destination
     — it must not count as probe evidence and phantom-close the circuit on
     PG health alone."""
-    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=0.0, flush_circuit_failures=3)
+    mgr, _, _ = _manager(flush_batch_max_rows=1, flush_interval_seconds=0.0, flush_circuit_failures=3)
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 3)
     with mgr._lock:
@@ -1576,7 +1659,7 @@ def test_circuit_backoff_floored_at_one_second_when_interval_zero():
     collapses to 0s and the breaker would never suppress a submission.
     The 1s floor keeps the gate real."""
     mgr, _, _ = _manager(
-        flush_max_rows=1, flush_interval_seconds=0.0, flush_circuit_failures=3, flush_circuit_max_seconds=900.0
+        flush_batch_max_rows=1, flush_interval_seconds=0.0, flush_circuit_failures=3, flush_circuit_max_seconds=900.0
     )
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 3)
@@ -1591,7 +1674,7 @@ def test_cursor_persist_failure_does_not_count_toward_circuit():
     """The destination write SUCCEEDED; the cursor-store PG is down. Shared
     infrastructure must not trip the destination's breaker (same stance as
     lifecycle: a PG blip must not punish destinations)."""
-    mgr, sm, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
+    mgr, sm, _ = _manager(flush_batch_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
     sm.advance_cursor.side_effect = RuntimeError("pg down")
     with (
         patch("viaduck.delivery.append_only", return_value=1),
@@ -1610,14 +1693,14 @@ def test_drain_bypasses_circuit():
     """Shutdown must attempt every destination even with an open circuit:
     a recovered destination drains cleanly instead of burning the whole
     drain timeout and abandoning rows."""
-    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
+    mgr, _, _ = _manager(flush_batch_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 2)
     with mgr._lock:
         assert mgr._circuit_open_until["d1"] > 0
     flushed = []
     with patch("viaduck.delivery.append_only", side_effect=lambda *a, **k: flushed.append(1) or 1):
-        mgr.buffer("d1", _table(3), 50)
+        mgr.buffer("d1", _table(1), 50)
         t0 = _time_mod.monotonic()
         mgr.drain(timeout_s=5.0)
         elapsed = _time_mod.monotonic() - t0
@@ -1629,7 +1712,7 @@ def test_readd_resets_circuit_state():
     """remove_destination -> add_destination: activation-scoped circuit
     state (a stopped, fixed, re-added destination gets a fresh probe, not
     its predecessor's open circuit)."""
-    mgr, _, _ = _manager(flush_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
+    mgr, _, _ = _manager(flush_batch_max_rows=1, flush_interval_seconds=100.0, flush_circuit_failures=2)
     with patch("viaduck.delivery.append_only", side_effect=RuntimeError("boom")):
         _fail_flushes(mgr, 2)
     with mgr._lock:
@@ -1729,8 +1812,7 @@ def test_memory_trigger_respects_override():
         buffer_max_bytes_per_destination=1000,  # global default below one table
         buffer_total_max_bytes=10_000_000,
         flush_interval_seconds=3600.0,
-        flush_max_bytes=10_000_000,
-        flush_max_rows=10_000_000,
+        flush_batch_max_rows=10_000_000,
     )
     mgr._cap_overrides = {"d1": tbl.nbytes * 3}
     fake, calls = _recording_flush(mgr)
@@ -1796,7 +1878,7 @@ def test_flush_commit_drops_covered_replay_entries():
     crash boundary into a permanent phantom."""
     import threading
 
-    mgr, sm, pool = _manager(("d1",), flush_max_rows=1)
+    mgr, sm, pool = _manager(("d1",), flush_interval_seconds=0.0)
     apply_gate = threading.Event()
 
     def gated_append(_pool, _dest, batch, **_kw):
@@ -1870,230 +1952,3 @@ def test_split_flush_after_retention_clamp_does_not_drop_tail():
     # Cursor: clamp floor wins (50 > entry cov 10); the entry completing
     # must not regress it, and nothing may persist beyond it early.
     assert mgr.status_snapshot()["d1"].flushed_snapshot == 50
-
-
-# ---------------------------------------------------------------------------
-# Honest-bytes estimation (the 2026-08-26 nbytes-inflation regression class)
-# ---------------------------------------------------------------------------
-
-
-def _offset_sliced_table(parent_rows: int, offset: int, n: int) -> pa.Table:
-    """An entry-shaped table reproducing the PRODUCTION nbytes inflation:
-    a slice of a dictionary-encoded column counts the entire shared
-    dictionary (measured ~41KB/row against ~hundreds true), and
-    combine_chunks does not prune it. Plain flat-array slices do NOT
-    over-report on current pyarrow — the dictionary is the mechanism."""
-    dictionary = pa.array(["v" * 200 + str(i) for i in range(20_000)])
-    indices = pa.array([i % 10 for i in range(parent_rows)], type=pa.int32())
-    parent = pa.table(
-        {
-            "a": pa.array(range(parent_rows), type=pa.int64()),
-            "s": pa.DictionaryArray.from_arrays(indices, dictionary),
-        }
-    )
-    return parent.slice(offset, n)
-
-
-class TestHonestBytes:
-    def test_offset_slice_nbytes_overreports(self):
-        # Fixture sanity: the pathology must exist for these tests to
-        # mean anything. A 100-row slice of a 100K-row parent reports
-        # the parent's buffers.
-        sliced = _offset_sliced_table(100_000, 5_000, 100)
-        from viaduck.delivery import _estimate_row_bytes
-
-        honest = _estimate_row_bytes(sliced) * sliced.num_rows
-        assert sliced.nbytes > honest * 50
-        # combine_chunks alone does NOT fix it (dictionary retained):
-        assert sliced.combine_chunks().nbytes > honest * 50
-
-    def test_estimate_row_bytes_matches_honest_copy(self):
-        from viaduck.delivery import _estimate_row_bytes
-
-        sliced = _offset_sliced_table(100_000, 5_000, 2_000)
-        decoded = sliced.combine_chunks()
-        decoded = pa.Table.from_arrays(
-            [decoded.column("a"), decoded.column("s").cast(pa.string())],
-            names=["a", "s"],
-        )
-        honest_per_row = decoded.nbytes / sliced.num_rows
-        est = _estimate_row_bytes(sliced)
-        assert honest_per_row * 0.5 <= est <= honest_per_row * 2
-
-    def test_estimate_row_bytes_empty_table(self):
-        from viaduck.delivery import _estimate_row_bytes
-
-        assert _estimate_row_bytes(_offset_sliced_table(10, 0, 0)) == 0
-
-    def test_split_sizes_from_honest_bytes_not_inflated(self):
-        # Adaptive byte-cut against an offset-sliced entry: the split must
-        # come out near target/honest_per_row. The inflated math produced
-        # target/parent_bytes-per-row — crumbs ~100x smaller.
-        from viaduck.delivery import _estimate_row_bytes
-
-        mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive=True)
-        entry = _offset_sliced_table(100_000, 5_000, 10_000)
-        per_row = _estimate_row_bytes(entry)
-        target = per_row * 1_000  # honest target: ~1,000 rows
-        with mgr._lock:
-            mgr._flush_target["d1"] = target
-        fake, calls = _recording_flush(mgr)
-        _, epoch = mgr.read_plan()["d1"]
-        mgr.buffer("d1", entry, through_snapshot=5, epoch=epoch)
-        with patch.object(mgr, "_flush", fake):
-            mgr.maybe_flush()
-        assert calls, "expected a flush"
-        rows = calls[0][1][0].num_rows
-        assert 500 <= rows <= 1_100, f"split of {rows} rows is not honest-sized (crumb regression)"
-
-    def test_flush_receives_honest_est_bytes(self):
-        # The adaptive controller's evidence must be in the same units as
-        # the cut. Capture the est_bytes handed to _flush and compare to
-        # the honest sample, not the inflated entry nbytes.
-        from viaduck.delivery import _estimate_row_bytes
-
-        mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive=True)
-        entry = _offset_sliced_table(100_000, 5_000, 500)
-        per_row = _estimate_row_bytes(entry)
-        with mgr._lock:
-            mgr._flush_target["d1"] = per_row * 10_000  # far above the entry: no split
-        received = []
-
-        def _fake(dest, tables, through, trigger, est_bytes=None):
-            received.append(est_bytes)
-            with mgr._lock:
-                mgr._inflight.discard(dest)
-
-        _, epoch = mgr.read_plan()["d1"]
-        mgr.buffer("d1", entry, through_snapshot=5, epoch=epoch)
-        with patch.object(mgr, "_flush", _fake):
-            mgr.maybe_flush(shutdown=True)
-        assert received and received[0] is not None
-        assert received[0] == 500 * per_row
-        assert received[0] < entry.nbytes / 10  # decisively not the inflated number
-
-    def test_adaptive_growth_gate_passes_with_honest_fill(self):
-        # Frozen-controller regression: a target-sized split flush must
-        # satisfy the fill gate when judged in honest units.
-        mgr, _, _ = _manager(
-            flush_batch_max_rows=0,
-            flush_interval_seconds=0.0,
-            flush_adaptive=True,
-        )
-        with mgr._lock:
-            cur = mgr._flush_target["d1"] = 1_000_000
-        honest_batch = 900_000  # fill 0.9 >= 0.7 gate
-        mgr._adapt_flush_target("d1", duration=0.01, batch_bytes=honest_batch)
-        with mgr._lock:
-            grown = mgr._flush_target["d1"]
-        assert grown > cur, "growth gate did not pass with honest fill"
-
-
-class TestHonestBytesTotality:
-    """Review HIGH-1/HIGH-2: the estimator must never raise (poll-cycle
-    escape handler exits the pod) and must price NESTED dictionaries
-    (which inflate identically but dodge a top-level-only check)."""
-
-    def _dict_col(self, parent_rows):
-        dictionary = pa.array(["v" * 200 + str(i) for i in range(20_000)])
-        indices = pa.array([i % 10 for i in range(parent_rows)], type=pa.int32())
-        return pa.DictionaryArray.from_arrays(indices, dictionary)
-
-    def test_struct_of_dict_priced_honestly(self):
-        from viaduck.delivery import _estimate_row_bytes
-
-        col = pa.StructArray.from_arrays([self._dict_col(50_000)], names=["inner"])
-        t = pa.table({"s": col}).slice(1_000, 500)
-        est = _estimate_row_bytes(t)
-        assert 0 < est < 2_000, f"nested dict unpriced or inflated: {est}"
-
-    def test_list_of_dict_priced_honestly(self):
-        from viaduck.delivery import _estimate_row_bytes
-
-        inner = self._dict_col(50_000)
-        offsets = pa.array(range(0, 50_001), type=pa.int32())
-        col = pa.ListArray.from_arrays(offsets, inner)
-        t = pa.table({"l": col}).slice(1_000, 500)
-        est = _estimate_row_bytes(t)
-        assert 0 < est < 2_000, f"list<dict> unpriced or inflated: {est}"
-
-    def test_dict_of_struct_never_raises(self):
-        # dict<struct> casts are unsupported in pyarrow — the estimator
-        # must degrade to 0 (byte-cut inert), never propagate.
-        from viaduck.delivery import _estimate_row_bytes
-
-        struct_vals = pa.StructArray.from_arrays([pa.array(["x" * 100] * 50)], names=["f"])
-        indices = pa.array([i % 50 for i in range(5_000)], type=pa.int32())
-        col = pa.DictionaryArray.from_arrays(indices, struct_vals)
-        t = pa.table({"d": col})
-        est = _estimate_row_bytes(t)  # must not raise
-        assert est >= 0
-
-    def test_multichunk_dictionary_entry_priced_honestly(self):
-        from viaduck.delivery import _estimate_row_bytes
-
-        parent = pa.table({"s": self._dict_col(100_000)})
-        cat = pa.concat_tables([parent.slice(i * 100, 100) for i in range(50)])
-        assert cat.nbytes > 50_000_000  # per-chunk whole-dictionary inflation
-        est = _estimate_row_bytes(cat)
-        assert 0 < est < 2_000
-
-    def test_aimd_grows_after_real_split_flush(self):
-        # End-to-end wiring (review MEDIUM-2): through the REAL _flush,
-        # a fast target-sized split flush must grow the target. Reverting
-        # the est_bytes plumbing in _flush makes this fail.
-        from viaduck.delivery import _estimate_row_bytes
-
-        mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive=True)
-        entry = _offset_sliced_table(100_000, 5_000, 10_000)
-        per_row = _estimate_row_bytes(entry)
-        target = per_row * 2_000
-        with mgr._lock:
-            mgr._flush_target["d1"] = target
-        _, epoch = mgr.read_plan()["d1"]
-        mgr.buffer("d1", entry, through_snapshot=5, epoch=epoch)
-        # Mock the destination WRITE only — _flush's own est/adapt logic
-        # stays real, which is the wiring under test.
-        with patch("viaduck.delivery.append_only", return_value=2_000):
-            assert mgr.maybe_flush() == 1
-            mgr._executor.shutdown(wait=True)
-        with mgr._lock:
-            grown = mgr._flush_target["d1"]
-        assert grown > target, f"AIMD did not grow ({target} -> {grown}); est_bytes plumbing broken"
-
-    def test_aimd_no_spurious_growth_on_underfilled_flush(self):
-        # THE discriminator for the _flush est_bytes plumbing (review N2):
-        # a 500-row flush against a 2,000-row-equivalent target has honest
-        # fill 0.25 < 0.7 -> NO growth. The reverted (inflated-nbytes)
-        # wiring reads ~4MB >= 0.7*target and grows spuriously — this test
-        # fails under that revert; the growth test alone cannot (inflated
-        # >= honest always, so growth happens in both worlds).
-        from viaduck.delivery import _estimate_row_bytes
-
-        mgr, _, _ = _manager(flush_batch_max_rows=0, flush_interval_seconds=0.0, flush_adaptive=True)
-        entry = _offset_sliced_table(100_000, 5_000, 500)
-        per_row = _estimate_row_bytes(entry)
-        target = per_row * 2_000
-        with mgr._lock:
-            mgr._flush_target["d1"] = target
-        _, epoch = mgr.read_plan()["d1"]
-        mgr.buffer("d1", entry, through_snapshot=5, epoch=epoch)
-        with patch("viaduck.delivery.append_only", return_value=500):
-            assert mgr.maybe_flush(shutdown=True) == 1
-            mgr._executor.shutdown(wait=True)
-        with mgr._lock:
-            after = mgr._flush_target["d1"]
-        assert after == target, f"spurious growth {target} -> {after}: _flush fed inflated bytes to the fill gate"
-
-    def test_fixed_size_list_of_dict_priced_honestly(self):
-        # Review N1: fixed_size_list<dict> dodged the rewrite and kept
-        # ~19x inflation silently.
-        from viaduck.delivery import _estimate_row_bytes
-
-        dictionary = pa.array(["v" * 200 + str(i) for i in range(20_000)])
-        indices = pa.array([i % 10 for i in range(20_000)], type=pa.int32())
-        inner = pa.DictionaryArray.from_arrays(indices, dictionary)
-        col = pa.FixedSizeListArray.from_arrays(inner, 2)
-        t = pa.table({"fl": col}).slice(1_000, 500)
-        est = _estimate_row_bytes(t)
-        assert 0 < est < 3_000, f"fixed_size_list<dict> unpriced or inflated: {est}"

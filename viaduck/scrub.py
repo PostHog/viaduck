@@ -7,17 +7,22 @@ handling). Scrub at the boundary so "no secret reaches a log" is a
 structural property, not a per-call-site promise.
 
 Regex notes: the quoted-value patterns use the unrolled-loop form
-``[^'\\\\]*(?:\\\\.[^'\\\\]*)*`` — the naive ``(?:\\\\.|[^'])*`` is ambiguous
-(a backslash matches both alternatives) and backtracks exponentially on
-unclosed quoted strings, which attacker-influenceable error text can
-contain (CodeQL py/redos on the earlier form).
+``'[^'\\\\]*(?:(?:\\\\.|'')[^'\\\\]*)*'`` — the naive ``(?:\\\\.|[^'])*`` is
+ambiguous (a backslash matches both alternatives) and backtracks
+exponentially on unclosed quoted strings, which attacker-influenceable
+error text can contain (CodeQL py/redos on the earlier form). The special
+alternative covers BOTH quoting dialects: libpq backslash-escapes (\\') and
+SQL's ''-doubling — discovery.build_attach_uri SQL-doubles quotes, and a
+pre-parse exception (e.g. a DuckDB ParserException) embeds the raw
+doubled-quote literal, which a backslash-only pattern terminates halfway
+through, leaking the password tail into the log line it was scrubbing.
 """
 
 from __future__ import annotations
 
 import re
 
-_QUOTED = r"'[^'\\]*(?:\\.[^'\\]*)*'"
+_QUOTED = r"'[^'\\]*(?:(?:\\.|'')[^'\\]*)*'"
 
 _CRED_PATTERNS = (
     # libpq kv form incl. quoted values and space-padded '='.

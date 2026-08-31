@@ -464,11 +464,16 @@ def materialize_one(
     allowed_endpoint_suffixes: tuple[str, ...] = (),
     allowed_secret_namespaces: tuple[str, ...] = (),
     probe_fresh: bool = False,
+    count_broken: bool = True,
 ) -> DestinationConfig | None:
     """One candidate -> DestinationConfig, or None (reason counted).
     Shared by startup materialize() and the reconciler's activate
     (which passes probe_fresh=True: an activation must prove the secret
-    is readable NOW — no TTL hit, no stale-fallback)."""
+    is readable NOW — no TTL hit, no stale-fallback). count_broken=False
+    is the reconciler's retry path: a persistently unmateralizable tenant
+    reports _broken ONCE per stint, not every poll cycle (the same
+    loud/quiet split classify_payload's count_broken gives the drift
+    poller)."""
     static_ids = static_ids or set()
     rv = str(m.team_id)
     if rv in static_routing_values:
@@ -482,17 +487,29 @@ def materialize_one(
         )
         return None
     if m.dest_id in static_ids:
-        _broken("id_collision", f"{m.dest_id} collides with a static destination id (different routing value)")
+        _broken(
+            "id_collision",
+            f"{m.dest_id} collides with a static destination id (different routing value)",
+            count=count_broken,
+        )
         return None
     # Defense-in-depth against a spoofed payload (it directs which
     # Secret we read and where the password gets sent in a libpq
     # handshake): endpoints and secret namespaces must match the
     # configured allowlists.
     if allowed_endpoint_suffixes and not any(m.pg_endpoint.endswith(sfx) for sfx in allowed_endpoint_suffixes):
-        _broken("endpoint_not_allowed", f"{m.dest_id}: endpoint {m.pg_endpoint!r} outside allowed suffixes")
+        _broken(
+            "endpoint_not_allowed",
+            f"{m.dest_id}: endpoint {m.pg_endpoint!r} outside allowed suffixes",
+            count=count_broken,
+        )
         return None
     if allowed_secret_namespaces and m.secret_namespace not in allowed_secret_namespaces:
-        _broken("namespace_not_allowed", f"{m.dest_id}: secret namespace {m.secret_namespace!r} not allowed")
+        _broken(
+            "namespace_not_allowed",
+            f"{m.dest_id}: secret namespace {m.secret_namespace!r} not allowed",
+            count=count_broken,
+        )
         return None
     try:
         # Materializability PROBE (C3 §4/§5): the password is NOT baked
@@ -515,7 +532,7 @@ def materialize_one(
                 timeout_s=secret_timeout_s,
             )
     except SecretReadError as e:
-        _broken("secret_unreadable", f"{m.dest_id}: {e}")
+        _broken("secret_unreadable", f"{m.dest_id}: {e}", count=count_broken)
         return None
     props = {"memory_limit": defaults.get("memory_limit", "8GB")}
     props.update(defaults.get("properties", {}))

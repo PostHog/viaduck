@@ -1,0 +1,182 @@
+# Load-test profile: same 20-tenant topology as viaduck-dev.yaml, but
+# 14 destinations share the CONTENDED dest-1 catalog and 6 sit on dest-2
+# as an uncontended control group — including mallardine, a TARGET-BOUND
+# mid-head tenant, so the control group has real baseline+wave flushes
+# (the Zipf tail is interval-bound at 120s and would give the control
+# assertion nothing to evaluate). Delivery tuning is prod-like: a 120s
+# interval so thin tenants are interval-bound. Rows-controller generation:
+# flush_batch_max_rows is the target ceiling — 30K (not the prod 60K) so
+# the head (~35% of 3K rows/s ≈ 1K rows/s) fills it in ~29s and mallardine
+# (~450 rows/s) in ~67s, both inside loadcheck's 90s baseline; the tail
+# stays interval-bound. The AIMD band is test-scaled (baseline flushes
+# run ~0.4s at this size — ~7x margin under the high bound; the latency
+# wave pushes flushes past it via OCC retries).
+source:
+  name: source
+  postgres_uri_env: SOURCE_POSTGRES_URI
+  data_path: s3://source/
+  table: events
+  properties:
+    s3_endpoint: minio:9000
+    s3_access_key_id_env: S3_ACCESS_KEY_ID
+    s3_secret_access_key_env: S3_SECRET_ACCESS_KEY
+    s3_use_ssl: "false"
+    s3_url_style: path
+
+routing:
+  field: company
+  key_columns: [event_id]
+  mode: full_cdc
+
+defaults:
+  properties:
+    s3_endpoint: minio:9000
+    s3_access_key_id_env: S3_ACCESS_KEY_ID
+    s3_secret_access_key_env: S3_SECRET_ACCESS_KEY
+    s3_use_ssl: "false"
+    s3_url_style: path
+
+# Contended group (dest-1 catalog; the contender service commits noise here)
+destinations:
+  - id: quacksworth-lake
+    routing_value: quacksworth
+    name: quacksworth
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_quacksworth
+  - id: drakeford-lake
+    routing_value: drakeford
+    name: drakeford
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_drakeford
+  - id: gosswick-lake
+    routing_value: gosswick
+    name: gosswick
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_gosswick
+  - id: eiderdown-lake
+    routing_value: eiderdown
+    name: eiderdown
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_eiderdown
+  - id: pintailor-lake
+    routing_value: pintailor
+    name: pintailor
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_pintailor
+  - id: scaupson-lake
+    routing_value: scaupson
+    name: scaupson
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_scaupson
+  - id: wigeonton-lake
+    routing_value: wigeonton
+    name: wigeonton
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_wigeonton
+  - id: gadwallace-lake
+    routing_value: gadwallace
+    name: gadwallace
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_gadwallace
+  - id: smewbury-lake
+    routing_value: smewbury
+    name: smewbury
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_smewbury
+  - id: pochardly-lake
+    routing_value: pochardly
+    name: pochardly
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_pochardly
+  - id: canvasbeck-lake
+    routing_value: canvasbeck
+    name: canvasbeck
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_canvasbeck
+  - id: redheadly-lake
+    routing_value: redheadly
+    name: redheadly
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_redheadly
+  - id: buffleton-lake
+    routing_value: buffleton
+    name: buffleton
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_buffleton
+  - id: goldeneye-lake
+    routing_value: goldeneye
+    name: goldeneye
+    postgres_uri_env: DEST_1_POSTGRES_URI
+    data_path: s3://dest-1/
+    table: events_goldeneye
+
+  # Control group (dest-2 catalog; no latency wave) — the differential half
+  # of the experiment: these targets must NOT move while dest-1's halve.
+  - id: mallardine-lake
+    routing_value: mallardine
+    name: mallardine
+    postgres_uri_env: DEST_2_POSTGRES_URI
+    data_path: s3://dest-2/
+    table: events_mallardine
+  - id: merganser-lake
+    routing_value: merganser
+    name: merganser
+    postgres_uri_env: DEST_2_POSTGRES_URI
+    data_path: s3://dest-2/
+    table: events_merganser
+  - id: ruddyshore-lake
+    routing_value: ruddyshore
+    name: ruddyshore
+    postgres_uri_env: DEST_2_POSTGRES_URI
+    data_path: s3://dest-2/
+    table: events_ruddyshore
+  - id: shovelnook-lake
+    routing_value: shovelnook
+    name: shovelnook
+    postgres_uri_env: DEST_2_POSTGRES_URI
+    data_path: s3://dest-2/
+    table: events_shovelnook
+  - id: woodington-lake
+    routing_value: woodington
+    name: woodington
+    postgres_uri_env: DEST_2_POSTGRES_URI
+    data_path: s3://dest-2/
+    table: events_woodington
+  - id: brantley-lake
+    routing_value: brantley
+    name: brantley
+    postgres_uri_env: DEST_2_POSTGRES_URI
+    data_path: s3://dest-2/
+    table: events_brantley
+
+poll:
+  interval_seconds: 3
+
+server:
+  port: 8000
+
+delivery:
+  workers: 8
+  flush_interval_seconds: 120
+  # Target init + ceiling (see the header comment for the 30K rationale).
+  flush_batch_max_rows: 30000
+  buffer_total_max_bytes: 1610612736
+  # Test-scaled AIMD band: local flushes are ~0.4s at 30K rows, so the
+  # prod [5,30]s band is unreachable; [0.5, 3.0]s is the identical
+  # controller behavior at local speed. Baseline flushes hold ~7x margin
+  # under the high bound; latency-wave OCC retries push flushes past it.
+  flush_adaptive_low_seconds: 0.5
+  flush_adaptive_high_seconds: 3.0

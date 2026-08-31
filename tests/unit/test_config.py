@@ -717,8 +717,7 @@ def test_log_summary_one_line_per_field_not_grouped(config_file, caplog):
         "config: routing.seed_mode=",
         "config: delivery.workers=",
         "config: delivery.flush_interval_seconds=",
-        "config: delivery.flush_max_rows=",
-        "config: delivery.flush_max_bytes=",
+        "config: delivery.flush_batch_max_rows=",
         "config: delivery.flush_deadline_seconds=",
         "config: delivery.flush_circuit_failures=",
         "config: poll.interval_seconds=",
@@ -954,8 +953,9 @@ def test_flush_adaptive_defaults_enabled():
     assert cfg.flush_adaptive is True
     assert cfg.flush_adaptive_low_seconds == 5.0
     assert cfg.flush_adaptive_high_seconds == 30.0
-    assert cfg.flush_adaptive_step_bytes == 16_777_216
-    assert cfg.flush_adaptive_min_bytes == 8_388_608
+    assert cfg.flush_adaptive_step_rows == 4_000
+    assert cfg.flush_adaptive_min_rows == 4_000
+    assert cfg.flush_adaptive_reprobe_after == 50
 
 
 def test_flush_adaptive_band_must_be_ordered():
@@ -971,8 +971,9 @@ def test_flush_adaptive_loader_passthrough(tmp_path: Path):
         "  flush_adaptive: false\n"
         "  flush_adaptive_low_seconds: 2.5\n"
         "  flush_adaptive_high_seconds: 60\n"
-        "  flush_adaptive_step_bytes: 8388608\n"
-        "  flush_adaptive_min_bytes: 4194304\n"
+        "  flush_adaptive_step_rows: 8000\n"
+        "  flush_adaptive_min_rows: 2000\n"
+        "  flush_adaptive_reprobe_after: 25\n"
     )
     p = tmp_path / "adaptive.yaml"
     p.write_text(raw)
@@ -980,8 +981,43 @@ def test_flush_adaptive_loader_passthrough(tmp_path: Path):
     assert cfg.delivery.flush_adaptive is False
     assert cfg.delivery.flush_adaptive_low_seconds == 2.5
     assert cfg.delivery.flush_adaptive_high_seconds == 60.0
-    assert cfg.delivery.flush_adaptive_step_bytes == 8388608
-    assert cfg.delivery.flush_adaptive_min_bytes == 4194304
+    assert cfg.delivery.flush_adaptive_step_rows == 8000
+    assert cfg.delivery.flush_adaptive_min_rows == 2000
+    assert cfg.delivery.flush_adaptive_reprobe_after == 25
+
+
+def test_retired_byte_knobs_warn_ignored(tmp_path: Path, caplog):
+    # The byte-controller keys were retired 2026-08-28 (flush-sizing
+    # endgame): a stale chart carrying them must load fine with the new
+    # defaults and a WARN per key — never a refusal (the replacement rows
+    # controller is on by default, so there is no silent-safety-loss).
+    import logging
+
+    raw = MINIMAL_YAML + (
+        "\ndelivery:\n"
+        "  flush_max_rows: 500000\n"
+        "  flush_max_bytes: 1073741824\n"
+        "  flush_adaptive_step_bytes: 8388608\n"
+        "  flush_adaptive_min_bytes: 4194304\n"
+    )
+    p = tmp_path / "retired.yaml"
+    p.write_text(raw)
+    with caplog.at_level(logging.WARNING, logger="viaduck.config"):
+        cfg = load(p)
+    assert cfg.delivery.flush_batch_max_rows == 60_000  # untouched default
+    warned = [r.message for r in caplog.records if "was removed with the byte-denominated" in r.message]
+    assert len(warned) == 4
+    assert any("flush_max_bytes" in m for m in warned)
+
+
+def test_flush_batch_max_rows_zero_rejected():
+    # 0 was "unlimited" under the byte controller; it is now the adaptive
+    # target's init AND ceiling, where unbounded is undefined (and with the
+    # legacy flush_max_rows backstop deleted, no rows bound would remain).
+    from viaduck.config import DeliveryConfig
+
+    with pytest.raises(ConfigError, match="flush_batch_max_rows"):
+        DeliveryConfig(flush_batch_max_rows=0)
 
 
 # --- slow-consumer isolation knobs (flush deadline / circuit / cycle budget) ---

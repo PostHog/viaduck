@@ -53,7 +53,7 @@ Viaduck
        reads (masked per destination), half-open ranges (position, current]
     3. If key_columns: table_changes() → Phase 1 → route → buffer
        Else: table_insertions() → route → buffer
-    4. Evaluate flush triggers (interval/rows/bytes/memory/shutdown), gated
+    4. Evaluate flush triggers (interval/target/memory/sliced/shutdown), gated
        by the per-destination flush circuit breaker
   flush workers (delivery.workers threads, flush cadence):
     5. Phase 2 (conflict resolution) on the concatenated buffer
@@ -220,6 +220,7 @@ Always run `just tlc` after spec changes.
 - Integration tests: `tests/integration/` — real pyducklake with local DuckDB; Postgres-backed state tests via testcontainers (124 tests)
 - Performance tests: `tests/perf/` — router, phases, delete filter, end-to-end delivery fanout at 200/500/1000 destinations (11 benchmarks)
 - Soak: manual docker-compose kill sequence (SIGKILL + SIGTERM + convergence diff) — run for delivery-semantics changes
+- Flush-sizing load harness: `just load-up` + `just load-check` (docker-compose.load.yaml: 3K rows/s Zipf-skewed wide-row loadgen with a mid-run thin→hot burst stream, dest-1 catalog Postgres behind toxiproxy so `test/loadcheck.py` can inject a catalog-latency wave; 6 destinations on dest-2 are the uncontended control group). Asserts the adaptive flush controller's behavior locally — head flushes target-triggered at full-size batches (absolute rows/flush band: the crumb-cut detector), contended destinations halve, control doesn't move, the burst tenant migrates interval→target with bounded lag, zero errors, drains clean — instead of learning it from a prod deploy. Reads both target-gauge generations (`_rows` preferred, `_bytes` fallback).
 
 Run all: `just ci` (lock-check + format + lint + unit + integration + docs-check + Docker build). Perf: `just test-perf`.
 Perf with JSON output: `just test-perf-json` → writes `perf-results.json`.

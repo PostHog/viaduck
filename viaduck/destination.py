@@ -140,6 +140,10 @@ class DestinationPool:
         except Exception:
             with self._lock:
                 self._creating.discard(destination_id)
+                # The LRU eviction loop above may have popped entries since
+                # the gauge was last set — re-publish the true count or the
+                # pool reads one-high until the next successful mutation.
+                metrics.pool_open_connections.set(len(self._pool))
             raise
 
         with self._lock:

@@ -317,7 +317,9 @@ buffering design working. Hover a cell for the snapshot count"
 data-sort="lag_seconds" data-type="num">Lag<span class="sort-ind"></span><span
 class="unit">seconds behind</span></th>
       <th title="Cumulative operations applied since seeding (upserts + deletes),
-not the destination's current row count" data-sort="rows_replicated"
+not the destination's current row count. At-least-once: ranges replayed after a
+commit/cursor-gap failure are counted again, and the inflation persists"
+data-sort="rows_replicated"
 data-type="num">Rows Processed<span class="sort-ind"></span><span class="unit">ops applied</span></th>
       <th title="Rows read from the source and awaiting flush (buffer age in seconds).
 Hover a cell for the cumulative rows buffered this run"
@@ -381,10 +383,11 @@ function fmtBytes(n) {
 function flushTip(d) {
   const c = d.delivery_config || {};
   return 'Changes buffer in memory and flush on the FIRST trigger to fire: ' +
-    'age \u2265 ' + esc(d.flush_interval || '?') + 's \u00b7 ' +
-    'rows \u2265 ' + fmt(c.flush_max_rows) + ' \u00b7 ' +
-    'bytes \u2265 ' + fmtBytes(c.flush_max_bytes) + ' \u00b7 ' +
-    'global watermark ' + fmtBytes(c.buffer_total_max_bytes) + ' (largest first) \u00b7 ' +
+    'age ≥ ' + esc(d.flush_interval || '?') + 's · ' +
+    'rows ≥ the adaptive per-destination target (starts at flush_batch_max_rows = ' + fmt(c.flush_batch_max_rows) +
+    (c.flush_adaptive ? ', AIMD-halves on slow flushes and re-probes upward' : ', fixed') + ') · ' +
+    'destination buffer at its cap · ' +
+    'global watermark ' + fmtBytes(c.buffer_total_max_bytes) + ' (largest first) · ' +
     'shutdown. Workers: ' + fmt(c.workers) + ', connection pool: ' + fmt(c.pool_max_open);
 }
 

@@ -114,6 +114,7 @@ class Reconciler:
         # Transition-only logging state.
         self._suppressed_logged: set[str] = set()
         self._retired_refused_logged: set[str] = set()
+        self._materialize_failed_logged: set[str] = set()
         self._floor_logged = False
 
     # ------------------------------------------------------------------ #
@@ -322,9 +323,15 @@ class Reconciler:
                 allowed_endpoint_suffixes=self._disc.allowed_endpoint_suffixes,
                 allowed_secret_namespaces=self._disc.allowed_secret_namespaces,
                 probe_fresh=True,  # "validate now" — no TTL hit, no stale-fallback
+                # A persistently unmaterializable tenant reports _broken
+                # ONCE per stint, not every poll cycle — the drift poller's
+                # loud/quiet convention applied to activation retries.
+                count_broken=dest_id not in self._materialize_failed_logged,
             )
             if cfg is None:
+                self._materialize_failed_logged.add(dest_id)
                 return _FAILED
+            self._materialize_failed_logged.discard(dest_id)
 
             # Cursor row: our own row resumes as-is (never-delete made it
             # durable); no row anywhere → seed at head (discovery starts
@@ -400,6 +407,7 @@ class Reconciler:
         self._evict_pending.add(dest_id)
         self._label_pending.add(dest_id)
         self._absent_streak.pop(dest_id, None)
+        self._materialize_failed_logged.discard(dest_id)  # re-report if a re-add fails again
         if kind == "stop":
             self._applied_mapped.pop(dest_id, None)
             metrics.discovery_applied_total.labels(kind="stop").inc()

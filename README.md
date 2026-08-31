@@ -122,7 +122,7 @@ Each poll cycle ([`main.py:_poll_cycle`](viaduck/main.py)):
 5. **Phase 1: Preimage Resolution** *(full CDC only)* — pair `update_preimage` with `update_postimage` rows by `rowid` (Arrow hash join). Cross-tenant mutations convert the preimage to a delete on the old destination; same-tenant preimages drop; orphaned preimages convert to deletes ([`main.py:_resolve_preimages`](viaduck/main.py)).
 6. **Route** — `split_and_count()` partitions the Arrow table by routing value in a single vectorized pass ([`router.py:split_and_count`](viaduck/router.py)).
 7. **Buffer** — routed batches accumulate in per-destination buffers; the read position advances in memory. Destinations with no routed rows advance position only — zero writes for idle destinations ([`delivery.py:buffer`](viaduck/delivery.py)).
-8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ `flush_max_rows`, bytes ≥ the destination's **adaptive flush target** (`delivery.flush_adaptive`, default on: an AIMD controller per destination that starts at `flush_max_bytes`, halves when a flush exceeds `flush_adaptive_high_seconds`, steps up `flush_adaptive_step_bytes` when a near-full flush beats `flush_adaptive_low_seconds`, floored at `flush_adaptive_min_bytes` — a commit-contended catalog gets small batches, an idle one gets full-size), per-destination queue (buffered + in-flight) at its cap (trigger label `memory`), or shutdown. The per-destination cap is `buffer_total_max_bytes / N` by default, or `buffer_max_bytes_per_destination` explicitly. One flush takes at most `flush_batch_max_rows` rows (default 60K, sliced at chunk boundaries; the remainder drains immediately after with trigger label `sliced` — bounded append batches are what keep the fork's native layer out of its big-batch pathology). Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)) — unless the destination's **circuit breaker** is open (below).
+8. **Flush triggers** — buffer age ≥ `flush_interval_seconds`, rows ≥ the destination's **adaptive flush target** in rows (`delivery.flush_adaptive`, default on: an AIMD controller per destination that starts at `flush_batch_max_rows` — its ceiling — halves when a flush exceeds `flush_adaptive_high_seconds`, steps up `flush_adaptive_step_rows` when a near-full flush beats `flush_adaptive_low_seconds`, floors at `flush_adaptive_min_rows`, and re-probes upward after `flush_adaptive_reprobe_after` consecutive in-band full flushes — a commit-contended catalog gets small batches, an idle one gets full-size), per-destination queue (buffered + in-flight) at its cap (trigger label `memory`), or shutdown. The per-destination cap is `buffer_total_max_bytes / N` by default, or `buffer_max_bytes_per_destination` explicitly. One flush takes at most the destination's current target (sliced at entry boundaries, or within an oversize entry; the remainder drains immediately after with trigger label `sliced` — bounded append batches are what keep the fork's native layer out of its big-batch pathology). Flush sizing is row-denominated end to end (bytes proved unpriceable — three incidents, 2026-08-26..28; buffer caps stay on raw nbytes as the conservative memory bound). Eligible buffers are swapped out and submitted to the worker pool ([`delivery.py:maybe_flush`](viaduck/delivery.py)) — unless the destination's **circuit breaker** is open (below).
 9. **Lag metrics + status** — per-destination snapshot lag from the delivery manager's authoritative in-memory view.
 
 Each flush (worker thread, [`delivery.py:_flush`](viaduck/delivery.py)):
@@ -274,20 +274,19 @@ state:
 delivery:
   workers: 8                                # flush worker threads
   flush_interval_seconds: 120               # per-destination max buffer age
-  flush_max_rows: 500000                    # per-destination row trigger
-  flush_max_bytes: 268435456                # per-destination byte trigger (256 MiB)
-  flush_batch_max_rows: 60000               # max rows ONE flush takes (0 = unlimited)
-  buffer_total_max_bytes: 1073741824        # total budget (1 GiB); per-destination cap = total / N
+  flush_batch_max_rows: 60000               # max rows ONE flush takes; also the adaptive target's init + ceiling
+  buffer_total_max_bytes: 1073741824        # total budget (1 GiB, raw nbytes); per-destination cap = total / N
   # buffer_max_bytes_per_destination: 0     # explicit per-destination cap (0 = auto: total / N)
   pool_max_open: 100                        # destination connection pool size
   # flush_deadline_seconds: 0               # overall per-flush wall-clock bound (0 = derive: 2 x flush_interval)
   flush_circuit_failures: 3                 # consecutive failures before a destination's circuit breaker opens
   flush_circuit_max_seconds: 900            # cap on the circuit breaker's exponential resubmit backoff
-  # flush_adaptive: true                    # per-destination AIMD flush-size target (see Poll Cycle)
+  # flush_adaptive: true                    # per-destination AIMD flush-size target in ROWS (see Poll Cycle)
   # flush_adaptive_low_seconds: 5           # faster than this + near-full batch → step the target up
   # flush_adaptive_high_seconds: 30         # slower than this → halve the target
-  # flush_adaptive_step_bytes: 16777216     # +16 MiB per fast flush (capped at flush_max_bytes)
-  # flush_adaptive_min_bytes: 8388608       # target floor (8 MiB; effective floor is one CDC chunk)
+  # flush_adaptive_step_rows: 4000          # +rows per fast full flush (capped at flush_batch_max_rows)
+  # flush_adaptive_min_rows: 4000           # target floor in rows
+  # flush_adaptive_reprobe_after: 50        # consecutive in-band full flushes before one upward re-probe
 
 memory:
   self_recycle_enabled: true                # watermark self-recycle (see Deployment)
@@ -479,7 +478,7 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_dest_last_snapshot_id` | Gauge | destination | Last replicated snapshot |
 | `viaduck_dest_lag_snapshots` | Gauge | destination | Snapshot lag per destination |
 | `viaduck_dest_time_lag_seconds` | Gauge | destination | Wall-clock age of the last flushed source snapshot (exact, no commit-rate assumption) |
-| `viaduck_dest_flush_target_bytes` | Gauge | destination | Adaptive per-destination flush-size target (pinned at the floor = commit-contended catalog) |
+| `viaduck_dest_flush_target_rows` | Gauge | destination | Adaptive per-destination flush-size target in rows (pinned at the floor = commit-contended catalog) |
 | `viaduck_unrouted_rows_total` | Counter | — | Rows with no matching destination |
 | `viaduck_pool_open_connections` | Gauge | — | Open destination connections |
 | `viaduck_pool_evictions_total` | Counter | — | LRU evictions |
@@ -488,7 +487,7 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_delivery_buffer_rows` | Gauge | destination | Rows buffered awaiting flush |
 | `viaduck_delivery_buffer_bytes` | Gauge | destination | Bytes buffered awaiting flush |
 | `viaduck_delivery_buffer_total_bytes` | Gauge | — | Total buffered + in-flight bytes (watermark input) |
-| `viaduck_delivery_flushes_total` | Counter | destination, trigger | Flushes by trigger (interval/rows/bytes/memory/sliced/shutdown) |
+| `viaduck_delivery_flushes_total` | Counter | destination, trigger | Flushes by trigger (interval/target/memory/sliced/shutdown) |
 | `viaduck_delivery_flush_seconds` | Histogram | destination | Flush duration (data flushes only) |
 | `viaduck_delivery_buffers_dropped_total` | Counter | destination | Buffers dropped on flush failure |
 | `viaduck_delivery_covered_replays_dropped_total` | Counter | destination | Buffered replay entries dropped at flush commit (already covered by it) |
