@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from viaduck import metrics
-from viaduck.destination import DestinationPool
+from viaduck.destination import DestinationConnectError, DestinationPool
 
 
 def setup_module():
@@ -1067,3 +1067,141 @@ class TestDeferredResolution:
             with patch("pyducklake.Catalog", return_value=MagicMock()):
                 pool._create("dyn-1")
         assert rd.call_count == 2
+
+
+# ----------------------------------------------------------------------
+# Age sweep — evict_older_than (Leak-2 mitigation)
+# ----------------------------------------------------------------------
+
+
+def test_evict_older_than_noop_when_disabled(pool):
+    """max_age <= 0 is a no-op (the knob's off state)."""
+    with patch.object(pool, "_create", return_value=(MagicMock(), MagicMock(), None)):
+        pool.get("team-123")
+        pool.release("team-123")
+    assert pool.evict_older_than(0) == 0
+    assert pool.size == 1
+
+
+def test_evict_older_than_sweeps_aged_only(pool):
+    """Entries younger than max_age survive; entries older than max_age close."""
+    cats = {}
+
+    def mock_create(dest_id):
+        cat = MagicMock()
+        cats[dest_id] = cat
+        return cat, MagicMock(), None
+
+    with patch.object(pool, "_create", side_effect=mock_create):
+        pool.get("young")
+        pool.release("young")
+        # Backdate "old" past the cutoff.
+        pool.get("old")
+        pool.release("old")
+        pool._created["old"] -= 400  # monotonic-seconds arithmetic
+
+    assert pool.evict_older_than(300) == 1
+    assert pool.size == 1
+    cats["old"].close.assert_called_once()
+    cats["young"].close.assert_not_called()
+
+
+def test_evict_older_than_skips_pinned(pool):
+    """An in-flight flush (pinned) is skipped by the sweep — the sweep only
+    takes entries that can close immediately; the pinned entry's close is
+    left to its normal LRU/error path. Routine sweeps must not manufacture
+    zombie churn."""
+    cat = MagicMock()
+    with patch.object(pool, "_create", return_value=(cat, MagicMock(), None)):
+        pool.get("busy")  # pinned
+        pool._created["busy"] -= 400
+
+    assert pool.evict_older_than(300) == 0  # skipped, not evicted
+    pool.release("busy")
+    cat.close.assert_not_called()  # still pooled
+
+
+def test_evict_older_than_budget_caps_herd():
+    """At most `budget` evictions per sweep — the herd bound."""
+    pool = DestinationPool(MagicMock(), MagicMock(), max_open=10)
+    cats = {}
+
+    def mock_create(dest_id):
+        cat = MagicMock()
+        cats[dest_id] = cat
+        return cat, MagicMock(), None
+
+    with patch.object(pool, "_create", side_effect=mock_create):
+        for i in range(6):
+            pool.get(f"dest-{i}")
+            pool.release(f"dest-{i}")
+            pool._created[f"dest-{i}"] -= 400
+
+    assert pool.evict_older_than(300, budget=2) == 2
+    assert pool.size == 4
+    closed = [d for d, c in cats.items() if c.close.called]
+    assert len(closed) == 2
+
+
+def test_evict_older_than_returns_actual_evictions(pool):
+    """Return value counts performed evictions, not aged candidates (pinned excluded)."""
+    with patch.object(pool, "_create", return_value=(MagicMock(), MagicMock(), None)):
+        pool.get("pinned")
+        pool.get("free")
+        pool.release("free")
+        pool._created["pinned"] -= 400
+        pool._created["free"] -= 400
+
+    # pinned stays (defers); free evicts.
+    assert pool.evict_older_than(300, budget=5) == 1
+
+
+# ----------------------------------------------------------------------
+# _create table-exists retry (adversarial-review fix: was `or` — retried
+# every exception; now `and` — only the race text retries)
+# ----------------------------------------------------------------------
+
+
+def test_create_retry_only_for_race_text(pool):
+    """A non-'Table already exists' exception must raise immediately."""
+    cfg_obj = MagicMock()
+    cfg_obj.table = "events_x"
+    cfg_obj.name = "x"
+    cfg_obj.partition_by = ()
+
+    cat = MagicMock()
+    cat.create_table_if_not_exists.side_effect = RuntimeError("permission denied")
+
+    with (
+        patch.object(pool._registry, "config_for", return_value=cfg_obj),
+        patch.object(pool, "_get_source_schema", return_value=MagicMock()),
+        patch.object(pool, "_resolve_uri", return_value="postgres://x"),
+        patch("viaduck.destination.safe_catalog", return_value=cat),
+        patch.object(pool, "_maybe_build_projection", return_value=None),
+        pytest.raises(DestinationConnectError, match="permission denied"),
+    ):
+        pool._create("team-x")
+    # one attempt, no retry
+    assert cat.create_table_if_not_exists.call_count == 1
+
+
+def test_create_retry_exhaustion_raises_not_asserts(pool):
+    """Persistent 'Table already exists' raises the real error, never bare AssertionError."""
+    cfg_obj = MagicMock()
+    cfg_obj.table = "events_x"
+    cfg_obj.name = "x"
+    cfg_obj.partition_by = ()
+
+    cat = MagicMock()
+    cat.create_table_if_not_exists.side_effect = RuntimeError("Table already exists: events_x")
+
+    with (
+        patch.object(pool._registry, "config_for", return_value=cfg_obj),
+        patch.object(pool, "_get_source_schema", return_value=MagicMock()),
+        patch.object(pool, "_resolve_uri", return_value="postgres://x"),
+        patch("viaduck.destination.safe_catalog", return_value=cat),
+        patch.object(pool, "_maybe_build_projection", return_value=None),
+        pytest.raises(DestinationConnectError, match="Table already exists"),
+    ):
+        pool._create("team-x")
+    assert cat.create_table_if_not_exists.call_count == 3  # bounded retry

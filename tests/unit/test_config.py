@@ -1130,6 +1130,8 @@ memory:
         "  self_recycle_rss_fraction: 1.5",
         "  self_recycle_rss_gib: -1",
         "  self_recycle_min_uptime_seconds: -5",
+        "  dest_conn_max_age_seconds: -1",
+        "  dest_conn_max_age_seconds: 30",
     ],
 )
 def test_memory_validation_rejects(tmp_path: Path, snippet: str):
@@ -1137,6 +1139,19 @@ def test_memory_validation_rejects(tmp_path: Path, snippet: str):
     p.write_text(MINIMAL_YAML + "\nmemory:\n" + snippet + "\n")
     with pytest.raises(ConfigError):
         load(p)
+
+
+def test_memory_dest_conn_max_age_default_and_override(tmp_path: Path):
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(MINIMAL_YAML)
+    assert load(p).memory.dest_conn_max_age_seconds == 600.0
+
+    p.write_text(MINIMAL_YAML + "\nmemory:\n  dest_conn_max_age_seconds: 120\n")
+    assert load(p).memory.dest_conn_max_age_seconds == 120.0
+
+    # off is allowed (0 disables the sweep)
+    p.write_text(MINIMAL_YAML + "\nmemory:\n  dest_conn_max_age_seconds: 0\n")
+    assert load(p).memory.dest_conn_max_age_seconds == 0.0
 
 
 def test_to_libpq_conninfo_translation():
