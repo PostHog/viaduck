@@ -424,6 +424,29 @@ class MemoryConfig:
     # runs hot, and a too-eager watermark would flap-restart into the exact
     # churn this feature exists to avoid.
     self_recycle_min_uptime_seconds: float = 3600.0
+    # EXPERIMENTAL source-connection recycle (the Leak-2 discriminating
+    # test, persistent_oom.md §The discriminating experiment): 0 disables;
+    # >0 closes and reopens the long-lived SOURCE catalog connection at a
+    # poll-cycle boundary with zero outstanding read futures, DETACH-first
+    # (Leak A lesson), interleaving flush submissions on any reopen retry.
+    # Verification is a multi-hour RSS SLOPE comparison, not an
+    # instantaneous before/after (allocator slack confounds the latter —
+    # see delivery-endgame C3 [R1-2]); viaduck_rss_bytes is exported every
+    # cycle so the slope is measurable from metrics alone.
+    source_conn_recycle_interval_seconds: float = 0.0
+    # Dest-connection age sweep (persistent_oom.md Leak-2): force-evict
+    # pooled destination connections older than this many seconds — the
+    # close frees accumulated per-connection engine state. Local evidence:
+    # first sweep freed ~0.96 GiB instantly; an N-scale measurement
+    # (N ∈ {1,5,10}) fit RSS(N) ≈ 0.92 + 0.062·N GiB (R²=0.87) — but that
+    # fit is a per-connection LEVEL at steady state, consistent with a
+    # fixed ~63 MiB per-connection cost alone; it does NOT by itself prove
+    # dest-scope for the prod leak rate. The falsifier (does a 60s sweep
+    # zero the slope?) is the next measurement. 600s default bounds the
+    # storm layer hypothesis-2 measured (~460MB/90s/contended connection)
+    # at ~10 min of accumulation per connection. 0 disables; the watermark
+    # self-recycle above stays the backstop for anything the sweep misses.
+    dest_conn_max_age_seconds: float = 600.0
 
     def __post_init__(self):
         if not 0.0 < self.self_recycle_rss_fraction < 1.0:
@@ -435,6 +458,19 @@ class MemoryConfig:
         if self.self_recycle_min_uptime_seconds < 0:
             raise ConfigError(
                 f"memory.self_recycle_min_uptime_seconds must be >= 0, got {self.self_recycle_min_uptime_seconds}"
+            )
+        if self.source_conn_recycle_interval_seconds < 0:
+            raise ConfigError(
+                f"memory.source_conn_recycle_interval_seconds must be >= 0, "
+                f"got {self.source_conn_recycle_interval_seconds}"
+            )
+        if self.dest_conn_max_age_seconds < 0:
+            raise ConfigError(f"memory.dest_conn_max_age_seconds must be >= 0, got {self.dest_conn_max_age_seconds}")
+        if 0 < self.dest_conn_max_age_seconds < 60:
+            raise ConfigError(
+                f"memory.dest_conn_max_age_seconds must be 0 (off) or >= 60 "
+                f"(below the poll/flush timescale the sweep becomes a connect-storm DoS), "
+                f"got {self.dest_conn_max_age_seconds}"
             )
 
 
@@ -1052,6 +1088,15 @@ def load(path: str | Path) -> ViaduckConfig:
         self_recycle_rss_fraction=float(memory_raw.get("self_recycle_rss_fraction", 0.75)),
         self_recycle_rss_gib=float(memory_raw.get("self_recycle_rss_gib", 0.0)),
         self_recycle_min_uptime_seconds=float(memory_raw.get("self_recycle_min_uptime_seconds", 3600.0)),
+        source_conn_recycle_interval_seconds=float(
+            os.environ.get(
+                "SOURCE_CONN_RECYCLE_INTERVAL_SECONDS",
+                memory_raw.get("source_conn_recycle_interval_seconds", 0.0),
+            )
+        ),
+        dest_conn_max_age_seconds=float(
+            os.environ.get("DEST_CONN_MAX_AGE_SECONDS", memory_raw.get("dest_conn_max_age_seconds", 600.0))
+        ),
     )
 
     web_raw = raw.get("web", {})

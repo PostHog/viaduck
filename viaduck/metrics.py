@@ -30,6 +30,32 @@ _self_recycles_total = Counter(
     "Clean watermark-triggered restarts (drain + exit 0 on RSS watermark)",
     ["pipeline"],
 )
+_source_conn_recycles_total = Counter(
+    "viaduck_source_conn_recycles_total",
+    "Source catalog connection close/reopen cycles (Leak-2 experiment; memory.source_conn_recycle_interval_seconds)",
+    ["pipeline"],
+)
+_dest_conn_sweeps_total = Counter(
+    "viaduck_dest_conn_sweeps_total",
+    "Destination-pool age sweeps performed (Leak-2 mitigation; memory.dest_conn_max_age_seconds)",
+    ["pipeline"],
+)
+_rss_bytes = Gauge(
+    "viaduck_rss_bytes",
+    "Process RSS (VmRSS) — the Leak-2 slope-verification signal; exported once per poll cycle",
+    ["pipeline"],
+)
+_arrow_pool_allocated_bytes = Gauge(
+    "viaduck_arrow_pool_allocated_bytes",
+    "pyarrow default memory pool live bytes (Leak-2: mimalloc lives outside "
+    "tracemalloc AND jemalloc — this is the only probe that sees it)",
+    ["pipeline"],
+)
+_arrow_pool_max_bytes = Gauge(
+    "viaduck_arrow_pool_max_bytes",
+    "pyarrow default memory pool peak live bytes",
+    ["pipeline"],
+)
 _cdc_read_seconds = Histogram(
     "viaduck_cdc_read_seconds",
     "Time to read CDC insertions from source",
@@ -442,6 +468,9 @@ _projection_cast_null_fallback_total = Counter(
 
 polls_total = _polls_total
 self_recycles_total = _self_recycles_total
+source_conn_recycles_total = _source_conn_recycles_total
+dest_conn_sweeps_total = _dest_conn_sweeps_total
+rss_bytes = _rss_bytes
 cdc_read_seconds = _cdc_read_seconds
 cdc_rows_read_total = _cdc_rows_read_total
 cdc_feed_query_seconds = _cdc_feed_query_seconds
@@ -527,7 +556,8 @@ def init(pipeline: str):
     global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id
     global cdc_feed_query_seconds, cdc_feed_files_total, cdc_feed_inlined_rows_total, cdc_feed_replans_total
     global read_clusters, read_pool_inflight
-    global self_recycles_total
+    global self_recycles_total, source_conn_recycles_total, rss_bytes
+    global dest_conn_sweeps_total, arrow_pool_allocated_bytes, arrow_pool_max_bytes
     global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
     global dest_time_lag_seconds, dest_flush_target_rows
@@ -601,6 +631,11 @@ def init(pipeline: str):
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
     self_recycles_total = _self_recycles_total.labels(pipeline=pipeline)
+    source_conn_recycles_total = _source_conn_recycles_total.labels(pipeline=pipeline)
+    dest_conn_sweeps_total = _dest_conn_sweeps_total.labels(pipeline=pipeline)
+    rss_bytes = _rss_bytes.labels(pipeline=pipeline)
+    arrow_pool_allocated_bytes = _arrow_pool_allocated_bytes.labels(pipeline=pipeline)
+    arrow_pool_max_bytes = _arrow_pool_max_bytes.labels(pipeline=pipeline)
     cdc_read_seconds = _cdc_read_seconds.labels(pipeline=pipeline)
     cdc_rows_read_total = _cdc_rows_read_total.labels(pipeline=pipeline)
     cdc_feed_query_seconds = _AutoPipelineLabels(_cdc_feed_query_seconds, pipeline)

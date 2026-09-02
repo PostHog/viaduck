@@ -54,6 +54,7 @@ import os
 import signal
 import threading
 import time
+import tracemalloc
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -911,6 +912,9 @@ def run(cfg: config.ViaduckConfig) -> None:
         metrics.set_destination_lifecycle(did, lifecycle.RETIRED, lifecycle.VALID_STATES)
 
     initial_snapshot_id = _initial_snapshot_id(cfg.routing.seed_mode, src_table)
+    # Experimental Leak-2 probe clock: the recycle interval elapses from
+    # process start (or last successful recycle).
+    _last_recycle_at = [time.monotonic()]
     static_assigned = [d for d in assigned_ids if d not in discovered_ids]
     state_mgr.initialize_destinations(static_assigned, initial_snapshot_id=initial_snapshot_id)
     disc_assigned = [d for d in assigned_ids if d in discovered_ids]
@@ -1036,8 +1040,53 @@ def run(cfg: config.ViaduckConfig) -> None:
         log.info("Received signal %s, shutting down", signal.Signals(signum).name)
         shutdown = True
 
+    # The SIGUSR1 handler does only flag work — logging + tracemalloc inside
+    # a signal handler can deadlock against a worker holding the logging
+    # lock (flush worker mid-emit). The poll loop performs the actual dump.
+    _tm_snap = [None]
+    _tm_dump_requested = [False]
+
+    def _tracemalloc_dump(signum, frame):
+        """SIGUSR1 → request a tracemalloc dump on the next poll cycle.
+
+        First call logs top 20 by size; subsequent calls log top 20 growth
+        deltas vs the previous dump. Never call traceback.format() here:
+        it reads source lines through linecache, and the linecache growth
+        then dominates the NEXT diff — a self-inflicted probe artifact
+        (sigh.txt finding #5). Raw filename:lineno attributes only.
+        """
+        _tm_dump_requested[0] = True
+
+    def _perform_tracemalloc_dump():
+        if not tracemalloc.is_tracing():
+            log.warning("tracemalloc not tracing; start with PYTHONTRACEMALLOC=25 or VIADUCK_TRACEMALLOC=1")
+            return
+
+        def _site(stat) -> str:
+            fr = stat.traceback[0]
+            return f"{fr.filename}:{fr.lineno}"
+
+        snap = tracemalloc.take_snapshot()
+        if _tm_snap[0] is None:
+            log.info("tracemalloc top 20 (absolute):")
+            for st in snap.statistics("lineno")[:20]:
+                log.info("  %s %s", _site(st), st.size)
+        else:
+            diffs = snap.compare_to(_tm_snap[0], "lineno")
+            log.info("tracemalloc top growth (vs prior SIGUSR1 snapshot):")
+            for d in diffs[:20]:
+                log.info("  %s %+d bytes (%+d blocks)", _site(d), d.size_diff, d.count_diff)
+        _tm_snap[0] = snap
+
+    # Probe is opt-in only (never default-on in prod — it measures the
+    # process it lives in). PYTHONTRACEMALLOC=25 at container start is the
+    # cleanest (hooks pre-import); VIADUCK_TRACEMALLOC=1 starts here for
+    # environments where the env var can't reach the interpreter.
+    if os.environ.get("VIADUCK_TRACEMALLOC") and not tracemalloc.is_tracing():
+        tracemalloc.start(25)
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGUSR1, _tracemalloc_dump)
 
     while not shutdown:
         try:
@@ -1047,6 +1096,12 @@ def run(cfg: config.ViaduckConfig) -> None:
             # re-added stale cursor before its first read.
             if reconciler is not None:
                 reconciler.apply(drift_watcher.latest())
+            # SIGUSR1-requested tracemalloc dump, performed on the poll
+            # thread (the handler only sets the flag — no logging/native
+            # work inside the signal handler).
+            if _tm_dump_requested[0]:
+                _tm_dump_requested[0] = False
+                _perform_tracemalloc_dump()
             # LIVE membership: the delivery manager's active set is the
             # single authority (statics + reconciler adds − reconciler
             # removes); with the reconciler off it equals the startup
@@ -1073,6 +1128,29 @@ def run(cfg: config.ViaduckConfig) -> None:
                         "Destination %s is active but was never seeded (skipped while non-active); "
                         "restart viaduck to seed it — until then it takes no reads",
                         d,
+                    )
+
+            # Experimental Leak-2 probe: maybe swap src_table BEFORE the
+            # cycle reads it (cycle boundary; read_pool_inflight == 0).
+            src_table = _maybe_recycle_source_conn(
+                src_table, cfg, delivery, source_columns, last_recycle_at=_last_recycle_at
+            )
+
+            # Dest-connection age sweep (persistent_oom.md Leak-2; config
+            # knob memory.dest_conn_max_age_seconds): closes pooled
+            # destination connections past their age — the close is what
+            # frees the engine-side accumulation. C3 falsified source-scope;
+            # this is the working mitigation. Budget-capped per cycle so a
+            # mass-eviction event can't storm the destination catalog.
+            _dest_max_age = cfg.memory.dest_conn_max_age_seconds
+            if _dest_max_age > 0:
+                aged_n = dest_pool.evict_older_than(_dest_max_age, budget=2)
+                if aged_n:
+                    metrics.dest_conn_sweeps_total.inc()
+                    log.info(
+                        "Dest-pool age sweep: %d connection(s) recycled (max age %.0fs)",
+                        aged_n,
+                        _dest_max_age,
                     )
 
             # ONE immutable registry snapshot per cycle: routing, config
@@ -1522,6 +1600,82 @@ def _apply_unit(
             delivery.advance_position(d, hi, epoch=epochs[d])
 
 
+def _maybe_recycle_source_conn(
+    src_table,
+    cfg: config.ViaduckConfig,
+    delivery,
+    source_columns,
+    *,
+    last_recycle_at: list,
+):
+    """EXPERIMENTAL Leak-2 probe (persistent_oom.md §The discriminating
+    experiment): close and reopen the long-lived SOURCE catalog connection
+    when memory.source_conn_recycle_interval_seconds has elapsed. Returns
+    the new table (the old one must not be referenced after the close).
+
+    Gates chosen over the endgame-C3 review: (1) cycle boundary — this
+    runs outside the read barrier while `read_pool_inflight == 0`, so no
+    unit read can hold the catalog connection (the invariant is call
+    placement, not a runtime check); (2) the close is DETACH-
+    first (pyducklake.Catalog.close — Leak A's fix); (3) a reopen failure
+    retries with bounded backoff while interleaving flush submissions —
+    flushing must never stall behind a source retry; (4) RSS slope is the
+    verification signal (viaduck_rss_bytes), not an instantaneous drop —
+    allocator slack confounds the latter.
+    """
+    interval = cfg.memory.source_conn_recycle_interval_seconds
+    if interval <= 0 or (time.monotonic() - last_recycle_at[0]) < interval:
+        return src_table
+    log.info("Source connection recycle: interval %.0fs elapsed; DETACH-first close", interval)
+    env = {"recycled": False}
+    try:
+        src_table.catalog.close()
+        env["recycled"] = True
+    except Exception:
+        # A failing close must not strand the old (still usable) table —
+        # same fallback discipline as pyducklake close (log and continue).
+        log.warning("Source connection recycle close failed; keeping the old connection", exc_info=True)
+    if env["recycled"]:
+        # Bounded async-reopen retry. connect() lives INSIDE the loop: a
+        # transient source-PG blip at recycle time must retry like any
+        # other failure, not raise into the fatal poll-cycle path. Until
+        # success, the `src_table` local still points at the closed
+        # connection — reads for this window are skipped next cycle, and
+        # flushing (the only ever-worse-than-today outcome) proceeds
+        # because `maybe_flush` is invoked per iteration.
+        deadline = time.monotonic() + 30.0
+        attempt = 0
+        catalog = None
+        while attempt < 6:
+            try:
+                if catalog is None:
+                    catalog = source.connect(cfg.source)
+                table = source.load_table(
+                    catalog, cfg.source.table, required_columns=(cfg.routing.field, *cfg.routing.key_columns)
+                )
+                log.info("Source connection recycled in %d attempt(s)", attempt + 1)
+                metrics.source_conn_recycles_total.inc()
+                last_recycle_at[0] = time.monotonic()
+                return table
+            except Exception as exc:
+                attempt += 1
+                if catalog is not None:
+                    try:
+                        catalog.close()
+                    except Exception:
+                        pass
+                    catalog = None
+                if time.monotonic() > deadline:
+                    raise ConfigError(f"source reopen failed after {attempt} attempts: {exc}") from exc
+                delivery.maybe_flush()
+                time.sleep(min(0.5 * attempt, 2.0))
+        # Attempt budget exhausted inside the deadline: raise, not return —
+        # the src_table local still points at the CLOSED connection and the
+        # next cycle would crash on it. ConfigError names the path for the
+        # crashloop forensics this probe otherwise obscures.
+        raise ConfigError(f"source reopen failed after {attempt} attempts (within deadline)")
+
+
 def _poll_cycle(
     src_table,
     delivery,
@@ -1580,6 +1734,21 @@ def _poll_cycle(
     cycle_t0 = time.monotonic()
     cycle_rows_read = 0
     cycle_units = 0
+    # Per-cycle RSS export: the Leak-2 verification is a multi-hour RSS
+    # SLOPE comparison, and this gauge is the measurement substrate
+    # (persistent_oom.md §The discriminating experiment). Best-effort —
+    # non-Linux dev runs have no VmRSS.
+    try:
+        metrics.rss_bytes.set(_read_rss_gib() * 2**30)
+        # Leak-2 attribution: pyarrow's default pool (mimalloc in the prod
+        # image) lives outside BOTH tracemalloc and any preloaded jemalloc —
+        # its live bytes vs RSS divergence separates arrow retention from
+        # every other native domain.
+        pool = pa.default_memory_pool()
+        metrics.arrow_pool_allocated_bytes.set(pool.bytes_allocated())
+        metrics.arrow_pool_max_bytes.set(pool.max_memory())
+    except Exception:
+        pass
     # Per-cycle gauge: re-zero BEFORE the branches so an all-paused or
     # empty cycle reads 0, not the last dispatching cycle's value (the
     # cursor-scatter trend reads this exactly during cap events).

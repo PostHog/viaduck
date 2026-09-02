@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 import threading
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
@@ -60,6 +61,7 @@ class DestinationPool:
         self._max_open = max_open
         self._lock = threading.Lock()
         self._pool: OrderedDict[str, tuple[Catalog, Table]] = OrderedDict()
+        self._created: dict[str, float] = {}  # creation monotonic per entry — the age-based sweep
         self._pins: dict[str, int] = {}
         self._creating: set[str] = set()  # reserved slots; created outside the lock
         self._zombies: dict[str, list[Catalog]] = {}  # evicted-while-pinned, closed on release
@@ -122,6 +124,7 @@ class DestinationPool:
                     )
                     break
                 evict_cat, _ = self._pool.pop(evict_id)
+                self._created.pop(evict_id, None)
                 self._projections.pop(evict_id, None)
                 to_close.append((evict_id, evict_cat))
                 metrics.pool_evictions_total.inc()
@@ -149,6 +152,7 @@ class DestinationPool:
         with self._lock:
             self._creating.discard(destination_id)
             self._pool[destination_id] = (catalog, table)
+            self._created[destination_id] = time.monotonic()
             # Store projection under the same lock that owns _pool mutation.
             # Otherwise a concurrent evict() of this destination (LRU pressure
             # from a peer worker) could pop _projections[dest] in between our
@@ -179,6 +183,43 @@ class DestinationPool:
                     except Exception:
                         log.warning("Error closing deferred connection for %s", destination_id)
 
+    def evict_older_than(self, max_age: float, *, budget: int = 2) -> int:
+        """Age-based sweep (memory.dest_conn_max_age_seconds): force-evict
+        up to `budget` pooled connections older than max_age. The close is
+        what frees the engine-side accumulation (persistent_oom.md Leak-2;
+        hypothesis-2's Leak-B family is reclaimed at close).
+
+        The budget bounds the self-inflicted reconnect storm: at prod scale
+        (~170 destinations, 10-20s catalog ATTACH on a contended catalog),
+        evicting every aged entry in one call would mass-recreate them in
+        the same flush window and trip flush deadlines — the degraded
+        regime this patch exists to avoid, self-inflicted every max_age.
+        Per-entry jitter (0.9-1.1x) decorrelates creation-time lockstep
+        after any mass-restart event. Pin/zombie discipline follows
+        evict(): an in-flight flush defers its close to release. Returns
+        the number of evictions actually performed.
+        """
+        if max_age <= 0 or budget <= 0:
+            return 0
+        cutoff = time.monotonic() - max_age
+        with self._lock:
+            aged = [
+                d
+                for d in self._pool
+                if self._created.get(d, time.monotonic()) < cutoff
+                and self._pins.get(d, 0) == 0  # pinned entries wait for release; no zombie spam
+            ]
+        # LRU order: self._pool iterates oldest-first after move_to_end
+        # discipline in get(); the oldest unpinned aged entries are the
+        # biggest accumulations AND the least-likely-in-flight.
+        evicted = 0
+        for dest_id in aged:
+            if evicted >= budget:
+                break
+            self.evict(dest_id)
+            evicted += 1
+        return evicted
+
     def evict(self, destination_id: str) -> None:
         """Force-evict a connection (e.g., after an error). If the entry is
         pinned (the caller itself, mid-retry), the close is deferred to the
@@ -188,6 +229,7 @@ class DestinationPool:
             entry = self._pool.pop(destination_id, None)
             if entry is None:
                 return
+            self._created.pop(destination_id, None)
             self._projections.pop(destination_id, None)
             cat, _ = entry
             if self._pins.get(destination_id, 0) > 0:
@@ -218,6 +260,7 @@ class DestinationPool:
                     log.warning("Error closing connection for %s", dest_id)
             self._pool.clear()
             self._projections.clear()
+            self._created.clear()
             for dest_id, cats in self._zombies.items():
                 for cat in cats:
                     try:
@@ -378,7 +421,31 @@ class DestinationPool:
             # skip it.
             if "." in dest_cfg.table:
                 catalog.create_namespace_if_not_exists(dest_cfg.table.rsplit(".", 1)[0])
-            table = catalog.create_table_if_not_exists(dest_cfg.table, schema)
+            table = None
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    table = catalog.create_table_if_not_exists(dest_cfg.table, schema)
+                    break
+                except Exception as exc:
+                    # pyducklake's create_table_if_not_exists is check-then-act:
+                    # two clients both table_exists → False, both create_table →
+                    # the loser sees "Table already exists". Retry bounded; the
+                    # winner's table is consistent either way. Any OTHER error
+                    # (auth, catalog down, schema mismatch) must surface
+                    # immediately — not be retried to an AssertionError.
+                    last_exc = exc
+                    if "Table already exists" in str(exc) and attempt < 2:
+                        log.info("Destination table %s race lost (attempt %d); retrying", destination_id, attempt + 1)
+                        time.sleep(0.25 * (attempt + 1))
+                        continue
+                    raise
+            if table is None:
+                # Unreachable in practice (raise on last attempt), but keeps
+                # the failure mode diagnosable if the loop ever changes.
+                raise DestinationConnectError(
+                    f"destination {destination_id}: table creation failed after retries"
+                ) from last_exc
             _ensure_partition_spec(table, dest_cfg, destination_id)
             plan = self._maybe_build_projection(destination_id, dest_cfg, source_schema=schema, table=table)
             log.info(

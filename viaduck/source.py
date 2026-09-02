@@ -13,6 +13,14 @@ import pyarrow as pa
 
 from viaduck import metrics
 
+# full_cdc read workaround (wedge-table-changes.md): the
+# ducklake_table_changes macro — a UNION ALL of two LEFT JOINs over the
+# insertions/deletions scans — deterministically stalls the DuckDB executor
+# against a large fast-advancing catalog (no runnable tasks, query never
+# completes; reproduces with threads=1). Each branch runs fine alone, so the
+# split path runs them as two separate statements and concats in Arrow.
+_CDC_SPLIT_READ = os.environ.get("VIADUCK_CDC_SPLIT_READ", "").lower() in ("1", "true", "yes")
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -243,7 +251,24 @@ def safe_catalog(name: str, uri: str, *, data_path: str, properties: dict[str, s
     from pyducklake import Catalog
 
     safe_props, ext_settings = split_extension_settings(properties)
-    catalog = Catalog(name, uri, data_path=data_path, properties=safe_props)
+    # Concurrent Catalog() on two processes racing CREATE TABLE on a shared
+    # destination catalog: the loser sees PG17 DuplicateObject/DuplicateTable
+    # (pg_type composite insert) even with the pyducklake CREATE TABLE inline
+    # IF NOT EXISTS — the same class state.py catches on the cursor table.
+    # Retry bounded; the winner's table exists either way.
+    catalog = None
+    for attempt in range(3):
+        try:
+            catalog = Catalog(name, uri, data_path=data_path, properties=safe_props)
+            break
+        except Exception as exc:
+            if "duplicate key value violates unique constraint" in str(exc) and attempt < 2:
+                log.info("Concurrent destination-catalog create-loser for %s (attempt %d); retrying", name, attempt + 1)
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise
+    else:
+        assert catalog is not None  # loop-exhausts with raise; static helper for typing
     try:
         apply_extension_settings_verified(catalog.connection, ext_settings, context=name)
     except Exception:
@@ -554,8 +579,11 @@ def read_cdc_changes(
     if columns is not None:
         kwargs["columns"] = columns
 
-    changeset: ChangeSet = table.table_changes(**kwargs)
-    result = changeset.to_arrow()
+    if _CDC_SPLIT_READ:
+        result = _read_cdc_changes_split(table, after_snapshot, end_snapshot, filter_expr=filter_expr, columns=columns)
+    else:
+        changeset: ChangeSet = table.table_changes(**kwargs)
+        result = changeset.to_arrow()
 
     duration = time.monotonic() - t0
     metrics.cdc_read_seconds.observe(duration)
@@ -571,6 +599,74 @@ def read_cdc_changes(
     )
 
     return result
+
+
+def _read_cdc_changes_split(
+    table: Table,
+    after_snapshot: int,
+    end_snapshot: int,
+    *,
+    filter_expr: str | None,
+    columns: tuple[str, ...] | list[str] | None,
+) -> pa.Table:
+    """full_cdc read as two separate statements + Arrow concat — see
+    _CDC_SPLIT_READ (the ducklake_table_changes executor stall workaround).
+
+    Semantics identical to the macro: branch 1 = inserts + update
+    postimages, branch 2 = deletes + update preimages, each change_type
+    labeled; the filter distributes over UNION ALL so it applies per branch;
+    concat preserves the macro's branch-then-branch row order. Proven against
+    the wedged catalog state: join branches individually return fine where
+    the union-of-joins plan never completes.
+    """
+    from pyducklake.catalog import escape_string_literal
+
+    catalog = table._catalog
+    namespace, table_name = table._identifier
+    esc_cat = escape_string_literal(catalog.name)
+    esc_ns = escape_string_literal(namespace)
+    esc_tbl = escape_string_literal(table_name)
+    start = after_snapshot + 1
+
+    if columns is not None:
+
+        def col_list(side: str) -> str:
+            return ", ".join(f'{side}."{c}"' for c in columns)
+
+    else:
+
+        def col_list(side: str) -> str:
+            return f"{side}.*"
+
+    branch1 = f"""
+SELECT i.snapshot_id AS snapshot_id, i.rowid AS rowid,
+       CASE WHEN d.rowid IS NOT NULL THEN 'update_postimage' ELSE 'insert' END AS change_type,
+       {col_list("i")}
+FROM ducklake_table_insertions('{esc_cat}', '{esc_ns}', '{esc_tbl}', {start}::BIGINT, {end_snapshot}::BIGINT) i
+LEFT JOIN ducklake_table_deletions('{esc_cat}', '{esc_ns}', '{esc_tbl}', {start}::BIGINT, {end_snapshot}::BIGINT) d
+  ON i.snapshot_id = d.snapshot_id AND i.rowid = d.rowid
+"""
+    branch2 = f"""
+SELECT d.snapshot_id AS snapshot_id, d.rowid AS rowid,
+       CASE WHEN i.rowid IS NOT NULL THEN 'update_preimage' ELSE 'delete' END AS change_type,
+       {col_list("d")}
+FROM ducklake_table_deletions('{esc_cat}', '{esc_ns}', '{esc_tbl}', {start}::BIGINT, {end_snapshot}::BIGINT) d
+LEFT JOIN ducklake_table_insertions('{esc_cat}', '{esc_ns}', '{esc_tbl}', {start}::BIGINT, {end_snapshot}::BIGINT) i
+  ON d.snapshot_id = i.snapshot_id AND d.rowid = i.rowid
+"""
+    parts = []
+    for sql in (branch1, branch2):
+        if filter_expr is not None:
+            # Post-join filter: the parenthesized branch is a single
+            # namespace, so the bare column references stay unambiguous.
+            sql = f"SELECT * FROM ({sql}) WHERE {filter_expr}"
+        arrow_obj = catalog.connection.execute(sql).arrow()
+        parts.append(arrow_obj if isinstance(arrow_obj, pa.Table) else arrow_obj.read_all())
+    if parts[1].num_rows == 0:
+        return parts[0]
+    if parts[0].num_rows == 0:
+        return parts[1]
+    return pa.concat_tables(parts)
 
 
 def strip_meta(table: pa.Table) -> pa.Table:
