@@ -489,6 +489,8 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_delivery_buffers_dropped_total` | Counter | destination | Buffers dropped on flush failure |
 | `viaduck_delivery_covered_replays_dropped_total` | Counter | destination | Buffered replay entries dropped at flush commit (already covered by it) |
 | `viaduck_retention_clamp_total` | Counter | destination, outcome | Retention-edge cursor clamps (`lost` = unrecoverable, alert; `at_risk` = pending flush) |
+| `viaduck_rss_bytes` | Gauge | — | Process RSS, exported once per poll cycle — the memory-safety signal |
+| `viaduck_dest_conn_sweeps_total` | Counter | — | Destination-pool age sweeps performed (the memory bound; see Deployment) |
 | `viaduck_cdc_routing_mutations_total` | Counter | — | Cross-tenant routing value changes |
 | `viaduck_cdc_conflicts_resolved_total` | Counter | — | Rowid-level conflicts resolved in Phase 2 |
 | `viaduck_cdc_tombstones_emitted_total` | Counter | — | Deletes surviving from insert+delete pairs (write cost of phantom healing; churn signal) |

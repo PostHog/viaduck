@@ -2124,9 +2124,9 @@ def log_startup_memory() -> None:
 def _read_rss_gib() -> float:
     """Process RSS in GiB from /proc; raises on platforms without procfs.
 
-    A missing VmRSS line raises too: on Linux with the watermark armed that
-    is abnormal, and returning 0.0 would silently disable the recycle while
-    looking like a successful read.
+    A missing VmRSS line raises too: on Linux that is abnormal, and
+    returning 0.0 would silently zero the per-cycle viaduck_rss_bytes gauge
+    while looking like a successful read.
     """
     for line in open("/proc/self/status"):
         if line.startswith("VmRSS:"):

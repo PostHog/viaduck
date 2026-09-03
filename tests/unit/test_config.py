@@ -1119,6 +1119,19 @@ def test_memory_dest_conn_max_age_rejects(tmp_path: Path, snippet: str):
         load(p)
 
 
+def test_memory_retired_self_recycle_keys_warn_not_refuse(tmp_path: Path, caplog):
+    """A stale chart carrying the removed self_recycle_* keys must load
+    (refusing would CrashLoop the rollout) but must WARN (silence would
+    let an operator believe the deleted backstop exists)."""
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(MINIMAL_YAML + "\nmemory:\n  self_recycle_enabled: true\n  self_recycle_rss_gib: 82\n")
+    with caplog.at_level("WARNING"):
+        cfg = load(p)
+    assert cfg.memory.dest_conn_max_age_seconds == 600.0  # defaults intact
+    warnings = [r for r in caplog.records if "self_recycle" in r.getMessage()]
+    assert len(warnings) == 2  # one per retired key present
+
+
 def test_to_libpq_conninfo_translation():
     """The chart's SOURCE_POSTGRES_URI is DuckDB-ATTACH format; psycopg
     rejects it verbatim (review F2 — the feed must translate like the

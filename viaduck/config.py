@@ -397,6 +397,15 @@ class PollConfig:
 
 @dataclass(frozen=True)
 class MemoryConfig:
+    # History signpost: the watermark self-recycle (drain + exit 0 at an RSS
+    # watermark) was REMOVED 2026-09-02 (PR #85) after the dest-connection
+    # age sweep held prod flat ~19h against a prior ~70-90min seppuku
+    # cadence. Do not re-add casually — the revert pointer is
+    # `git revert 1440dc3 f34627e`, and it exists only for a leak class that
+    # dodges the dest pool. The Duckling component keeps its own
+    # RSS-limit exit (single_destination.py _maybe_recycle): one connection
+    # per pod, nothing to sweep — the pod is the unit of recycling there.
+    #
     # EXPERIMENTAL source-connection recycle (the Leak-2 discriminating
     # test, persistent_oom.md §The discriminating experiment): 0 disables;
     # >0 closes and reopens the long-lived SOURCE catalog connection at a
@@ -406,6 +415,8 @@ class MemoryConfig:
     # instantaneous before/after (allocator slack confounds the latter —
     # see delivery-endgame C3 [R1-2]); viaduck_rss_bytes is exported every
     # cycle so the slope is measurable from metrics alone.
+    # FALSIFIED 2026-09-02 (RSS slope unaffected, twice — persistent_oom.md);
+    # kept as a default-off bisection probe for future leak classes.
     source_conn_recycle_interval_seconds: float = 0.0
     # Dest-connection age sweep (persistent_oom.md Leak-2): force-evict
     # pooled destination connections older than this many seconds — the
@@ -1044,7 +1055,24 @@ def load(path: str | Path) -> ViaduckConfig:
     server_raw = raw.get("server", {})
     server = ServerConfig(port=server_raw.get("port", 8000))
 
-    memory_raw = raw.get("memory", {})
+    memory_raw = raw.get("memory", {}) or {}
+    # Retired with the watermark self-recycle (PR #85, 2026-09-02): WARN-
+    # ignored, never refused — prod's chart still carries these keys, so a
+    # refusal would CrashLoop the rollout, but silence would let an operator
+    # believe the 82GiB preemption bound exists when it doesn't. The dest-
+    # connection age sweep (dest_conn_max_age_seconds) is the bound now.
+    for retired in (
+        "self_recycle_enabled",
+        "self_recycle_rss_fraction",
+        "self_recycle_rss_gib",
+        "self_recycle_min_uptime_seconds",
+    ):
+        if retired in memory_raw:
+            log.warning(
+                "config: memory.%s was removed with the watermark self-recycle (PR #85); "
+                "the dest-connection age sweep is the memory bound now; ignoring it",
+                retired,
+            )
     memory = MemoryConfig(
         source_conn_recycle_interval_seconds=float(
             os.environ.get(

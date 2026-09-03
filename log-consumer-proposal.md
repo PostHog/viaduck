@@ -66,7 +66,12 @@ production log, 2026-08-15, viaduck 0.0.70.)
 | Poll cycles timeboxed | 1125/1125 (100%), 8 groups deferred each |
 | Flush health | 100% clean; team-2 p50 15.5s, max 60.6s |
 | Destination append cliff (team-2) | 13.2s @30–60k rows, 56.5s @60–90k, 164.4s @90–120k (240s deadline) |
-| Memory | ~2.9 GiB/h untracked native residual; bounded by the dest-connection age sweep |
+| Memory | ~2.9 GiB/h untracked native residual; 82 GiB self-recycle watermark |
+
+*(Erratum, 2026-09-02: the watermark self-recycle was removed in PR #85
+after the dest-connection age sweep (#84) held prod flat for ~19h; the
+sweep is the bound now. The dated rows above/below record the
+2026-08-15 state verbatim.)*
 
 Structural findings:
 
@@ -237,8 +242,9 @@ whether anyone does.
 
 - **Reliable**: at-least-once (unchanged contract). Recovery state is the
   durable per-destination cursor. In-flight state may be volatile:
-  crashes are rare (the RSS residual is bounded by the dest-connection
-  age sweep), and §6.5 prices the rewind honestly.
+  crashes are rare (clean self-recycle drain for the known RSS residual;
+  that drain path was removed 2026-09-02 in PR #85 — the dest-connection
+  age sweep is the bound now), and §6.5 prices the rewind honestly.
 - **Performant**: a consumer's pace is bounded only by its destination's
   append capacity, never by peers.
 - **Simple**: delete more than we add; any mechanism that arbitrates
