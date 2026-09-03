@@ -167,7 +167,7 @@ class FeedReader:
                 # prepare_threshold=None: psycopg3 otherwise auto-promotes
                 # to server-side prepared statements after 5 executions —
                 # fatal under pgbouncer transaction pooling (per-destination
-                # duckling fleet runs behind it).
+                # single-destination fleet runs behind it).
                 prepare_threshold=None,
                 # idle_in_transaction_session_timeout: a wedged REPEATABLE
                 # READ snapshot pins the catalog's vacuum horizon; at N

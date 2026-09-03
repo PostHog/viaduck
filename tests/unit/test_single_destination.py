@@ -1,4 +1,4 @@
-"""Unit tests for viaduck.single_destination — the per-destination duckling.
+"""Unit tests for viaduck.single_destination — the single-destination viaduck.
 
 The wrapper is the only layer that can silently lose data (the read core is
 pinned by the feed parity suite), so the cursor/ordering/crash semantics
@@ -15,16 +15,16 @@ import pyarrow as pa
 import pytest
 
 from viaduck import single_destination as sd
-from viaduck.single_destination import Duckling, DucklingConfig, FatalDucklingError
+from viaduck.single_destination import FatalSingleDestinationError, SingleDestinationConfig, SingleDestinationViaduck
 
 
-def _cfg(**kw) -> DucklingConfig:
+def _cfg(**kw) -> SingleDestinationConfig:
     base = dict(
         source_pg_uri="postgres:host=src port=5432 dbname=megaduck user=m password=pw",
         source_catalog="lake",
         source_data_path="s3://b/src",
         source_table="main.events_nrt",
-        dest_pg_uri="postgres:host=dst port=5432 dbname=duckling user=d password=pw",
+        dest_pg_uri="postgres:host=dst port=5432 dbname=dest user=d password=pw",
         dest_catalog="dest",
         dest_data_path="s3://b/dst",
         dest_table="posthog.events",
@@ -33,13 +33,13 @@ def _cfg(**kw) -> DucklingConfig:
         destination_id="org-abc-team-2",
     )
     base.update(kw)
-    return DucklingConfig(**base)
+    return SingleDestinationConfig(**base)
 
 
-def _duckling(cfg=None, cursor=100) -> Duckling:
-    """A Duckling without boot(): all collaborators mocked. Catalog-side
+def _single_destination(cfg=None, cursor=100) -> SingleDestinationViaduck:
+    """A SingleDestinationViaduck without boot(): all collaborators mocked. Catalog-side
     queries route through feed._pg(); cursor writes through _cursor_conn."""
-    d = Duckling.__new__(Duckling)
+    d = SingleDestinationViaduck.__new__(SingleDestinationViaduck)
     d.cfg = cfg or _cfg()
     d._stop = threading.Event()
     d._last_poll_ok = time.monotonic()
@@ -64,8 +64,8 @@ def _duckling(cfg=None, cursor=100) -> Duckling:
     return d
 
 
-def _poll_ready(d: Duckling, rows: pa.Table, head=500, hi=500):
-    """Wire a duckling for poll_once: assertions no-op, plan/read mocked."""
+def _poll_ready(d: SingleDestinationViaduck, rows: pa.Table, head=500, hi=500):
+    """Wire a single-destination viaduck for poll_once: assertions no-op, plan/read mocked."""
     d._assert_no_deletes = MagicMock()
     d._check_inline_stores = MagicMock()
     d._clamp_to_retention = MagicMock()
@@ -85,7 +85,7 @@ class TestCursorOrdering:
         monkeypatch.setattr(sd.time, "sleep", lambda *_: None)
 
     def test_cursor_strictly_after_commit(self):
-        d = _duckling()
+        d = _single_destination()
         rows = pa.table({"team_id": [2, 3, 2], "event": ["a", "b", "c"]})
         _poll_ready(d, rows)
         parent = MagicMock()
@@ -101,17 +101,17 @@ class TestCursorOrdering:
         """The silent-corruption guard's shape pin: the append MUST be
         INSERT BY NAME (positional silently swaps same-typed columns on
         reordered dest tables)."""
-        d = _duckling()
+        d = _single_destination()
         d._append(pa.table({"team_id": [2]}))
         appends = [c for c in d.dst_catalog.connection.execute.call_args_list if "INSERT INTO" in str(c)]
         assert len(appends) == 1 and "BY NAME" in appends[0].args[0]
 
     def test_append_failure_never_advances_cursor_and_is_fatal(self):
-        d = _duckling()
+        d = _single_destination()
         rows = pa.table({"team_id": [2], "event": ["a"]})
         _poll_ready(d, rows)
         d.dst_catalog.connection.execute.side_effect = RuntimeError("catalog down")
-        with pytest.raises(FatalDucklingError, match="append failed after 3 attempts"):
+        with pytest.raises(FatalSingleDestinationError, match="append failed after 3 attempts"):
             d.poll_once()
         assert d._cursor == 100
         assert not any("ON CONFLICT" in str(c) for c in d._cursor_conn.execute.call_args_list)
@@ -122,7 +122,7 @@ class TestCursorOrdering:
     def test_empty_range_still_advances(self):
         """Foreign-commit polls: hi is a valid coverage boundary; idling
         forever would burn the retention window."""
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": pa.array([], type=pa.int64()), "event": pa.array([], type=pa.string())}))
         d.poll_once()
         assert d._cursor == 500
@@ -131,15 +131,15 @@ class TestCursorOrdering:
     def test_empty_range_rechecks_table_identity(self):
         """A silent drop+recreate is invisible to the feed's cached table_id
         (its plans come back empty forever) — the empty path re-resolves."""
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": pa.array([], type=pa.int64()), "event": pa.array([], type=pa.string())}))
         d._resolve_table_id = MagicMock(return_value=17)
-        with pytest.raises(FatalDucklingError, match="table_id changed"):
+        with pytest.raises(FatalSingleDestinationError, match="table_id changed"):
             d.poll_once()
         assert d._cursor == 100  # frozen
 
     def test_idle_when_at_head(self):
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": [2]}), head=100)
         d.poll_once()
         d.feed.plan_unit.assert_not_called()
@@ -148,24 +148,24 @@ class TestCursorOrdering:
 
 class TestDropCreate:
     def test_table_id_change_on_read_error_freezes_and_pages(self):
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": [2]}))
         d.feed.read.side_effect = RuntimeError("catalog read exploded")
         d._resolve_table_id = MagicMock(return_value=17)
-        with pytest.raises(FatalDucklingError, match="table_id changed 16 → 17"):
+        with pytest.raises(FatalSingleDestinationError, match="table_id changed 16 → 17"):
             d.poll_once()
         assert d._cursor == 100
 
     def test_table_dropped_pages(self):
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": [2]}))
         d.feed.read.side_effect = RuntimeError("boom")
         d._resolve_table_id = MagicMock(side_effect=sd.ConfigError("not found"))
-        with pytest.raises(FatalDucklingError, match="source table dropped"):
+        with pytest.raises(FatalSingleDestinationError, match="source table dropped"):
             d.poll_once()
 
     def test_transient_read_error_reraises(self):
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": [2]}))
         d.feed.read.side_effect = RuntimeError("s3 flaked")
         d._resolve_table_id = MagicMock(return_value=16)  # unchanged → transient
@@ -175,17 +175,17 @@ class TestDropCreate:
 
     def test_cursor_provenance_mismatch_at_boot(self):
         """Drop+recreate WHILE DOWN: the stored table_id is the only evidence."""
-        d = _duckling()
+        d = _single_destination()
         d.table_id = 99  # resolved fresh at boot
         d._cursor_pg().execute.return_value.fetchone.return_value = (100, 16)  # stored against 16
-        with pytest.raises(FatalDucklingError, match="table_id=16"):
+        with pytest.raises(FatalSingleDestinationError, match="table_id=16"):
             d._cursor_load()
 
     def test_cursor_provenance_backfilled_when_null(self):
         """The fleet-transplant path: a pre-existing row with NULL provenance
         gets stamped at boot — otherwise a drop+recreate-while-down is
         undetectable (the witness is keyed to the NEW table_id)."""
-        d = _duckling()
+        d = _single_destination()
         d._cursor_pg().execute.return_value.fetchone.return_value = (100, None)
         d._cursor_load()
         assert d._cursor == 100
@@ -195,10 +195,10 @@ class TestDropCreate:
 
 class TestClampAssertionOrdering:
     def test_clamp_runs_before_assertions(self):
-        """A reorder regression crash-loops the duckling inside the retention
+        """A reorder regression crash-loops the single-destination viaduck inside the retention
         window (a delete whose evidence outlives its snapshots must not veto
         the clamp's loud advance)."""
-        d = _duckling(cursor=100)
+        d = _single_destination(cursor=100)
         calls = []
         d._clamp_to_retention = MagicMock(side_effect=lambda: calls.append("clamp"))
         d._assert_no_deletes = MagicMock(side_effect=lambda: calls.append("assert"))
@@ -212,7 +212,7 @@ class TestFeedErrorClassification:
     def test_floor_feederror_is_transient(self):
         """The floor guard's FeedError re-raises as-is: next poll's clamp
         advances past it. Making it fatal would crash-loop in the window."""
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": [2]}))
         d.feed.read.side_effect = sd.feed.FeedError("cursor 5 is below the retained snapshot floor 9")
         with pytest.raises(sd.feed.FeedError, match="retained snapshot floor"):
@@ -221,15 +221,15 @@ class TestFeedErrorClassification:
     def test_other_feederror_is_fatal(self):
         """A real refusal (non-additive schema, encryption) must crash —
         transient retry is a silent stall with a growing lag gauge."""
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": [2]}))
         d.feed.read.side_effect = sd.feed.FeedError("non-additive schema change (rename/drop) is unsupported")
-        with pytest.raises(FatalDucklingError, match="non-additive"):
+        with pytest.raises(FatalSingleDestinationError, match="non-additive"):
             d.poll_once()
 
     def test_missing_team_column_is_fatal(self):
-        d = _duckling()
-        with pytest.raises(FatalDucklingError, match="schema contract"):
+        d = _single_destination()
+        with pytest.raises(FatalSingleDestinationError, match="schema contract"):
             d._arrow_filter(pa.table({"other": [1]}))
 
 
@@ -237,9 +237,9 @@ class TestHeadRegression:
     def test_head_below_cursor_is_fatal(self):
         """A source restore/rebuild regresses head under the cursor: the
         ONE alarm (lag) must not read 0 while wedged — crash loudly."""
-        d = _duckling(cursor=100)
+        d = _single_destination(cursor=100)
         _poll_ready(d, pa.table({"team_id": [2]}), head=50)
-        with pytest.raises(FatalDucklingError, match="regressed below cursor"):
+        with pytest.raises(FatalSingleDestinationError, match="regressed below cursor"):
             d.poll_once()
         assert d._cursor == 100
 
@@ -250,7 +250,7 @@ class TestHeadRegression:
 
 
 class TestRunSupervision:
-    def _runnable(self, d: Duckling):
+    def _runnable(self, d: SingleDestinationViaduck):
         d.boot = MagicMock()
         d._maybe_recycle = MagicMock()
         with patch.object(sd, "_start_health_server", return_value=MagicMock()):
@@ -259,15 +259,15 @@ class TestRunSupervision:
             yield d
 
     def test_fatal_crashes(self):
-        d = _duckling()
+        d = _single_destination()
         for d in self._runnable(d):
-            d.poll_once = MagicMock(side_effect=FatalDucklingError("assertion fired"))
-            with pytest.raises(FatalDucklingError):
+            d.poll_once = MagicMock(side_effect=FatalSingleDestinationError("assertion fired"))
+            with pytest.raises(FatalSingleDestinationError):
                 d.run()
 
     def test_transient_retries_next_poll(self, monkeypatch):
         monkeypatch.setattr(sd.time, "sleep", lambda *_: None)  # backoff budget
-        d = _duckling(_cfg(poll_interval_s=0.01))
+        d = _single_destination(_cfg(poll_interval_s=0.01))
         for d in self._runnable(d):
             calls = [0]
 
@@ -286,7 +286,7 @@ class TestRunSupervision:
         interval synchronizes the assertion burst after any fleet-wide
         restart). Pin the wait's shape deterministically."""
         monkeypatch.setattr(sd.random, "random", lambda: 0.5)
-        d = _duckling(_cfg(poll_interval_s=10.0))
+        d = _single_destination(_cfg(poll_interval_s=10.0))
         for d in self._runnable(d):
             seen = []
 
@@ -306,7 +306,7 @@ class TestRunSupervision:
 
 class TestRetentionClamp:
     def test_below_floor_advances_loudly_with_loss_note(self):
-        d = _duckling(cursor=100)
+        d = _single_destination(cursor=100)
         d.feed._pg.return_value.execute.return_value.fetchone.return_value = (600,)  # MIN(snapshot_id)
         d._clamp_to_retention()
         assert d._cursor == 599
@@ -315,14 +315,14 @@ class TestRetentionClamp:
         assert "100" in str(update) and "599" in str(update)
 
     def test_at_floor_is_quiet(self):
-        d = _duckling(cursor=599)
+        d = _single_destination(cursor=599)
         d.feed._pg.return_value.execute.return_value.fetchone.return_value = (600,)
         d._clamp_to_retention()
         assert d._cursor == 599
         assert not any("last_error" in str(c) for c in d._cursor_conn.execute.call_args_list)
 
     def test_empty_snapshot_table_is_noop(self):
-        d = _duckling(cursor=0)
+        d = _single_destination(cursor=0)
         d.feed._pg.return_value.execute.return_value.fetchone.return_value = (None,)
         d._clamp_to_retention()
         assert d._cursor == 0
@@ -339,7 +339,7 @@ class TestAimd:
         monkeypatch.setattr(sd.time, "sleep", lambda *_: None)
 
     def test_flush_failure_halves_budget(self):
-        d = _duckling()
+        d = _single_destination()
         d.dst_catalog.connection.execute.side_effect = [RuntimeError("occ contention"), None]
         d._append(pa.table({"team_id": [2]}))
         # halve on the failed attempt (50000 → 25000), then +10% recovery on
@@ -347,13 +347,13 @@ class TestAimd:
         assert d._budget_rows == 27_500
 
     def test_slow_flush_halves(self):
-        d = _duckling()
+        d = _single_destination()
         d.cfg = _cfg(slow_flush_seconds=0.0)  # every flush is "slow"
         d._append(pa.table({"team_id": [2]}))
         assert d._budget_rows == 25_000
 
     def test_floor_and_recovery(self):
-        d = _duckling()
+        d = _single_destination()
         d._budget_rows = d.cfg.aimd_floor_rows
         d._aimd_halve("test")
         assert d._budget_rows == d.cfg.aimd_floor_rows
@@ -375,13 +375,13 @@ class TestCursorWrites:
     def test_cursor_advance_has_monotonic_guard(self):
         """A maxSurge pair sharing the row must never regress it (fleet
         semantics; the guard is what makes a racing advance a no-op)."""
-        d = _duckling()
+        d = _single_destination()
         d._cursor_advance(500, 3)
         sql = d._cursor_conn.execute.call_args.args[0]
         assert "WHERE viaduck.viaduck_state.last_snapshot_id <= EXCLUDED.last_snapshot_id" in sql
 
     def test_retry_then_success(self):
-        d = _duckling()
+        d = _single_destination()
         import psycopg
 
         d._cursor_conn.execute.side_effect = [psycopg.OperationalError("pg blip"), None]
@@ -390,11 +390,11 @@ class TestCursorWrites:
         assert d._cursor_conn.execute.call_count == 2
 
     def test_exhaustion_is_fatal(self):
-        d = _duckling()
+        d = _single_destination()
         import psycopg
 
         d._cursor_conn.execute.side_effect = psycopg.OperationalError("pg down")
-        with pytest.raises(FatalDucklingError, match="cursor update failed"):
+        with pytest.raises(FatalSingleDestinationError, match="cursor update failed"):
             d._cursor_advance(500, 10)
         assert d._cursor == 100  # in-memory cursor did not move
 
@@ -406,7 +406,7 @@ class TestCursorWrites:
 
 class TestArrowFilter:
     def test_filters_to_team(self):
-        d = _duckling()
+        d = _single_destination()
         rows = pa.table({"team_id": [2, 3, 2], "event": ["a", "b", "c"]})
         out = d._arrow_filter(rows)
         assert out.num_rows == 2
@@ -416,18 +416,18 @@ class TestArrowFilter:
         """poll_once must NOT pass a filter to the feed: parquet zone-maps
         can lie on add_files-registered files, and SQL pushdown under-
         delivery is invisible. The Arrow layer is the whole filter."""
-        d = _duckling()
+        d = _single_destination()
         _poll_ready(d, pa.table({"team_id": [2]}))
         d.poll_once()
         assert "filter_expr" not in d.feed.read.call_args.kwargs or d.feed.read.call_args.kwargs["filter_expr"] is None
 
     def test_missing_team_column_crashes_loudly(self):
-        d = _duckling()
+        d = _single_destination()
         with pytest.raises(Exception):
             d._arrow_filter(pa.table({"other": [1]}))
 
     def test_string_team_value(self):
-        d = _duckling(_cfg(team_field="team", team_value="blue"))
+        d = _single_destination(_cfg(team_field="team", team_value="blue"))
         d._team_array = pa.array(["blue"], type=pa.string())
         rows = pa.table({"team": ["blue", "red"]})
         assert d._arrow_filter(rows).num_rows == 1
@@ -447,7 +447,7 @@ class TestAssertions:
         """The accept path's linchpin: every assertion query is scoped to
         UN-CROSSED history (snapshot > cursor). Dropping a scope predicate
         reintroduces the no-accept-path trap (round-3 C1)."""
-        d = _duckling(cursor=100)
+        d = _single_destination(cursor=100)
         pg = self._pg_with_counts({}, regclass=None)
         d.feed._pg.return_value = pg
         d._assert_no_deletes()
@@ -460,7 +460,7 @@ class TestAssertions:
 
     def test_delete_below_cursor_does_not_fire(self):
         """An adjudicated (pre-cursor) delete: all checks stay quiet."""
-        d = _duckling(cursor=100)
+        d = _single_destination(cursor=100)
 
         pg = MagicMock()
 
@@ -485,7 +485,7 @@ class TestAssertions:
     def test_inlined_delete_store_scoped_to_cursor(self):
         """The store-probe leg carries the same cursor scope — dropping that
         predicate reintroduces the no-accept-path trap for inlined deletes."""
-        d = _duckling(cursor=100)
+        d = _single_destination(cursor=100)
         pg = self._pg_with_counts({"ducklake_inlined_delete_16": 0}, regclass="lake_meta.ducklake_inlined_delete_16")
         d.feed._pg.return_value = pg
         d._assert_no_deletes()
@@ -516,24 +516,24 @@ class TestAssertions:
         return pg
 
     def test_delete_file_appearance_crashes(self):
-        d = _duckling()
+        d = _single_destination()
         d.feed._pg.return_value = self._pg_with_counts({"ducklake_delete_file": 1})
-        with pytest.raises(FatalDucklingError, match="append-only contract violated"):
+        with pytest.raises(FatalSingleDestinationError, match="append-only contract violated"):
             d._assert_no_deletes()
 
     def test_end_snapshot_appearance_crashes(self):
-        d = _duckling()
+        d = _single_destination()
         d.feed._pg.return_value = self._pg_with_counts({"ducklake_data_file": 3})
-        with pytest.raises(FatalDucklingError, match="end_snapshot"):
+        with pytest.raises(FatalSingleDestinationError, match="end_snapshot"):
             d._assert_no_deletes()
 
     def test_witness_regex_scoped_to_table_and_vocabulary(self):
         """The fork's exact delete vocabulary: deleted_from_table /
         inlined_delete / rewrite_delete / dropped_table (verified against
         ducklake_transaction.cpp AddChangeInfo)."""
-        d = _duckling()
+        d = _single_destination()
         d.feed._pg.return_value = self._pg_with_counts({"ducklake_snapshot_changes": 1})
-        with pytest.raises(FatalDucklingError, match="delete/drop activity"):
+        with pytest.raises(FatalSingleDestinationError, match="delete/drop activity"):
             d._assert_no_deletes()
         witness = next(c for c in d.feed._pg.return_value.execute.call_args_list if "snapshot_changes" in str(c))
         pattern = witness.args[1][1]  # params: (cursor, pattern)
@@ -542,26 +542,26 @@ class TestAssertions:
         assert ":16" in pattern
 
     def test_inlined_delete_table_nonempty_crashes(self):
-        d = _duckling()
+        d = _single_destination()
         d.feed._pg.return_value = self._pg_with_counts(
             {"ducklake_inlined_delete_16": 2}, regclass="lake_meta.ducklake_inlined_delete_16"
         )
-        with pytest.raises(FatalDucklingError, match="inlined deletes"):
+        with pytest.raises(FatalSingleDestinationError, match="inlined deletes"):
             d._assert_no_deletes()
 
     def test_inlined_delete_table_absent_passes(self):
-        d = _duckling()
+        d = _single_destination()
         d.feed._pg.return_value = self._pg_with_counts({}, regclass=None)
         d._assert_no_deletes()
 
     def test_inline_rows_page_but_continue(self):
         from prometheus_client import REGISTRY
 
-        d = _duckling()
+        d = _single_destination()
         d.feed._pg.return_value = self._pg_with_counts(
             {"ducklake_inlined_data_16_1": 2}, stores=["ducklake_inlined_data_16_1"]
         )
-        metric = "viaduck_duckling_assertion_failures_total"
+        metric = "viaduck_single_destination_assertion_failures_total"
         before = REGISTRY.get_sample_value(metric, {"check": "inline_rows_present"}) or 0
         d._check_inline_stores()  # no raise — the feed serves inline correctly
         after = REGISTRY.get_sample_value(metric, {"check": "inline_rows_present"})
@@ -570,7 +570,7 @@ class TestAssertions:
     def test_inline_registry_alone_is_quiet(self):
         """Registry membership is normal (stores register at CREATE TABLE
         even with row_limit=0); only ROWS in stores are drift."""
-        d = _duckling()
+        d = _single_destination()
         d.feed._pg.return_value = self._pg_with_counts({}, stores=["ducklake_inlined_data_16_1"])
         d._check_inline_stores()
 
@@ -596,15 +596,15 @@ class TestConfig:
             "DESTINATION_ID": "org-abc-team-2",
         }.items():
             monkeypatch.setenv(k, v)
-        cfg = DucklingConfig.from_env()
+        cfg = SingleDestinationConfig.from_env()
         assert cfg.cursor_pg_uri == cfg.source_pg_uri  # colocated default
-        assert cfg.instance_id == "duckling"  # STABLE — never a pod name
+        assert cfg.instance_id == "single-destination"  # STABLE — never a pod name
         assert cfg.unit_max_rows == 50_000
 
     def test_unsafe_identifier_refused(self, monkeypatch):
         monkeypatch.setenv("SOURCE_TABLE", "events; DROP TABLE x")
         with pytest.raises(sd.ConfigError):
-            DucklingConfig.from_env()
+            SingleDestinationConfig.from_env()
 
     def test_dest_managed_columns_parsed(self, monkeypatch):
         monkeypatch.setenv("DEST_MANAGED_COLUMNS", "_inserted_at, _raw")
@@ -623,7 +623,7 @@ class TestConfig:
             "DESTINATION_ID": "d",
         }.items():
             monkeypatch.setenv(k, v)
-        assert DucklingConfig.from_env().dest_managed_columns == frozenset({"_inserted_at", "_raw"})
+        assert SingleDestinationConfig.from_env().dest_managed_columns == frozenset({"_inserted_at", "_raw"})
 
 
 # ---------------------------------------------------------------------------
@@ -631,7 +631,7 @@ class TestConfig:
 # ---------------------------------------------------------------------------
 
 
-def _boot_mocks(d: Duckling, cursor_row=(100, 16), head=900, winner_row=None):
+def _boot_mocks(d: SingleDestinationViaduck, cursor_row=(100, 16), head=900, winner_row=None):
     """Patch catalog/feed/psycopg collaborators for boot(); returns mocks.
 
     winner_row: when cursor_row is None (first boot), the re-SELECT after
@@ -688,7 +688,7 @@ class TestBoot:
         """The F2 pin at this layer: ATTACH-format secret in, libpq conninfo
         to psycopg — or first boot crashes."""
         cfg = _cfg()
-        d = Duckling(cfg)
+        d = SingleDestinationViaduck(cfg)
         src_table, cursor_pg, catalog_pg, catalog = _boot_mocks(d)
 
         with (
@@ -709,7 +709,7 @@ class TestBoot:
 
     def test_cursor_initialized_at_head_when_absent(self):
         cfg = _cfg()
-        d = Duckling(cfg)
+        d = SingleDestinationViaduck(cfg)
         src_table, cursor_pg, catalog_pg, catalog = _boot_mocks(d, cursor_row=None)
 
         with (
@@ -732,7 +732,7 @@ class TestBoot:
         cursor — adopting it would silently skip the between range. The
         re-SELECT pins adoption."""
         cfg = _cfg()
-        d = Duckling(cfg)
+        d = SingleDestinationViaduck(cfg)
         src_table, cursor_pg, catalog_pg, catalog = _boot_mocks(d, cursor_row=None, winner_row=(850,))
 
         with (
@@ -749,7 +749,7 @@ class TestBoot:
 
     def test_dest_column_reconciliation_adds_missing(self):
         cfg = _cfg()
-        d = Duckling(cfg)
+        d = SingleDestinationViaduck(cfg)
         src_table, cursor_pg, catalog_pg, catalog = _boot_mocks(d)
         catalog.create_table_if_not_exists.return_value.schema.column_names.return_value = ("team_id",)
 
@@ -768,7 +768,7 @@ class TestBoot:
 
     def test_dest_extra_column_wedges_but_managed_columns_pass(self):
         cfg = _cfg()
-        d = Duckling(cfg)
+        d = SingleDestinationViaduck(cfg)
         src_table, cursor_pg, catalog_pg, catalog = _boot_mocks(d)
         catalog.create_table_if_not_exists.return_value.schema.column_names.return_value = (
             "team_id",
@@ -785,12 +785,12 @@ class TestBoot:
         ):
             fr_cls.return_value._meta_schema = "lake_meta"
             fr_cls.return_value._pg.return_value = catalog_pg
-            with pytest.raises(FatalDucklingError, match="mystery"):
+            with pytest.raises(FatalSingleDestinationError, match="mystery"):
                 d.boot()
 
     def test_integer_team_value_validated_at_boot(self):
         cfg = _cfg(team_value="not-an-int")
-        d = Duckling(cfg)
+        d = SingleDestinationViaduck(cfg)
         src_table, cursor_pg, catalog_pg, catalog = _boot_mocks(d)
 
         with (
@@ -801,7 +801,7 @@ class TestBoot:
         ):
             fr_cls.return_value._meta_schema = "lake_meta"
             fr_cls.return_value._pg.return_value = catalog_pg
-            with pytest.raises(FatalDucklingError, match="not an integer"):
+            with pytest.raises(FatalSingleDestinationError, match="not an integer"):
                 d.boot()
 
 
@@ -812,11 +812,11 @@ class TestBoot:
 
 class TestHealth:
     def test_healthy_after_recent_poll(self):
-        d = _duckling()
+        d = _single_destination()
         assert d.is_healthy()
 
     def test_stale_after_threshold(self):
-        d = _duckling()
+        d = _single_destination()
         d._last_poll_ok = time.monotonic() - 400  # 300s floor
         assert not d.is_healthy()
 
@@ -825,10 +825,10 @@ class TestMetricsMove:
     def test_lag_gauge_and_delivered_counter(self):
         from prometheus_client import REGISTRY
 
-        d = _duckling()
+        d = _single_destination()
         rows = pa.table({"team_id": [2, 3], "event": ["a", "b"]})
         _poll_ready(d, rows)
-        before = REGISTRY.get_sample_value("viaduck_duckling_rows_delivered_total") or 0
+        before = REGISTRY.get_sample_value("viaduck_single_destination_rows_delivered_total") or 0
         d.poll_once()
-        assert (REGISTRY.get_sample_value("viaduck_duckling_rows_delivered_total") or 0) == before + 1
-        assert REGISTRY.get_sample_value("viaduck_duckling_lag_snapshots") == 400  # head 500 - cursor 100
+        assert (REGISTRY.get_sample_value("viaduck_single_destination_rows_delivered_total") or 0) == before + 1
+        assert REGISTRY.get_sample_value("viaduck_single_destination_lag_snapshots") == 400  # head 500 - cursor 100
