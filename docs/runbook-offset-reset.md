@@ -80,9 +80,9 @@ kubectl -n argocd patch application <viaduck-app> --type merge \
   -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
 ```
 
-Verify on startup: `Self-recycle watermark` line present, first poll
-cycles show small lags, `viaduck_dest_lag_snapshots` near zero for reset
-destinations, no `retention clamp` warnings.
+Verify on startup: first poll cycles show small lags,
+`viaduck_dest_lag_snapshots` near zero for reset destinations, no
+`retention clamp` warnings.
 
 ## Hazards
 
