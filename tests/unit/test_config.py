@@ -1092,55 +1092,6 @@ def test_destination_buffer_max_bytes_default_zero(config_file: Path):
     assert cfg.destinations[0].buffer_max_bytes == 0
 
 
-# --- memory / self-recycle ---
-
-
-def test_memory_defaults(config_file: Path):
-    cfg = load(config_file)
-    assert cfg.memory.self_recycle_enabled is True
-    assert cfg.memory.self_recycle_rss_fraction == 0.75
-    assert cfg.memory.self_recycle_rss_gib == 0.0
-    assert cfg.memory.self_recycle_min_uptime_seconds == 3600.0
-
-
-def test_memory_explicit_values(tmp_path: Path):
-    p = tmp_path / "viaduck.yaml"
-    p.write_text(
-        MINIMAL_YAML
-        + """
-memory:
-  self_recycle_enabled: false
-  self_recycle_rss_fraction: 0.5
-  self_recycle_rss_gib: 70
-  self_recycle_min_uptime_seconds: 0
-"""
-    )
-    cfg = load(p)
-    assert cfg.memory.self_recycle_enabled is False
-    assert cfg.memory.self_recycle_rss_fraction == 0.5
-    assert cfg.memory.self_recycle_rss_gib == 70.0
-    assert cfg.memory.self_recycle_min_uptime_seconds == 0.0
-
-
-@pytest.mark.parametrize(
-    "snippet",
-    [
-        "  self_recycle_rss_fraction: 0",
-        "  self_recycle_rss_fraction: 1",
-        "  self_recycle_rss_fraction: 1.5",
-        "  self_recycle_rss_gib: -1",
-        "  self_recycle_min_uptime_seconds: -5",
-        "  dest_conn_max_age_seconds: -1",
-        "  dest_conn_max_age_seconds: 30",
-    ],
-)
-def test_memory_validation_rejects(tmp_path: Path, snippet: str):
-    p = tmp_path / "viaduck.yaml"
-    p.write_text(MINIMAL_YAML + "\nmemory:\n" + snippet + "\n")
-    with pytest.raises(ConfigError):
-        load(p)
-
-
 def test_memory_dest_conn_max_age_default_and_override(tmp_path: Path):
     p = tmp_path / "viaduck.yaml"
     p.write_text(MINIMAL_YAML)
@@ -1152,6 +1103,33 @@ def test_memory_dest_conn_max_age_default_and_override(tmp_path: Path):
     # off is allowed (0 disables the sweep)
     p.write_text(MINIMAL_YAML + "\nmemory:\n  dest_conn_max_age_seconds: 0\n")
     assert load(p).memory.dest_conn_max_age_seconds == 0.0
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "  dest_conn_max_age_seconds: -1",
+        "  dest_conn_max_age_seconds: 30",  # below the 60s floor (connect-storm guard)
+    ],
+)
+def test_memory_dest_conn_max_age_rejects(tmp_path: Path, snippet: str):
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(MINIMAL_YAML + "\nmemory:\n" + snippet + "\n")
+    with pytest.raises(ConfigError):
+        load(p)
+
+
+def test_memory_retired_self_recycle_keys_warn_not_refuse(tmp_path: Path, caplog):
+    """A stale chart carrying the removed self_recycle_* keys must load
+    (refusing would CrashLoop the rollout) but must WARN (silence would
+    let an operator believe the deleted backstop exists)."""
+    p = tmp_path / "viaduck.yaml"
+    p.write_text(MINIMAL_YAML + "\nmemory:\n  self_recycle_enabled: true\n  self_recycle_rss_gib: 82\n")
+    with caplog.at_level("WARNING"):
+        cfg = load(p)
+    assert cfg.memory.dest_conn_max_age_seconds == 600.0  # defaults intact
+    warnings = [r for r in caplog.records if "self_recycle" in r.getMessage()]
+    assert len(warnings) == 2  # one per retired key present
 
 
 def test_to_libpq_conninfo_translation():

@@ -193,7 +193,7 @@ There is **no data loss path** — machine-checked, not just argued: every consi
 | Crash after destination commit, before cursor persist | Destination has data, cursor stale | At-least-once: range re-read and re-applied idempotently (full CDC); tombstones remove any since-deleted rows the crashed commit wrote. | Per-destination |
 | Cursor persist failure (PG down) | Destination commit already landed | 3 in-process retries ([`delivery.py:_advance_cursor_with_retry`](viaduck/delivery.py)); on exhaustion, same path as flush failure — range re-read, idempotent re-apply. | Per-destination |
 | Destination apply failure (full CDC) | Delete + upsert transaction rolled back | No partial state on destination. Buffer dropped, range re-read. | Per-destination |
-| SIGTERM with data buffered | Shutdown drain | `drain()` flushes everything buffered (trigger=shutdown), bounded by a 60s deadline; anything abandoned is re-read on restart. Note: the 60s deadline exceeds K8s's default 30s `terminationGracePeriodSeconds` — raise the grace period or expect SIGKILL to cut the drain short (safe, just re-read). The watermark self-recycle exit uses a 300s drain budget instead (no grace clock is ticking — see Deployment). | — |
+| SIGTERM with data buffered | Shutdown drain | `drain()` flushes everything buffered (trigger=shutdown), bounded by a 60s deadline; anything abandoned is re-read on restart. Note: the 60s deadline exceeds K8s's default 30s `terminationGracePeriodSeconds` — raise the grace period or expect SIGKILL to cut the drain short (safe, just re-read). | — |
 | Destination at its buffer cap | Backpressure (by design) | The destination's queue (buffer + in-flight) hit its per-destination cap: its buffer force-flushes (trigger=`memory`) and its CDC reads pause until the flush drains — `viaduck_delivery_reads_paused` gauges it. Healthy peers keep reading and flushing. | **Per-destination** |
 | Destination failing flushes repeatedly | Circuit breaker opens after `flush_circuit_failures` consecutive failures | Flush submissions pause behind an exponential backoff; reads continue under the buffer cap. A probe after each backoff closes the circuit on success. `viaduck_delivery_circuit_open` / `viaduck_delivery_circuit_opens_total` gauge/count it; logs WARN on open. | **Per-destination** |
 | Routing field missing from source | `RoutingError` halts group processing | Error metricked, logged. Requires config or schema fix. | All destinations in group |
@@ -289,10 +289,7 @@ delivery:
   # flush_adaptive_reprobe_after: 50        # consecutive in-band full flushes before one upward re-probe
 
 memory:
-  self_recycle_enabled: true                # watermark self-recycle (see Deployment)
-  # self_recycle_rss_gib: 0                 # absolute RSS watermark in GiB (0 = derive from fraction)
-  # self_recycle_rss_fraction: 0.75         # watermark as fraction of the cgroup memory limit
-  # self_recycle_min_uptime_seconds: 3600   # never recycle a young (catching-up) process
+  # dest_conn_max_age_seconds: 600        # close/reopen pooled destination connections past this age (0 disables)
 
 server:
   port: 8000                                # metrics, health checks, status UI
@@ -492,7 +489,8 @@ The web UI (`/ui`) and status API (`/status`) report a per-destination operation
 | `viaduck_delivery_buffers_dropped_total` | Counter | destination | Buffers dropped on flush failure |
 | `viaduck_delivery_covered_replays_dropped_total` | Counter | destination | Buffered replay entries dropped at flush commit (already covered by it) |
 | `viaduck_retention_clamp_total` | Counter | destination, outcome | Retention-edge cursor clamps (`lost` = unrecoverable, alert; `at_risk` = pending flush) |
-| `viaduck_self_recycles_total` | Counter | — | Clean watermark-triggered restarts (drain + exit 0 on RSS watermark) |
+| `viaduck_rss_bytes` | Gauge | — | Process RSS, exported once per poll cycle — the memory-safety signal |
+| `viaduck_dest_conn_sweeps_total` | Counter | — | Destination-pool age sweeps performed (the memory bound; see Deployment) |
 | `viaduck_cdc_routing_mutations_total` | Counter | — | Cross-tenant routing value changes |
 | `viaduck_cdc_conflicts_resolved_total` | Counter | — | Rowid-level conflicts resolved in Phase 2 |
 | `viaduck_cdc_tombstones_emitted_total` | Counter | — | Deletes surviving from insert+delete pairs (write cost of phantom healing; churn signal) |
@@ -601,11 +599,9 @@ kubectl apply -f k8s/deployment.yaml
 
 Viaduck runs as a K8s Deployment (not StatefulSet — no ordinal-based identity needed). For horizontal scaling, deploy multiple instances with different `instance.partition` configs. See [`k8s/deployment.yaml`](k8s/deployment.yaml) for manifests.
 
-### Watermark self-recycle
+### Destination connection age sweep
 
-Long-lived processes accrue untracked native memory in the ducklake extension (roughly proportional to catalog metadata volume, freed only on connection close). An OOM-kill mid-flight rewinds every destination to its durable cursor and scatters the cursor groups; a clean exit after a drain leaves cursors tight at the read position. So viaduck preempts the OOM: after `memory.self_recycle_min_uptime_seconds` (default 3600 — a post-restart catch-up legitimately runs hot), each poll cycle checks RSS against a watermark; on crossing it, the process finishes the cycle, drains with a 300s budget (longer than the SIGTERM drain — no grace clock is ticking), and exits 0 for an in-place kubelet restart (`restartPolicy: Always`). Signals: the `[SELF-RECYCLE]` WARN, `viaduck_self_recycles_total`, and the container's last-state `Completed`/exit 0 (vs `OOMKilled`/137).
-
-Knobs ([`config.py`](viaduck/config.py) `memory.*`): `self_recycle_enabled` (default true), `self_recycle_rss_gib` (absolute watermark, default 0 = derive), `self_recycle_rss_fraction` (default 0.75 × the cgroup memory limit; disabled with a startup log if no limit is readable). Sizing: the watermark must clear the deployment's legitimate peak (≈ `delivery.buffer_total_max_bytes` + pool native footprint + baseline) or leak-free load recycles the pod every min-uptime — sized deployments should set the absolute knob.
+Long-lived destination connections accrue per-connection native memory that is only reclaimed on close. The poll loop sweeps the destination pool: connections older than `memory.dest_conn_max_age_seconds` (default 600s; 0 disables; values below 60 are rejected) are force-evicted and recreated lazily on their next flush — capped at two evictions per cycle so a mass-expiry event can't storm the destination catalog. A pinned (in-flight) connection is skipped rather than closed mid-apply. Signal: `viaduck_dest_conn_sweeps_total`.
 
 ## Error Handling and Retries
 

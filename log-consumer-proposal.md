@@ -68,6 +68,11 @@ production log, 2026-08-15, viaduck 0.0.70.)
 | Destination append cliff (team-2) | 13.2s @30–60k rows, 56.5s @60–90k, 164.4s @90–120k (240s deadline) |
 | Memory | ~2.9 GiB/h untracked native residual; 82 GiB self-recycle watermark |
 
+*(Erratum, 2026-09-02: the watermark self-recycle was removed in PR #85
+after the dest-connection age sweep (#84) held prod flat for ~19h; the
+sweep is the bound now. The dated rows above/below record the
+2026-08-15 state verbatim.)*
+
 Structural findings:
 
 1. **Group-scan amplification**: N cursor groups each pay full scan cost
@@ -237,8 +242,9 @@ whether anyone does.
 
 - **Reliable**: at-least-once (unchanged contract). Recovery state is the
   durable per-destination cursor. In-flight state may be volatile:
-  crashes are rare (clean self-recycle drain for the known RSS residual),
-  and §6.5 prices the rewind honestly.
+  crashes are rare (clean self-recycle drain for the known RSS residual;
+  that drain path was removed 2026-09-02 in PR #85 — the dest-connection
+  age sweep is the bound now), and §6.5 prices the rewind honestly.
 - **Performant**: a consumer's pace is bounded only by its destination's
   append capacity, never by peers.
 - **Simple**: delete more than we add; any mechanism that arbitrates
@@ -428,7 +434,7 @@ position-grid chunking, group fairness machinery.
 
 | Event | Cost |
 |---|---|
-| Clean restart / self-recycle | Drain flushes buffers; cursors tight; resume near head. Seconds. |
+| Clean restart | Drain flushes buffers; cursors tight; resume near head. Seconds. |
 | Hard crash, healthy fleet | Rewind = buffered window ≤ flush cadence (~120s × 2 snap/s ≈ ~240 snapshots). Re-read at feed speed: seconds. Clustering re-glues in one cycle. |
 | Hard crash with an at-cap destination | Worst case rewind = the full per-destination cap: 4GiB ≈ ~4.3M team-2 rows ≈ **~6.7k snapshots ≈ ~1h of head**. Re-read is minutes (feed is cheap); **re-delivery is append-bound, ~16–20 min** at 3.6–4.5k rows/s. Note the crash postures correlate with fat buffers — plan for the at-cap case, not the healthy one. Still not absorbing: the 08-14 catastrophe required the divergence regime. |
 | One destination down hours | Cap freezes its position; on recovery it sweeps at its own append rate. Fleet unaffected. |
@@ -532,8 +538,8 @@ bridge split (§10.3), not schedule compression.
    churn this implies).
 5. **Shadow** (validation scaffolding, owned as a time-boxed third image,
    not a compat shim): old image + feed in dual-read mode, divergence
-   counter, 24–48h. Note the shadow pod still leaks ~2.9GiB/h toward its
-   self-recycle — comparison continuity across recycles is scripted, not
+   counter, 24–48h. Note the shadow pod still carries the ~2.9GiB/h
+   residual — comparison continuity across any restarts is scripted, not
    assumed. Shadow doubles source read load briefly; acceptable.
    **Operational gate for the shadow window: no source-table DDL.** The
    feed has no `mapping_id`/rename story yet (§11.4) — a mid-shadow rename

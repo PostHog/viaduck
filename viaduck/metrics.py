@@ -25,11 +25,6 @@ _polls_total = Counter(
     "Poll cycles executed",
     ["pipeline"],
 )
-_self_recycles_total = Counter(
-    "viaduck_self_recycles_total",
-    "Clean watermark-triggered restarts (drain + exit 0 on RSS watermark)",
-    ["pipeline"],
-)
 _source_conn_recycles_total = Counter(
     "viaduck_source_conn_recycles_total",
     "Source catalog connection close/reopen cycles (Leak-2 experiment; memory.source_conn_recycle_interval_seconds)",
@@ -467,7 +462,6 @@ _projection_cast_null_fallback_total = Counter(
 # --- Public names (replaced by init() with pipeline-bound instances) ---
 
 polls_total = _polls_total
-self_recycles_total = _self_recycles_total
 source_conn_recycles_total = _source_conn_recycles_total
 dest_conn_sweeps_total = _dest_conn_sweeps_total
 rss_bytes = _rss_bytes
@@ -556,7 +550,7 @@ def init(pipeline: str):
     global polls_total, cdc_read_seconds, cdc_rows_read_total, source_snapshot_id
     global cdc_feed_query_seconds, cdc_feed_files_total, cdc_feed_inlined_rows_total, cdc_feed_replans_total
     global read_clusters, read_pool_inflight
-    global self_recycles_total, source_conn_recycles_total, rss_bytes
+    global source_conn_recycles_total, rss_bytes
     global dest_conn_sweeps_total, arrow_pool_allocated_bytes, arrow_pool_max_bytes
     global source_columns_excluded_total
     global dest_write_seconds, dest_rows_written_total, dest_last_snapshot_id, dest_lag_snapshots
@@ -630,7 +624,6 @@ def init(pipeline: str):
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     polls_total = _polls_total.labels(pipeline=pipeline)
-    self_recycles_total = _self_recycles_total.labels(pipeline=pipeline)
     source_conn_recycles_total = _source_conn_recycles_total.labels(pipeline=pipeline)
     dest_conn_sweeps_total = _dest_conn_sweeps_total.labels(pipeline=pipeline)
     rss_bytes = _rss_bytes.labels(pipeline=pipeline)
