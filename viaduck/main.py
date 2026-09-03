@@ -1031,10 +1031,6 @@ def run(cfg: config.ViaduckConfig) -> None:
 
     shutdown = False
 
-    recycle_watermark_gib = resolve_recycle_watermark(cfg.memory)
-    loop_started_at = time.monotonic()
-    recycling = False
-
     def _signal_handler(signum, frame):
         nonlocal shutdown
         log.info("Received signal %s, shutting down", signal.Signals(signum).name)
@@ -1178,22 +1174,6 @@ def run(cfg: config.ViaduckConfig) -> None:
             log.exception("Fatal error in poll cycle")
             break
 
-        # Watermark self-recycle: preempt the residual-leak OOM with a clean
-        # exit through the SAME graceful path SIGTERM takes — drain() flushes
-        # every buffer so cursors land tight at the read position, and the
-        # kubelet restarts a fresh process with no rewind and no
-        # cursor-group scatter.
-        if not shutdown and _should_self_recycle(
-            recycle_watermark_gib, loop_started_at, cfg.memory.self_recycle_min_uptime_seconds
-        ):
-            # Best-effort metric: the process exits shortly after and the
-            # counter resets, so a scrape can miss it. The durable signals
-            # are the [SELF-RECYCLE] WARN and the container's last-state
-            # `Completed`/exit 0 (vs `OOMKilled`/137).
-            metrics.self_recycles_total.inc()
-            recycling = True
-            shutdown = True
-
         if not shutdown:
             # Chunked sleep so SIGTERM is honored within ~1s rather than
             # waiting up to `interval_seconds`. With long poll intervals (e.g.
@@ -1204,20 +1184,13 @@ def run(cfg: config.ViaduckConfig) -> None:
     # Graceful shutdown: flush everything buffered (the spec's
     # shutdown-trigger FlushStart), wait for workers, then close.
     #
-    # The recycle path gets a longer drain budget than SIGTERM: SIGTERM is
-    # bounded by terminationGracePeriodSeconds (kubelet SIGKILLs at the
-    # deadline, so a drain longer than the grace just dies mid-close), but a
-    # self-recycle has NO grace clock — nothing external is killing the
-    # process — so it can afford to flush a fat catch-up buffer instead of
-    # abandoning it to a cursor rewind. The bound that DOES apply here is
-    # the liveness probe: with the poll loop stopped, /healthz goes stale
-    # after ~300s poll-age plus the probe's 10x30s failure budget (~600s
-    # total), which is also the backstop that reaps a flush worker wedged
-    # in a native call (the interpreter's exit-join would otherwise wait
-    # forever — kubelet SIGKILL via failed liveness is the way out of that
-    # already-pathological state).
+    # The drain budget is bounded by terminationGracePeriodSeconds (kubelet
+    # SIGKILLs at the deadline, so a drain longer than the grace just dies
+    # mid-close). A flush worker wedged in a native call is reaped the same
+    # way via the liveness probe (the interpreter's exit-join would
+    # otherwise wait forever).
     log.info("Shutting down...")
-    delivery.drain(timeout_s=_RECYCLE_DRAIN_TIMEOUT_S if recycling else 60.0)
+    delivery.drain(timeout_s=60.0)
     dest_pool.close_all()
     state_mgr.close()
     if feed_reader is not None:
@@ -2159,92 +2132,6 @@ def _read_rss_gib() -> float:
         if line.startswith("VmRSS:"):
             return int(line.split()[1]) / 1024 / 1024
     raise RuntimeError("VmRSS not present in /proc/self/status")
-
-
-def _cgroup_memory_limit_gib() -> float:
-    """Container memory limit in GiB from the cgroup (v2 then v1); 0 when
-    unreadable or unlimited ("max" / the v1 no-limit sentinel)."""
-    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
-        try:
-            raw = open(path).read().strip()
-        except OSError:
-            continue
-        if raw == "max":
-            return 0.0
-        limit = int(raw) / 1024**3
-        # cgroup v1 reports ~8 EiB when unlimited; anything implausibly
-        # large is "no limit".
-        return limit if limit < 4096 else 0.0
-    return 0.0
-
-
-def resolve_recycle_watermark(cfg_memory) -> float:
-    """Resolve the self-recycle RSS watermark in GiB; 0 = disabled.
-
-    Logged once at startup so the effective threshold (and why it is what it
-    is) is always on the record: absolute knob wins, else fraction x cgroup
-    limit, else disabled when no limit is readable (bare-metal/dev runs).
-    """
-    if not cfg_memory.self_recycle_enabled:
-        log.info("Self-recycle disabled by config")
-        return 0.0
-    if cfg_memory.self_recycle_rss_gib > 0:
-        log.info("Self-recycle watermark: %.1fGiB (absolute)", cfg_memory.self_recycle_rss_gib)
-        return cfg_memory.self_recycle_rss_gib
-    limit = _cgroup_memory_limit_gib()
-    if limit <= 0:
-        log.info("Self-recycle disabled: no cgroup memory limit readable and no absolute watermark set")
-        return 0.0
-    watermark = limit * cfg_memory.self_recycle_rss_fraction
-    log.info(
-        "Self-recycle watermark: %.1fGiB (%.0f%% of %.1fGiB cgroup limit)",
-        watermark,
-        cfg_memory.self_recycle_rss_fraction * 100,
-        limit,
-    )
-    return watermark
-
-
-# RSS read failures never trip a restart, but a PERSISTENT failure with the
-# watermark armed means the recycle is silently dark (the leak then runs to
-# OOM unpreempted) — worth a rate-limited WARN. Same count-and-log-every-Nth
-# shape as _MEM_STATS_FAILURES; at the ~5s cycle interval, every 360th ≈
-# one line per half hour.
-_RSS_READ_FAILURES = 0
-_RSS_READ_LOG_EVERY_NTH_FAILURE = 360
-
-# Drain budget for the self-recycle path. Must stay comfortably under the
-# liveness reap window (~600s: 300s poll-age staleness + 10x30s probe
-# failures) so a healthy long drain is never killed mid-flush.
-_RECYCLE_DRAIN_TIMEOUT_S = 300.0
-
-
-def _should_self_recycle(watermark_gib: float, started_at: float, min_uptime_s: float) -> bool:
-    """One cheap check per poll cycle. Failures never trip a restart."""
-    global _RSS_READ_FAILURES
-    if watermark_gib <= 0 or time.monotonic() - started_at < min_uptime_s:
-        return False
-    try:
-        rss = _read_rss_gib()
-    except Exception:
-        _RSS_READ_FAILURES += 1
-        if _RSS_READ_FAILURES == 1 or _RSS_READ_FAILURES % _RSS_READ_LOG_EVERY_NTH_FAILURE == 0:
-            log.warning(
-                "[SELF-RECYCLE] RSS read failed (occurrence #%d) — watermark armed but not checking",
-                _RSS_READ_FAILURES,
-                exc_info=True,
-            )
-        return False
-    if rss < watermark_gib:
-        return False
-    log.warning(
-        "[SELF-RECYCLE] rss=%.1fGiB >= watermark %.1fGiB; draining and exiting 0 for a clean restart. "
-        "Whatever the drain flushes lands tight; anything past the drain deadline re-reads from "
-        "persisted cursors — still strictly less rewind than the mid-flight OOM this preempts",
-        rss,
-        watermark_gib,
-    )
-    return True
 
 
 def _log_watermark_paused(kind: str) -> None:
