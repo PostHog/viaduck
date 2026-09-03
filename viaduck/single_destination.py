@@ -43,14 +43,14 @@ from viaduck.config import _to_libpq_conninfo
 from viaduck.logging_config import setup as setup_logging
 from viaduck.scrub import scrub_credentials
 
-log = logging.getLogger("viaduck.duckling")
+log = logging.getLogger("viaduck.single_destination")
 
 
 class ConfigError(Exception):
     pass
 
 
-class FatalDucklingError(RuntimeError):
+class FatalSingleDestinationError(RuntimeError):
     """Crash-class failure (append exhausted, cursor exhausted, assertion
     violation, source rebuild): the process must die, not retry — K8s
     backoff is the supervisor. run() re-raises these; everything else is a
@@ -61,18 +61,18 @@ class FatalDucklingError(RuntimeError):
 # Metrics (one process = one destination: no pipeline label needed)
 # ---------------------------------------------------------------------------
 
-rows_read_total = Counter("viaduck_duckling_rows_read_total", "Rows read from the source (pre-filter)")
-rows_delivered_total = Counter("viaduck_duckling_rows_delivered_total", "Rows appended to the destination")
-flush_seconds = Histogram("viaduck_duckling_flush_seconds", "Destination append latency")
-unit_budget_rows = Gauge("viaduck_duckling_unit_budget_rows", "Current AIMD read-unit row budget")
-lag_snapshots = Gauge("viaduck_duckling_lag_snapshots", "Source head minus committed cursor")
+rows_read_total = Counter("viaduck_single_destination_rows_read_total", "Rows read from the source (pre-filter)")
+rows_delivered_total = Counter("viaduck_single_destination_rows_delivered_total", "Rows appended to the destination")
+flush_seconds = Histogram("viaduck_single_destination_flush_seconds", "Destination append latency")
+unit_budget_rows = Gauge("viaduck_single_destination_unit_budget_rows", "Current AIMD read-unit row budget")
+lag_snapshots = Gauge("viaduck_single_destination_lag_snapshots", "Source head minus committed cursor")
 cursor_below_floor = Gauge(
-    "viaduck_duckling_cursor_below_floor", "1 while the cursor is under the retained snapshot floor"
+    "viaduck_single_destination_cursor_below_floor", "1 while the cursor is under the retained snapshot floor"
 )
 assertion_failures_total = Counter(
-    "viaduck_duckling_assertion_failures_total", "Per-poll assertion failures", ["check"]
+    "viaduck_single_destination_assertion_failures_total", "Per-poll assertion failures", ["check"]
 )
-polls_total = Counter("viaduck_duckling_polls_total", "Loop iterations", ["result"])
+polls_total = Counter("viaduck_single_destination_polls_total", "Loop iterations", ["result"])
 
 # ---------------------------------------------------------------------------
 # Config
@@ -90,7 +90,7 @@ def _env(name: str, default: str | None = None, required: bool = True) -> str:
 
 
 @dataclass
-class DucklingConfig:
+class SingleDestinationConfig:
     source_pg_uri: str
     source_catalog: str
     source_data_path: str
@@ -103,7 +103,7 @@ class DucklingConfig:
     team_value: str  # validated against the pinned column's type at boot
     destination_id: str
     cursor_pg_uri: str = ""  # defaults to source_pg_uri
-    instance_id: str = "duckling"  # STABLE per destination — never a pod name
+    instance_id: str = "single-destination"  # STABLE per destination — never a pod name
     dest_managed_columns: frozenset[str] = frozenset({"_inserted_at"})
     s3_properties: dict[str, str] = field(default_factory=dict)
     poll_interval_s: float = 5.0
@@ -123,7 +123,7 @@ class DucklingConfig:
             self.cursor_pg_uri = self.source_pg_uri
 
     @classmethod
-    def from_env(cls) -> DucklingConfig:
+    def from_env(cls) -> SingleDestinationConfig:
         def ident(name: str, pattern=_IDENT) -> str:
             v = _env(name)
             if not pattern.match(v):
@@ -147,7 +147,7 @@ class DucklingConfig:
             team_value=_env("TEAM_VALUE"),
             destination_id=_env("DESTINATION_ID"),
             cursor_pg_uri=_env("CURSOR_PG_URI", "", required=False),
-            instance_id=_env("INSTANCE_ID", "duckling", required=False),
+            instance_id=_env("INSTANCE_ID", "single-destination", required=False),
             dest_managed_columns=managed,
             s3_properties=s3,
             poll_interval_s=float(_env("POLL_INTERVAL_S", "5", required=False)),
@@ -161,12 +161,12 @@ class DucklingConfig:
 
 
 # ---------------------------------------------------------------------------
-# The duckling
+# The single-destination viaduck
 # ---------------------------------------------------------------------------
 
 
-class Duckling:
-    def __init__(self, cfg: DucklingConfig):
+class SingleDestinationViaduck:
+    def __init__(self, cfg: SingleDestinationConfig):
         self.cfg = cfg
         self._stop = threading.Event()
         self._last_poll_ok = time.monotonic()
@@ -202,12 +202,12 @@ class Duckling:
     def boot(self) -> None:
         try:
             self._boot_inner()
-        except FatalDucklingError:
+        except FatalSingleDestinationError:
             raise
         except Exception as e:
             # ATTACH/connect errors embed the full conninfo — scrub before
             # the message can reach pod logs.
-            raise FatalDucklingError(f"boot failed: {scrub_credentials(str(e))}") from None
+            raise FatalSingleDestinationError(f"boot failed: {scrub_credentials(str(e))}") from None
 
     def _boot_inner(self) -> None:
         cfg = self.cfg
@@ -252,7 +252,7 @@ class Duckling:
             raise ConfigError(f"destination FQN {fqn!r} contains SQL metacharacters")
         self._dest_fqn = fqn
 
-        # Cursor row in viaduck_state (existing table; the duckling adds one
+        # Cursor row in viaduck_state (existing table; the single-destination viaduck adds one
         # additive column for table_id provenance — a drop+recreate WHILE
         # DOWN is otherwise undetectable: boot would resolve the new id and
         # the witness is keyed to it). Baseline assertions run BEFORE the
@@ -264,7 +264,7 @@ class Duckling:
         self._check_inline_stores()
         self._cursor_persist()
         log.info(
-            "duckling up: %s → %s (team %s=%s), cursor=%d, columns=%d",
+            "single-destination viaduck up: %s → %s (team %s=%s), cursor=%d, columns=%d",
             cfg.source_table,
             cfg.dest_table,
             cfg.team_field,
@@ -367,7 +367,7 @@ class Duckling:
             )
         except (psycopg.errors.DuplicateSchema, psycopg.errors.DuplicateTable, psycopg.errors.UniqueViolation):
             pass  # concurrent first boot (state.py's race guard)
-        # Duckling-managed additive column (the fleet never reads it): the
+        # SingleDestinationViaduck-managed additive column (the fleet never reads it): the
         # table_id the cursor position was earned against.
         pg.execute("ALTER TABLE viaduck.viaduck_state ADD COLUMN IF NOT EXISTS source_table_id bigint")
 
@@ -388,10 +388,10 @@ class Duckling:
             self._cursor_row_exists = True
             stored_tid = row[1]
             if stored_tid is not None and int(stored_tid) != self.table_id:
-                raise FatalDucklingError(
+                raise FatalSingleDestinationError(
                     f"cursor was earned against table_id={int(stored_tid)} but the source table is now "
-                    f"table_id={self.table_id}: the source was dropped+recreated while this duckling was "
-                    "down — mandatory re-seed (delete the cursor row to restart at head)"
+                    f"table_id={self.table_id}: the source was dropped+recreated while this "
+                    "single-destination viaduck was down — mandatory re-seed (delete the cursor row to restart at head)"
                 )
             if stored_tid is None:
                 # Backfill provenance (fleet-transplanted cursors arrive
@@ -449,7 +449,7 @@ class Duckling:
                     "%s failed (attempt %d/%d): %s", what, attempt + 1, self.cfg.attempts, scrub_credentials(str(e))
                 )
                 time.sleep(0.5 * (attempt + 1))
-        raise FatalDucklingError(
+        raise FatalSingleDestinationError(
             f"{what} failed after {self.cfg.attempts} attempts: {scrub_credentials(str(last_err))}"
         )
 
@@ -525,7 +525,9 @@ class Duckling:
             n = self._count(sql, params)
             if n:
                 assertion_failures_total.labels(check=name).inc()
-                raise FatalDucklingError(f"append-only contract violated: {n} rows in {name} for table_id={tid}")
+                raise FatalSingleDestinationError(
+                    f"append-only contract violated: {n} rows in {name} for table_id={tid}"
+                )
         # Retention-lived witness: survives the delete+merge-between-polls
         # race that erases the two checks above. changes_made is a
         # comma-joined `type:table_id` list (ducklake_transaction.cpp
@@ -538,7 +540,7 @@ class Duckling:
         )
         if witness:
             assertion_failures_total.labels(check="snapshot_changes_witness").inc()
-            raise FatalDucklingError(f"delete/drop activity for table_id={tid} in snapshot_changes")
+            raise FatalSingleDestinationError(f"delete/drop activity for table_id={tid} in snapshot_changes")
         # Inlined deletes: their own per-table PG table, invisible to all of
         # the above (round-2 C2). Existence probe first, then count.
         store = (
@@ -556,7 +558,7 @@ class Duckling:
             )
             if n:
                 assertion_failures_total.labels(check="inlined_delete").inc()
-                raise FatalDucklingError(f"{n} inlined deletes for table_id={tid}")
+                raise FatalSingleDestinationError(f"{n} inlined deletes for table_id={tid}")
 
     def _check_inline_stores(self) -> None:
         """Inlining is an attach-scoped writer option — unverifiable in the
@@ -623,7 +625,7 @@ class Duckling:
         for this class). BY NAME maps by column name and default-fills
         dest-managed columns."""
         conn = self.dst_catalog.connection
-        view = "_duckling_append"
+        view = "_single_destination_append"
         conn.register(view, batch)
         try:
             conn.execute(f"INSERT INTO {self._dest_fqn} BY NAME SELECT * FROM {view}")
@@ -650,7 +652,7 @@ class Duckling:
                 )
                 self._aimd_halve(f"flush failure: {type(e).__name__}")
                 time.sleep(1.0 * (attempt + 1))
-        raise FatalDucklingError(
+        raise FatalSingleDestinationError(
             f"append failed after {self.cfg.attempts} attempts: {scrub_credentials(str(last_err))}"
         )
 
@@ -681,7 +683,7 @@ class Duckling:
         lag_snapshots.set(head - self._cursor)  # signed: a NEGATIVE lag is
         # a source regression (PITR restore / rebuild) — never clamp it to 0
         if head < self._cursor:
-            raise FatalDucklingError(
+            raise FatalSingleDestinationError(
                 f"source head {head} regressed below cursor {self._cursor}: the source was "
                 "restored or rebuilt — the cursor's basis is gone; operator adjudication (re-seed)"
             )
@@ -708,7 +710,7 @@ class Duckling:
         except feed.FeedError as read_err:
             if "retained snapshot floor" in str(read_err):
                 raise  # transient in composition: next poll's clamp heals it
-            raise FatalDucklingError(scrub_credentials(str(read_err))) from None
+            raise FatalSingleDestinationError(scrub_credentials(str(read_err))) from None
         except Exception as read_err:
             # DROP+CREATE detection on the error path: a changed (or
             # vanished) table_id means the source was rebuilt — freeze and
@@ -741,9 +743,9 @@ class Duckling:
         try:
             new_tid = self._resolve_table_id()
         except ConfigError:
-            raise FatalDucklingError("source table dropped — operator adjudication required") from cause
+            raise FatalSingleDestinationError("source table dropped — operator adjudication required") from cause
         if new_tid != self.table_id:
-            raise FatalDucklingError(
+            raise FatalSingleDestinationError(
                 f"source table_id changed {self.table_id} → {new_tid}: DROP+CREATE requires re-seed"
             ) from cause
 
@@ -751,7 +753,7 @@ class Duckling:
         try:
             col = rows.column(self.cfg.team_field)
         except Exception:
-            raise FatalDucklingError(
+            raise FatalSingleDestinationError(
                 f"team field {self.cfg.team_field!r} missing from the read batch — schema contract broken"
             ) from None
         return rows.filter(pc.is_in(col, value_set=self._team_array))
@@ -765,12 +767,12 @@ class Duckling:
                 try:
                     self.poll_once()
                     self._last_poll_ok = time.monotonic()
-                except FatalDucklingError:
+                except FatalSingleDestinationError:
                     raise  # crash-class: die, let K8s restart
                 except Exception:
                     # Transient read/plan errors: the cursor never advanced,
                     # the range is retried next poll. Append/cursor/
-                    # assertion failures are FatalDucklingError (above).
+                    # assertion failures are FatalSingleDestinationError (above).
                     polls_total.labels(result="error").inc()
                     log.exception("poll failed (transient)")
                 self._maybe_recycle()
@@ -805,7 +807,7 @@ class Duckling:
         return (time.monotonic() - self._last_poll_ok) < max(3 * self.cfg.poll_interval_s, 300)
 
 
-def _start_health_server(duck: Duckling) -> ThreadingHTTPServer:
+def _start_health_server(duck: SingleDestinationViaduck) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/healthz":
@@ -833,9 +835,9 @@ def _start_health_server(duck: Duckling) -> ThreadingHTTPServer:
 def main() -> None:
     setup_logging()
     source.sweep_spill_dirs()  # crash-loops otherwise accumulate leftovers in the pod emptyDir
-    cfg = DucklingConfig.from_env()
-    metrics.init(f"duckling-{cfg.destination_id}")
-    duck = Duckling(cfg)
+    cfg = SingleDestinationConfig.from_env()
+    metrics.init(f"single-destination-{cfg.destination_id}")
+    duck = SingleDestinationViaduck(cfg)
     signal.signal(signal.SIGTERM, lambda *_: duck._stop.set())
     duck.run()
 

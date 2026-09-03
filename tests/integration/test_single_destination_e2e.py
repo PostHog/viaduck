@@ -1,4 +1,4 @@
-"""End-to-end: the per-destination duckling against real catalogs.
+"""End-to-end: the single-destination viaduck against real catalogs.
 
 PG testcontainer holds both ducklake catalogs (source + destination) and
 the viaduck_state cursor table on the SOURCE database (the colocated
@@ -17,11 +17,11 @@ from pyducklake import Catalog
 from testcontainers.postgres import PostgresContainer
 
 from viaduck import metrics
-from viaduck.single_destination import Duckling, DucklingConfig, FatalDucklingError
+from viaduck.single_destination import FatalSingleDestinationError, SingleDestinationConfig, SingleDestinationViaduck
 
 
 def setup_module():
-    metrics.init("duckling_integration_test")
+    metrics.init("single_destination_integration_test")
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +41,7 @@ def _mkdb(pg_dsn: str, name: str) -> str:
 
 
 class Env:
-    """Test handle: both catalogs plus a DucklingConfig factory."""
+    """Test handle: both catalogs plus a SingleDestinationConfig factory."""
 
     def __init__(self, src, dst, src_dsn, dst_dsn, tmp_path):
         self.src = src
@@ -51,7 +51,7 @@ class Env:
         self.tmp_path = tmp_path
         self._destination_id = f"org-test-team-2-{uuid.uuid4().hex[:6]}"
 
-    def cfg(self, **kw) -> DucklingConfig:
+    def cfg(self, **kw) -> SingleDestinationConfig:
         base = dict(
             # ATTACH format on purpose: exercises the F2 conninfo translation
             source_pg_uri=f"postgres:{self.src_dsn}",
@@ -67,12 +67,12 @@ class Env:
             cursor_pg_uri="",
             destination_id=self._destination_id,  # stable per test: a restart
             # resumes the SAME cursor row
-            instance_id="duckling-test-0",
+            instance_id="single-destination-test-0",
             poll_interval_s=0.1,
             start_snapshot_id=0,  # tests want full catch-up, not start-at-head
         )
         base.update(kw)
-        return DucklingConfig(**base)
+        return SingleDestinationConfig(**base)
 
 
 @pytest.fixture()
@@ -114,7 +114,7 @@ class TestEndToEnd:
         _insert(src, [(2, "c")])
         _insert(src, [(9, "d"), (2, "e")])
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         d.boot()
         try:
             d.poll_once()
@@ -136,7 +136,7 @@ class TestEndToEnd:
         src, dst = env.src, env.dst
         _insert(src, [(2, "a"), (2, "b")])
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         d.boot()
         d._cursor_advance = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated crash"))
         try:
@@ -146,7 +146,7 @@ class TestEndToEnd:
             _close(d)
         assert _dest_rows(dst) == [(2, "a"), (2, "b")]  # committed; cursor not
 
-        d2 = Duckling(env.cfg())  # "restart": same cursor row
+        d2 = SingleDestinationViaduck(env.cfg())  # "restart": same cursor row
         d2.boot()
         try:
             d2.poll_once()
@@ -160,7 +160,7 @@ class TestEndToEnd:
         src, dst = env.src, env.dst
         _insert(src, [(2, "a")])
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         d.boot()
         try:
             # NB: on the deployed build the ALTER resurrects the session's
@@ -173,7 +173,7 @@ class TestEndToEnd:
             _close(d)
         assert _dest_rows(dst) == [(2, "a"), (2, "b")]
 
-        d2 = Duckling(env.cfg())
+        d2 = SingleDestinationViaduck(env.cfg())
         d2.boot()
         try:
             assert "extra" in d2.columns
@@ -193,7 +193,7 @@ class TestEndToEnd:
         _insert(src, [(2, "a")])
         src.connection.execute("DELETE FROM lake.main.events WHERE team_id = 2")
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         try:
             # the baseline assertions at boot already see the delete
             with pytest.raises(RuntimeError, match="contract violated|delete"):
@@ -209,7 +209,7 @@ class TestEndToEnd:
         src, dst = env.src, env.dst
         _insert(src, [(2, "a")])
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         d.boot()
         try:
             d.poll_once()
@@ -218,7 +218,7 @@ class TestEndToEnd:
             _close(d)
         assert _dest_rows(dst) == [(2, "a")]
 
-        d2 = Duckling(env.cfg())  # same destination_id → same cursor row
+        d2 = SingleDestinationViaduck(env.cfg())  # same destination_id → same cursor row
         d2.boot()
         try:
             assert d2._cursor == cursor_after  # resumed, not restarted
@@ -246,7 +246,7 @@ class TestEndToEnd:
         floor = snaps[-1]
         pg.execute(f'DELETE FROM "{meta}".ducklake_snapshot WHERE snapshot_id < {floor}')
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         d.boot()  # writes the cursor row at start_snapshot_id=0
         try:
             assert d._cursor == 0
@@ -318,9 +318,9 @@ class TestEndToEnd:
         pg.execute(f'DELETE FROM "{meta}".ducklake_snapshot_changes')
         pg.close()
 
-        d = Duckling(env.cfg(source_table="main.inlined_del2", dest_table="main.inlined_del2"))
+        d = SingleDestinationViaduck(env.cfg(source_table="main.inlined_del2", dest_table="main.inlined_del2"))
         try:
-            with pytest.raises(FatalDucklingError, match="inlined deletes"):
+            with pytest.raises(FatalSingleDestinationError, match="inlined deletes"):
                 d.boot()  # baseline assertions: store probe fires
         finally:
             _close(d)
@@ -339,7 +339,7 @@ class TestEndToEnd:
         head = int(pg.execute(f'SELECT MAX(snapshot_id) FROM "{meta}".ducklake_snapshot').fetchone()[0])
         pg.close()
 
-        d = Duckling(env.cfg(start_snapshot_id=head))  # the documented accept: cursor past the delete
+        d = SingleDestinationViaduck(env.cfg(start_snapshot_id=head))  # the documented accept: cursor past the delete
         d.boot()
         try:
             _insert(src, [(2, "b")])
@@ -358,7 +358,7 @@ class TestEndToEnd:
             "CREATE TABLE dst.main.events (event VARCHAR, _inserted_at TIMESTAMPTZ DEFAULT now(), team_id BIGINT)"
         )
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         d.boot()
         try:
             d.poll_once()
@@ -377,7 +377,7 @@ class TestEndToEnd:
             "CREATE TABLE dst.main.events (team_id BIGINT, event VARCHAR, _inserted_at TIMESTAMPTZ DEFAULT now())"
         )
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         d.boot()
         try:
             d.poll_once()
@@ -398,9 +398,9 @@ class TestEndToEnd:
         src.connection.execute("INSERT INTO lake.main.inlined_del VALUES (2, 'a'), (2, 'b')")
         src.connection.execute("DELETE FROM lake.main.inlined_del WHERE event = 'a'")
 
-        d = Duckling(env.cfg(source_table="main.inlined_del", dest_table="main.inlined_del"))
+        d = SingleDestinationViaduck(env.cfg(source_table="main.inlined_del", dest_table="main.inlined_del"))
         try:
-            with pytest.raises(FatalDucklingError, match="delete/drop activity"):
+            with pytest.raises(FatalSingleDestinationError, match="delete/drop activity"):
                 d.boot()
         finally:
             d.feed.close()
@@ -410,7 +410,7 @@ class TestEndToEnd:
 
 class TestVariantSourceColumn:
     """The production shape: events_nrt carries millpond's VARIANT dual-write
-    companions. The duckling must boot, read, and deliver as if they don't
+    companions. The single-destination viaduck must boot, read, and deliver as if they don't
     exist (load_table's EXCLUDABLE_SOURCE_TYPES exclusion)."""
 
     def test_boot_and_deliver_with_variant_column(self, env):
@@ -420,7 +420,7 @@ class TestVariantSourceColumn:
         )
         src.connection.execute("INSERT INTO lake.main.events_v VALUES (2, 'a', {\"k\": 1}), (3, 'b', NULL)")
 
-        d = Duckling(env.cfg(source_table="main.events_v", dest_table="main.events_v"))
+        d = SingleDestinationViaduck(env.cfg(source_table="main.events_v", dest_table="main.events_v"))
         d.boot()
         try:
             assert "properties_variant" not in d.columns
@@ -439,7 +439,7 @@ class TestVariantSourceColumn:
         src, dst = env.src, env.dst
         _insert(src, [(2, "a")])
 
-        d = Duckling(env.cfg())
+        d = SingleDestinationViaduck(env.cfg())
         d.boot()
         try:
             src.connection.execute("ALTER TABLE lake.main.events ADD COLUMN properties_variant VARIANT")
@@ -451,7 +451,7 @@ class TestVariantSourceColumn:
             _close(d)
         assert _dest_rows(dst) == [(2, "a"), (2, "b")]
 
-        d2 = Duckling(env.cfg())
+        d2 = SingleDestinationViaduck(env.cfg())
         d2.boot()  # restart: load_table excludes the VARIANT again
         try:
             assert "properties_variant" not in d2.columns
@@ -474,7 +474,7 @@ class TestInlineServedAndPaged:
         src.connection.execute("INSERT INTO lake.main.inlined VALUES (2, 'i1'), (3, 'i2')")
         src.connection.execute("RESET ducklake_default_data_inlining_row_limit")
 
-        d = Duckling(env.cfg(source_table="main.inlined", dest_table="main.inlined"))
+        d = SingleDestinationViaduck(env.cfg(source_table="main.inlined", dest_table="main.inlined"))
         d.boot()
         try:
             d.poll_once()
