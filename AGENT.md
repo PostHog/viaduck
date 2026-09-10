@@ -225,6 +225,61 @@ Always run `just tlc` after spec changes.
 Run all: `just ci` (lock-check + format + lint + unit + integration + docs-check + Docker build). Perf: `just test-perf`.
 Perf with JSON output: `just test-perf-json` → writes `perf-results.json`.
 
+## Releases and Promoting to Prod
+
+Every merge to `main` triggers `.github/workflows/release.yaml`: it
+builds and pushes the image to `ghcr.io/posthog/viaduck` (`:vX.Y.Z`,
+`:<commit-sha>`, `:latest`), then dispatches `commit_state_update` to
+PostHog/charts with the manifest digest. The charts deploy bot writes
+`state.viaduck.image.sha` and promotes `image.dev` automatically
+(mw-dev rolls immediately). Deployments must not follow the mutable
+`:prod`/`:latest` tags — the fleet follows the digest-pinned state file.
+
+Prod is manual by policy — `state/viaduck.yaml` sets
+`require_prod_approval: true`, so the ONLY path to prod is the charts
+repo's `promote-to-prod.yml` workflow, gated by required reviewers on
+the `prod-promote-managed-warehouse` GitHub environment. Results post
+to #alerts-managed-warehouse. (Same mechanism as duckgres and millpond.)
+
+1. **Resolve the ref** — the promotable ref is the multi-arch manifest
+   digest recorded in the state file, never a per-arch digest:
+
+   ```bash
+   STATE=$(gh api -H "Accept: application/vnd.github.raw" \
+     /repos/PostHog/charts/contents/state/viaduck.yaml)
+   DEV=$(echo "$STATE" | yq '.state.viaduck.image.dev')
+   PROD=$(echo "$STATE" | yq '.state.viaduck.image.prod')
+   echo "dev:  $DEV"; echo "prod: $PROD"
+   # The <git-sha> prefix of $DEV must be the viaduck main commit you
+   # intend to ship. If dev lags sha, the CD/deploy-bot hop hasn't
+   # landed yet — wait.
+   ```
+
+2. **Show the delta going out**: `git log --oneline "${PROD%%@*}..${DEV%%@*}"`
+
+3. **Fire the promotion** (parks at the approval gate; nothing deploys yet):
+
+   ```bash
+   gh workflow run promote-to-prod.yml -R PostHog/charts \
+     -f app=viaduck -f image="$DEV"
+   ```
+
+   Open the run page (`gh run list -R PostHog/charts
+   --workflow=promote-to-prod.yml --limit 1 --json url --jq '.[0].url'`)
+   and have a required reviewer approve the pending deployment. Never
+   self-approve programmatically on the operator's behalf.
+
+4. **Watch and verify**: `gh run watch <run-id> -R PostHog/charts
+   --exit-status`, then confirm `image.prod` in the state file moved.
+   ArgoCD rolls the prod Deployment; `kubectl -n viaduck get pods -w`
+   for verification beyond ArgoCD. Rollback = promote the previous
+   known-good ref (visible in `git log -- state/viaduck.yaml` in the
+   charts repo) through the same workflow.
+
+Note: the `viaduck-metrics` Deployment in the viaduck namespace runs
+the MILLPOND image (`tools/ducklake_metrics.py`) at millpond's prod
+pin — it deploys through millpond promotions, not viaduck ones.
+
 ## Grafana
 
 Dashboard at `grafana/dashboards/viaduck.json`. Available at `http://localhost:3000/d/viaduck/viaduck` when running `just up`.
